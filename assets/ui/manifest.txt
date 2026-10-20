@@ -1,0 +1,25 @@
+# Single-page UI bundle, assembled in this order into one <style> and one
+# <script> (shared global scope). Used by build.rs, `--ui-dir` and UI tests.
+style styles/tokens.css
+style styles/base.css
+style styles/design.css
+style styles/experience.css
+style styles/motion.css
+script scripts/motion.js
+script scripts/core.js
+script scripts/tasks.js
+script scripts/settings.js
+script scripts/reports.js
+script scripts/logs.js
+script scripts/forms.js
+script scripts/events.js
+script scripts/extensions.js
+script scripts/handling.js
+script scripts/tags.js
+script scripts/workflow.js
+script scripts/palette.js
+script scripts/analysis-display.js
+script scripts/handling-live.js
+script scripts/memory.js
+script scripts/guide.js
+script scripts/boot.js

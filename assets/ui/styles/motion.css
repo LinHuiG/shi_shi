@@ -1,0 +1,25 @@
+/* Motion is quick and never adds a delay before input or data updates. */
+:root{--dur-normal:160ms;--dur-fast:140ms}
+#nav-count,.side-view>span,.daily-summary span,.report-counts b,.usage-line b{font-variant-numeric:tabular-nums}
+#nav-count,.side-view>span{min-width:3ch;text-align:right}
+.phase-copy{display:inline-block;min-width:8em}.side-pending{min-height:20px}
+.live-dialog{height:min(620px,calc(100dvh - 48px));max-height:calc(100dvh - 48px)}
+.live-dialog .ai-live-output{min-height:0;max-height:none;overscroll-behavior:contain}
+html:has(#overlay:not([hidden])),html:has(#overlay:not([hidden])) body{overflow:hidden;overscroll-behavior:none}
+.approval-shell{width:min(560px,calc(100vw - 32px));height:min(520px,calc(100dvh - 48px));max-height:calc(100dvh - 48px);padding:20px;overflow:hidden;display:flex;flex-direction:column}
+.approval-shell .approval-dialog{width:100%;max-width:none;min-height:0;flex:1;display:flex;flex-direction:column;overflow:hidden}
+.approval-shell .approval-dialog>header,.approval-shell .approval-context,.approval-shell .approval-footer{flex:none}
+.approval-scroll{min-height:0;flex:1;overflow:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:4px}
+.approval-shell .approval-context{margin:10px 0;padding-bottom:10px}.approval-shell .approval-footer{margin-top:12px}
+.approval-shell .approval-dialog h2{margin-top:10px}.approval-shell .approval-dialog pre{max-height:none;overflow:visible}
+.handling-stream{margin-top:12px;min-width:0;border:1px solid var(--line);border-radius:10px;background:var(--surface-sunken);overflow:hidden}
+.handling-stream-output{height:clamp(160px,30vh,300px);overflow:auto;overscroll-behavior:contain;overflow-anchor:none;scrollbar-gutter:stable;padding:14px 16px}
+.handling-stream-output:empty:before{content:'等待接入返回公开进展…';color:var(--text-muted)}
+.handling-stream-entry+.handling-stream-entry{border-top:1px solid var(--line);padding-top:10px;margin-top:10px}
+.handling-stream-entry h4{font-size:12px;color:var(--text-muted);margin:0 0 5px;font-weight:500}
+.handling-stream-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.8;font-family:'Segoe UI','Microsoft YaHei UI',sans-serif}
+.handling-stream-footer{display:flex;align-items:center;justify-content:space-between;min-height:34px;padding:3px 12px;border-top:1px solid var(--line);color:var(--text-muted);font-size:12px}
+.handling-stream-footer button{font-size:12px;padding:2px 8px}
+.memory-page>.box,.sources-page,.prompt-workspace>.box{min-height:80px}
+@media(max-height:600px){.approval-shell,.live-dialog{padding:12px;height:calc(100dvh - 24px);max-height:calc(100dvh - 24px)}.overlay{padding:12px}.approval-shell .approval-dialog h2{margin:6px 0}.approval-shell .approval-context{margin:6px 0;padding-bottom:6px}.live-heading{padding-bottom:8px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;animation-duration:.001ms!important;transition-duration:0ms!important}}

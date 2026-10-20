@@ -1,0 +1,9 @@
+[package]
+name = "shishi-plugin-sdk"
+version = "1.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+repository = "https://github.com/LinHuiG/shi_shi"
+
+[dependencies]
+serde_json = "1"

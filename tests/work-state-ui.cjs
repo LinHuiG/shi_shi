@@ -1,0 +1,84 @@
+const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
+const root=path.resolve(__dirname,'..'),out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-work-state-ui-')),now=Date.now();
+const task={id:'t1',title:'核对发布结果',description:'收集发布日志并确认结果。',summary:'收集发布日志',status:'待处理',priority:'普通',category:'问题排查',environment:'未指定',due:'',evidence:{direct:['m1'],background:['m2'],completion:['m3']},steps:[{id:'s1',title:'收集发布日志',status:'running',depends_on:[],waiting_for:'发布人',next_step:'等待日志',confirmed:false}],tags:[],created:now,updated:now,today:true,manual:false,generation:'',archived:false};
+const state={tasks:[task],schedules:[],messages:[{id:'m1',text:'发布完成请核对',sender:'测试',group:'发布群',source_name:'测试来源',time:now,private:true},{id:'m2',text:'背景说明',sender:'测试',group:'发布群',source_name:'测试来源',time:now-1000,private:true}],config:{codex:'fixture',enabled:false,auto_ai:false,leaders:[],interval_minutes:5,analysis_interval_minutes:30,analysis_lookback_hours:24,daily_calls:40,max_input_chars:60000,message_retention_days:90,work_start:'09:00',work_end:'18:00',model:'model-analysis',reasoning_effort:'low',model_profiles:{filter:{model:'model-analysis',reasoning_effort:'low'},analysis:{model:'model-analysis',reasoning_effort:'low'},handling:{model:'model-analysis',reasoning_effort:'low'},review:{model:'model-analysis',reasoning_effort:'low'}}},usage:{day:'2026-10-18',calls:0,input_tokens:0,output_tokens:0,cached_input_tokens:0,cached_reports:0,unreported_calls:0},filter_usage:{calls:2,input_tokens:10,output_tokens:3,unreported_calls:1,reason:''},work_state:{at_ms:now,business_date:'2026-10-18',status:'off_duty',calendar_day:{date:'2026-10-18',kind:'weekend',source:'weekend',stale:false,diagnostics:[]},end_eligibility:'not_eligible'},archive_attempt:null,activity:[],audit:[],suggestions:[],reports:[],chat_sources:[],handling:[],pending:1,last_scan:now,in_work_hours:false,filter_usage:{calls:2,input_tokens:10,output_tokens:3,unreported_calls:1,reason:''}};
+delete state.filter_usage; state.filter_usage={calls:2,input_tokens:10,output_tokens:3,unreported_calls:1,reason:''};
+const history={versions:[{id:'v1',created:now-1000,action:'archive',reason:'初始归档',prompt_version:'p1',tag_version:'g1',archived_version:1},{id:'v2',created:now,action:'archive',reason:'后续归档',prompt_version:'p2',tag_version:'g2',archived_version:2}],current:'v2'};
+const version={id:'v1',created:now,action:'archive',reason:'初始归档',prompt:'系统提示词',rules:[{title:'规则',rule:'只按证据判断'}],tags:[{name:'事项类型',values:['问题排查']}],memory:[{key:'职责',text:'核对环境'}],current:'v1'};
+const mock=`window.fixture=${JSON.stringify(state)};window.historyFixture=${JSON.stringify(history)};window.versionFixture=${JSON.stringify(version)};window.requests=[];window.ipc={postMessage(raw){const {id,method,params:p}=JSON.parse(raw);requests.push({method,p});setTimeout(()=>{let data=true;switch(method){case 'state':data=fixture;break;case 'work_state':if(p.overtime===true){fixture.work_state.status='overtime';}if(p.date){fixture.work_state.calendar_day={...fixture.work_state.calendar_day,date:p.date,kind:p.kind==='holiday'?'holiday':'workday',source:'manual'};}break;case 'edit':{const t=fixture.tasks.find(x=>x.id===p.task.id);if(t&&p.task.steps)t.steps=p.task.steps;data=t;break;}case 'evidence':data=[{id:'m1',source_name:'测试来源',group:'发布群',sender:'测试',time:Date.now(),text:'发布完成请核对',kind:'text',evidence_role:'direct'},{id:'m2',source_name:'测试来源',group:'发布群',sender:'测试',time:Date.now()-1000,text:'背景说明',kind:'text',evidence_role:'background'},{id:'m3',source_name:'测试来源',group:'发布群',sender:'测试',time:Date.now()-500,text:'结果已确认',kind:'text',evidence_role:'completion'}];break;case 'archive_history':data={versions:historyFixture.versions,current:historyFixture.current};break;case 'archive_version':data={...versionFixture,id:p.id,prompt:p.id==='v2'?'当前版本：先核对证据':'目标版本：记录行动项'};break;case 'archive_rollback':historyFixture.current='v2';break;case 'prompts':data={classify:'默认',handling:'默认',prompt_review:'默认',format:'默认',learning:'默认',report:'默认'};break;case 'models':data={models:[{model:'model-analysis',displayName:'analysis',supportedReasoningEfforts:[{reasoningEffort:'low'}]}]};break;}window.receive({id,ok:true,data});},5)}};`;
+const html=require('../scripts/frontend.cjs').build().replace('<script>','<script>'+mock+'\n');
+(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{const page=await browser.newPage({viewport:{width:1280,height:960}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.setContent(html);await page.locator('.task-row').first().waitFor();
+ await page.waitForFunction(()=>document.querySelector('#work-status')?.innerText.includes('已下班'));
+ await page.evaluate(async()=>{page='tasks';selected='t1';await render();});
+ assert.equal(await page.locator('[data-step-confirm],[data-step-status],.steps-section').count(),0);
+ assert(await page.evaluate(()=>fixture.tasks[0].steps.length===1));
+ await page.locator('#evidence-list .source').first().waitFor({state:'attached'});
+ await page.locator('.evidence-disclosure summary').click();
+ const evidenceText=await page.locator('#evidence').innerText();for(const label of ['直接依据','背景上下文','完成依据'])assert(!evidenceText.includes(label));
+ assert.equal(await page.locator('#evidence-list .source').count(),3);
+ assert((await page.locator('#evidence-list .source').first().innerText()).includes('背景说明'));
+ await page.locator('[data-evidence-sort]').click();assert((await page.locator('#evidence-list .source').first().innerText()).includes('发布完成请核对'));
+ await page.locator('#evidence-search').fill('背景');assert.equal(await page.locator('#evidence-list .source').count(),1);assert.equal(await page.locator('#evidence-summary').innerText(),'匹配 1 / 共 3 条');
+ await page.locator('#evidence-search').fill('不存在的关键词');assert((await page.locator('#evidence-list').innerText()).includes('没有匹配'));
+ await page.locator('#evidence-search').fill('');assert.equal(await page.locator('#evidence-list .source').count(),3);
+ // Ignore duplicate references and unavailable messages even if returned by a stale adapter.
+ await page.evaluate(()=>{evidenceCache.t1.push({...evidenceCache.t1[0]});});
+ await page.evaluate(async()=>{await renderDetail();});await page.locator('#evidence-list .source').first().waitFor({state:'attached'});
+ assert.equal(await page.locator('[data-evidence-count]').innerText(),'3 条');
+ await page.screenshot({path:path.join(out,'task-steps-evidence.png')});
+ await page.locator('[data-action="work-state"]').click();
+ assert.equal(await page.locator('#overlay').isVisible(),false);
+ assert.equal(await page.locator('#work-state-panel details[open]').count(),0);
+ await page.screenshot({path:path.join(out,'work-state.png')});
+ await page.locator('[data-work-close]').click();
+ await page.locator('[data-action="overtime-toggle"]').click();
+ await page.waitForFunction(()=>fixture.work_state.status==='overtime');
+ assert(await page.evaluate(()=>requests.some(r=>r.method==='work_state'&&r.p.overtime===true)));
+ // Authoritative status controls both entry points, including makeup/overnight workdays.
+ for(const value of ['working','off_duty','holiday','calendar_unknown','overtime']){
+  await page.evaluate(value=>{state.work_state.status=value;fixture.work_state.status=value;status();},value);
+  assert.equal(await page.locator('[data-action="overtime-toggle"]').count(),value==='working'?0:1);
+  await page.locator('[data-action="work-state"]').click();assert.equal(await page.locator('[data-work-overtime="1"]').count(),['working','overtime'].includes(value)?0:1);
+  if(value==='overtime')assert(await page.locator('[data-work-overtime="0"]').isEnabled());
+  await page.locator('[data-work-close]').click();
+ }
+ for(const width of [1280,1000,760,360]){
+  await page.setViewportSize({width,height:800});
+  await page.locator('[data-action="work-state"]').click();
+  await page.locator('.work-correction summary').click();
+  const bounds=await page.locator('#work-state-panel').boundingBox();assert(bounds.x>=0&&bounds.x+bounds.width<=width&&bounds.y>=0&&bounds.y+bounds.height<=800);
+  await page.screenshot({path:path.join(out,`work-state-${width}.png`)});
+  await page.keyboard.press('Escape');assert.equal(await page.locator('#work-state-panel').count(),0);
+ }
+ await page.setViewportSize({width:1280,height:960});
+ await page.locator('[data-action="work-state"]').click();await page.locator('#page-title').click();assert.equal(await page.locator('#work-state-panel').count(),0);
+ await page.locator('[data-action="work-state"]').click();await page.locator('.work-correction summary').click();await page.locator('#work-date').fill('2026-10-20');await page.locator('#work-kind').selectOption('holiday');await page.locator('[data-work-correct]').click();await page.waitForFunction(()=>!document.querySelector('#work-state-panel')&&fixture.work_state.calendar_day.date==='2026-10-20');
+ assert(await page.evaluate(()=>requests.some(r=>r.method==='work_state'&&r.p.kind==='holiday')));
+ await page.evaluate(()=>{fixture.tasks[0].archived=true;state.tasks[0].archived=true;tab='归档';renderTasks();});
+ assert((await page.locator('.task-status').first().innerText()).includes('已归档'));
+ await page.evaluate(async()=>{page='reports';await render();});
+ await page.evaluate(()=>{state.archive_attempt={status:'failed',batches:1,processed:12,archived_tasks:2,remaining:8,error:'合成后续批次失败'};renderReports();});
+ assert((await page.locator('.report-page').innerText()).includes('归档部分已提交，后续未完成'));
+ assert((await page.locator('.report-page').innerText()).includes('剩余 8 条'));
+ await page.evaluate(()=>{state.archive_attempt={status:'succeeded',finished:Date.now(),batches:2,processed:20,archived_tasks:4,remaining:0};renderReports();});
+ assert((await page.locator('.report-page').innerText()).includes('归档完成'));
+ await page.evaluate(()=>{state.archive_attempt.finished=Date.now()-86400000;renderReports();});assert(!(await page.locator('.report-page').innerText()).includes('归档完成'));
+ await page.evaluate(()=>{state.archive_attempt.finished=Date.now()-300001;renderReports();});assert(!(await page.locator('.report-page').innerText()).includes('归档完成'));
+ assert(await page.evaluate(()=>{const midnight=Date.parse('2026-10-20T00:00:00+08:00');return !visibleArchiveAttempt({status:'succeeded',finished:midnight-1000},midnight+1000);}));
+
+ await page.locator('[data-action="archive-history"]').click();
+ await page.locator('#dialog').getByText('归档版本历史').waitFor();
+ assert((await page.locator('#dialog').innerText()).includes('初始归档'));
+ await page.locator('[data-archive-view="v1"]').click();
+ await page.locator('#dialog').getByText('比较归档版本').waitFor();
+ const compareText=await page.locator('#dialog').textContent();
+ assert(compareText.includes('系统提示词'));
+ assert.equal(await page.locator('#dialog details').first().locator('pre').nth(0).textContent(),'当前版本：先核对证据');
+ assert.equal(await page.locator('#dialog details').first().locator('pre').nth(1).textContent(),'目标版本：记录行动项');
+ assert(compareText.includes('只按证据判断'));
+ await page.locator('#dialog details').first().evaluate(el=>el.open=true);
+ await page.screenshot({path:path.join(out,'archive-comparison.png')});
+ await page.locator('[data-action="close"]').click();
+ assert.deepEqual(errors,[]);
+ console.log('PASS work status chip and overtime; legacy steps hidden and preserved; unified searchable/sortable evidence; transient archive success; archive version comparison. '+out);
+}finally{await browser.close();}})().catch(error=>{console.error(error);process.exitCode=1});

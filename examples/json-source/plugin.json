@@ -1,0 +1,13 @@
+{
+  "id": "json-file",
+  "name": "聊天 JSON 文件",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entrypoint": "shishi_json_source.dll",
+  "files": ["shishi_json_source.dll"],
+  "capabilities": ["discover", "validate", "fetch_incremental", "fetch_range", "lookup_messages"],
+  "config_fields": [
+    {"key":"file","label":"聊天 JSON 文件","type":"file","required":true,"description":"包含 messages 数组的 UTF-8 JSON，时间使用毫秒时间戳。"},
+    {"key":"scan_root","label":"自动查找目录","type":"directory","required":false,"description":"自动查找此目录下可读取的聊天 JSON 文件。"}
+  ]
+}

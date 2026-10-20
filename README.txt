@@ -1,0 +1,38 @@
+拾事 ShiShi 1.2.0
+
+拾事是 Windows 桌面 AI 事项助手：把聊天消息整理成可跟进的事项，
+保留消息依据和处理经验，由你选择事项交给 AI 调查、处置并查看结果。
+
+主要功能
+- 插件读取消息、增量导入、去重和收件箱查询。
+- AI 整理或手动创建事项，维护状态、等级、截止时间、标签与定时事项。
+- 定时分析、早报、下班汇总、归档，以及可查看和编辑的 AI 记忆。
+- 持续的 AI 处置会话，支持追问、权限审批、中断和进展同步。
+- 提示词、规则与标签建议由你预览和采用，相关配置可回滚。
+
+开始使用
+1. 准备 Windows x64 和 Microsoft Edge WebView2 Runtime。
+2. 在设置中配置 AI 连接与可用模型。Codex CLI、DeepSeek Harness（ACP）
+   支持分析和一键处置；OpenAI Chat Completions 兼容 HTTPS API 支持分析。
+3. 可先手动创建事项。需要消息时，在“消息来源”安装可信插件，配置并验证
+   数据位置，再启用扫描与分析。首次启动默认关闭扫描、过滤及完整 AI 跟踪。
+
+插件接入
+插件由 Windows x64 DLL、plugin.json 和声明的依赖组成，打包为 ZIP，
+在“消息来源”安装。开发者可使用 plugin-sdk 和 examples/json-source 示例，
+实现发现、验证、增量读取、区间补读、按 ID 查询五个接口。
+详细步骤和协议见源码 README.md、docs/PLUGINS.md、PLUGIN_API.txt。
+
+数据与运行
+消息、事项和配置保存在本机；调用 AI 时会发送相关内容给所选后端。
+消息采集、分析与处置分开，执行处置由用户发起。
+插件在主程序进程内运行，请只安装可信插件，仅读取已授权的数据。
+API 密钥使用 Windows DPAPI 保存，或从指定环境变量读取。
+自动任务需要程序保持运行；关闭窗口进入托盘，托盘菜单“退出”结束程序。
+
+源码与完整文档：https://github.com/LinHuiG/shi_shi
+本项目原创代码采用 GNU AGPL v3.0（AGPL-3.0-only，仅 3.0 版）。
+分发受许可覆盖的程序，或通过网络提供修改版时，须按许可证要求提供对应源码。
+许可证全文见随附 LICENSE，对应源码见同版本 Release 中的源码包。
+第三方组件保留各自许可证，见 THIRD_PARTY_NOTICES.md。
+Copyright (c) 2026 ShiShi contributors. 软件按现状提供，不附带担保。

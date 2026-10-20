@@ -1,0 +1,46 @@
+拾事插件协议 1 / Windows x64
+
+目录与依赖
+插件是独立的动态库项目。主程序只认识本协议和统一消息模型；适配某软件的名称、路径规则、数据库结构、解码代码、依赖资源和迁移逻辑都属于插件。
+安装包至少包含 plugin.json 和一个 DLL。可以压成 ZIP，用户在界面直接安装；plugin.json 可位于 ZIP 根目录或第一层包目录内，但 ZIP 只能含一个插件描述。只复制 manifest.files 中声明的资源，不允许绝对路径、上级目录、重解析点或链接。宿主不预装或自动加载任何插件。只加载用户在界面安装到 data/plugins/<id> 的包，旧版可执行文件旁的 plugins 目录不再自动加载。
+消息来源页面的安装区域同时支持点击选择和拖入 ZIP。每个插件可开启、停用或卸载；停用不调用插件接口，卸载会保留来源配置、消息和事项，并停用关联来源。重新安装后需按需启用来源。安装阶段仅校验描述与文件，不加载 DLL。打开配置页面自动调用 discover，单一候选自动填入全部配置；保存配置时调用 validate，启用来源后调用读取接口。插件的静态初始化不得读取数据、创建线程或要求完整配置。
+
+plugin.json
+参见 examples/json-source/plugin.json。必需字段：id、name、version、api_version=1、entrypoint（相对DLL路径）、files、capabilities、config_fields。
+id及配置字段key只允许字母、数字、短横线和下划线，1–64字符。
+配置字段：key、label、type（file/directory/text/password）、required、description。宿主据此生成表单，支持文件和目录选择。password只遮挡UI显示，配置保存在用户的本地data中，插件不要返回不必要的凭据。
+插件必须提供 discover、validate、fetch_incremental、fetch_range、lookup_messages；可选 import_legacy。
+
+C ABI（禁止跨 DLL 传 Rust String/Vec/trait 对象）
+uint32_t shishi_plugin_abi(void); // 返回1
+uint8_t *shishi_plugin_call(const uint8_t *input, size_t input_len, size_t *output_len);
+void shishi_plugin_free(uint8_t *output, size_t output_len);
+输入输出为 UTF-8 JSON，不依赖结尾0。由DLL分配输出，宿主调用同一DLL的free后才能卸载。单次请求/响应不超过32 MiB。
+返回信封 {"ok":true,"result":...} 或 {"ok":false,"error":"说明"}。
+plugin-sdk::export_plugin!(handler) 提供 Rust 导出、分配释放和 panic 捕获。
+宿主在工作线程直接调用DLL，同一插件可被多个来源并发调用，插件必须可重入/线程安全。插件自行遵守context.timeout_ms，进程内ABI不提供强制终止或崩溃隔离。不要留下后台线程、回调或未结束的异步工作，否则DLL卸载后不安全。需要子进程时由插件管理其生命周期，父进程退出时必须结束。
+
+请求
+{"protocol":1,"method":"...","config":{...},"params":{...},"context":{"plugin_dir":"绝对包目录","work_dir":"可写临时目录","timeout_ms":90000}}
+plugin_dir只读；资源相对它解析，临时文件写work_dir，支持 Unicode 和空格路径。读取原数据必须只读，不发送消息。
+
+接口
+discover: config可能缺字段。扫描已安装程序和数据位置，可结合用户的搜索目录。返回 {"candidates":[{"label":"可读说明","config":{完整候选配置}}],"warnings":["说明"]}。只返回已经校验的候选；多账号不默默选错。UI让用户选择候选、补齐后保存。
+validate: 检查配置、文件内容和账号，返回 {"valid":true,"account_key":"稳定的来源身份","message":"说明"}。失败返回错误信封或valid=false。account_key用于防止更换账号后复用旧消息编号：同账号数据迁移应保持不变；通用文件来源可用规范化绝对文件路径。
+fetch_incremental: params {"cursor":上次游标或null,"since":毫秒,"until":毫秒}。按范围读取，游标是插件私有JSON。返回 {"messages":[...],"cursor":新游标,"until":已成功读到的毫秒检查点}。宿主校验并成功保存消息后才提交游标。失败时不得跳过原游标，重试须幂等。
+fetch_range: params {"since":毫秒,"until":毫秒}，包含首尾，返回同格式；宿主不会提交此游标。
+lookup_messages: params {"ids":[原始消息编号],"until":当前毫秒}，返回 {"messages":[...]}，用于更新仍被事项跟踪的消息和撤回状态。未找到的ID可省略，不推断撤回。
+import_legacy（可选）: params.state为宿主保留的升级前原始JSON。插件解读自己的旧格式，返回 {"config":{...},"account_key":"...","cursor":...,"last_scan":毫秒,"message_ids":[旧编号],"messages":[旧消息的可读文本转换结果]}。宿主迁移仍无source_id的缓存、任务引用和审计中的sources，保留原始副本；导入后默认关闭，用户校验启用。
+
+统一消息
+必需 id（来源内稳定字符串）、time（Unix毫秒）、text（已经提取的可读文本）。建议完整提供：
+{"id":"m1","chat":"c1","from":"u1","sender":"姓名","to":"u2","recipient":"对方","group":"会话名称","time":1792051200000,"text":"请确认发布安排","kind":"text","mention_me":false,"mention_all":false,"private":true,"mine":false,"withdrawn":false,"reply":""}
+宿主为消息、会话、发送接收方和回复ID加来源前缀；插件收到的lookup IDs仍为原始ID。插件不要填source_id/source_name/external_id，由宿主写入。
+withdrawn=true时宿主清空text，并处理相关证据。只把正文放text，不把软件协议元数据、隐式命令或卡片动作链接交给宿主猜测。附件可返回可读占位说明。
+
+示例开发与验证
+cargo build --workspace --release --locked
+将 target/release/shishi_json_source.dll 与 examples/json-source/plugin.json 放在同一目录，安装该描述文件或整个 ZIP 包即可。
+设置 SHISHI_TEST_PLUGIN 为此示例插件包目录或 ZIP 文件，可运行 cargo test native_json_plugin -- --ignored 测试真实DLL和多来源读取；只使用自动生成的测试数据，不会调用AI。
+
+图片附件（可选，主程序0.3.8起）：消息可带 images:[{id:string,path:string}]，最多8项。path为本地已缓存栅格图片绝对路径，不可用时填空；主程序重新命名id，不把路径发给模型。来源插件负责限定到本账号数据目录，不提供任意URL下载或无关文件。撤回消息必须清空images。支持PNG/JPEG/GIF/BMP，原始文件最多10MiB。仅在用户预览或AI明确read_image时解码，自动分析每批最多2次。旧插件无需此字段仍兼容。
