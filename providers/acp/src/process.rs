@@ -383,7 +383,7 @@ mod tests {
         let pid_file = temp.join("pid.txt");
         // Run cmd in the background through PowerShell and record its PID.
         let ps = format!(
-            "$p=Start-Process -FilePath cmd.exe -ArgumentList '/D','/S','/C','ping -n 30 127.0.0.1 >NUL' -PassThru; Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 30",
+            "$p=Start-Process -FilePath cmd.exe -ArgumentList '/D','/S','/C','ping -n 30 127.0.0.1 >NUL' -WindowStyle Hidden -PassThru; Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 30",
             pid_file.display()
         );
         let out = run_bounded(

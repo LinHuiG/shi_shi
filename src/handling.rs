@@ -8,7 +8,21 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, MutexGuard, TryLockError},
+    time::{Duration, Instant},
+};
+
+#[cfg(test)]
+#[path = "handling_backlog_tests.rs"]
+mod backlog_tests;
+#[path = "handling_desktop.rs"]
+mod desktop;
+#[cfg(test)]
+#[path = "handling_preview_tests.rs"]
+mod preview_tests;
+use desktop::is_desktop;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -94,10 +108,18 @@ pub struct Supplement {
     pub id: String,
     pub text: String,
     pub accepted: bool,
+    pub not_submitted: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Run {
+    pub model_reported: Option<bool>,
+    pub input_revision: u64,
+    pub transport: String,
+    pub requested_model: String,
+    pub requested_effort: String,
+    pub waiting_on: String,
+    pub stop_requested: bool,
     pub connection: Option<Connection>,
     pub id: String,
     pub task_id: String,
@@ -129,6 +151,30 @@ pub struct Run {
     pub rollout_path: String,
     pub context_handoff_prepared: bool,
 }
+/// Public stream deltas are a preview, not an independent business commit.
+/// A preview is valid only against the durable run version it was derived from.
+pub(crate) struct Preview {
+    pub base_updated: i64,
+    pub run: Run,
+}
+
+fn business_run(run: &Run) -> Value {
+    let mut value = json!(run);
+    let object = value.as_object_mut().unwrap();
+    for field in ["progress", "synced", "updated"] {
+        object.remove(field);
+    }
+    for round in value["rounds"].as_array_mut().unwrap() {
+        // Only changing text is transient. New items, tool lifecycle, approvals,
+        // conclusions, counters and round state still force an immediate save.
+        for step in round["steps"].as_array_mut().unwrap() {
+            if let Some(object) = step.as_object_mut() {
+                object.remove("text");
+            }
+        }
+    }
+    value
+}
 pub fn initialize(s: &mut State) {
     if s.handling.versions.is_empty() {
         s.handling.versions.push(Version {
@@ -145,6 +191,12 @@ pub fn initialize(s: &mut State) {
     // rebind old records to whichever provider is selected now.
     for r in &mut s.handling.runs {
         r.requests.clear();
+        if r.stop_requested {
+            if !["detached", "ended"].contains(&r.status.as_str()) {
+                r.status = "terminated".into();
+            }
+            r.watching = false;
+        }
         if r.desktop_control && r.handoff_at == 0 {
             r.handoff_at = r.updated.max(r.created);
             r.handoff_turns = r.rounds.iter().map(|round| round.turn_id.clone()).collect();
@@ -156,7 +208,11 @@ pub fn initialize(s: &mut State) {
                 };
         }
         // Without an accepted session id no prompt could have been submitted.
-        if r.status == "uncertain" && r.thread_id.is_empty() && r.rounds.is_empty() {
+        if r.status == "uncertain"
+            && r.thread_id.is_empty()
+            && r.rounds.is_empty()
+            && r.transport != "desktop"
+        {
             r.status = "failed".into();
             r.watching = false;
         }
@@ -170,8 +226,26 @@ pub fn source_matches(run: &Run, connection: &Connection) -> bool {
         .as_ref()
         .is_some_and(|c| c.id == connection.id && c.driver == connection.driver)
 }
+pub const STOPPED: &str = "本次处置已终止";
+
+// A reservation covers both waiting and sending. It is not persisted or retried:
+// an uncertain remote reply must never enqueue the same input a second time.
+struct FollowupReservation<'a> {
+    app: &'a App,
+    run_id: String,
+}
+impl Drop for FollowupReservation<'_> {
+    fn drop(&mut self) {
+        self.app
+            .handling_followups
+            .lock()
+            .unwrap()
+            .remove(&self.run_id);
+    }
+}
 pub fn can_restart(run: &Run) -> bool {
-    run.status == "failed" && run.rounds.iter().all(|r| r.not_submitted)
+    matches!(run.status.as_str(), "terminated" | "detached" | "ended")
+        || (run.status == "failed" && run.rounds.iter().all(|r| r.not_submitted))
 }
 fn current(s: &State) -> &Version {
     s.handling
@@ -294,7 +368,13 @@ fn apply_usage_event(run: &mut Run, event: &ai_backend::UsageEvent) {
 fn active(r: &Run) -> bool {
     matches!(
         r.status.as_str(),
-        "starting" | "submitting" | "inProgress" | "waiting" | "uncertain" | "disconnected"
+        "starting"
+            | "submitting"
+            | "inProgress"
+            | "waiting"
+            | "uncertain"
+            | "disconnected"
+            | "stopping"
     )
 }
 
@@ -340,8 +420,26 @@ impl App {
         cached.insert(key, c.clone());
         Ok(c)
     }
+    fn ensure_run_open(&self, id: &str) -> Result<(), String> {
+        let state = self.state.lock().unwrap();
+        let run = state
+            .handling
+            .runs
+            .iter()
+            .find(|r| r.id == id)
+            .ok_or("处置记录不存在")?;
+        if run.stop_requested {
+            Err(STOPPED.into())
+        } else {
+            Ok(())
+        }
+    }
     fn run_client(&self, run: &Run) -> Result<Arc<dyn AgentSession>, String> {
+        self.ensure_run_open(&run.id)?;
         let connection = self.run_connection(run)?;
+        if connection.driver == "codex" {
+            return Err("Codex 处置由桌面执行，禁止启动独立执行连接".into());
+        }
         if run.desktop_control {
             return self.handling_client(&connection);
         }
@@ -357,183 +455,21 @@ impl App {
             .get(&connection.cache_key())
             .cloned()
             .ok_or("Missing fixture client")?;
+        if let Err(error) = self.ensure_run_open(&run.id) {
+            let _ = c.close();
+            return Err(error);
+        }
         cached.insert(key, c.clone());
         Ok(c)
     }
     fn ensure_local_control(run: &Run) -> Result<(), String> {
-        if run.desktop_control {
+        if run.stop_requested {
+            Err(STOPPED.into())
+        } else if run.desktop_control && !is_desktop(run) {
             Err("会话已交接，请在 Codex 中继续操作".into())
         } else {
             Ok(())
         }
-    }
-    pub fn handling_handoff(&self, task: &str) -> Result<Value, String> {
-        let previous = self.run(task)?;
-        if self.run_connection(&previous)?.driver == "dsh" {
-            let config = self.state.lock().unwrap().config.clone();
-            let target = config
-                .ai_connections
-                .iter()
-                .find(|c| c.driver == "codex")
-                .cloned()
-                .unwrap_or(Connection {
-                    executable: config.codex.clone(),
-                    name: config.codex_name.clone(),
-                    ..Connection::default()
-                });
-            if target.executable.is_empty() {
-                return Err("请先配置 Codex 接入".into());
-            }
-            if !Path::new(&previous.cwd).is_dir() {
-                return Err("原处置目录不可用，请重新选择项目目录".into());
-            }
-            self.handling_add_project(&json!({"cwd":previous.cwd}))?;
-            let projects = self.handling_projects_for(&target)?;
-            let project = projects
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|p| {
-                    crate::ai_connections::launcher_identity(Path::new(str_at(p, "cwd")))
-                        == crate::ai_connections::launcher_identity(Path::new(&previous.cwd))
-                })
-                .ok_or("无可用目录")?;
-            let mut args = json!({"task_id":task,"project_id":project["id"],"cwd":project["cwd"],"instructions":previous.instructions,"stop_previous":true});
-            args["connection_id"] = json!(if target.id.is_empty() {
-                "__default_codex"
-            } else {
-                &target.id
-            });
-            let existing = self
-                .state
-                .lock()
-                .unwrap()
-                .handling
-                .runs
-                .iter()
-                .rev()
-                .find(|r| {
-                    r.task_id == task && source_matches(r, &target) && !r.thread_id.is_empty()
-                })
-                .cloned();
-            if let Some(existing) = existing {
-                let _guard = self
-                    .handling_action
-                    .try_lock()
-                    .map_err(|_| "正在处理处置，请稍后重试")?;
-                self.stop_previous_runs(task, true)?;
-                ai_backend::backend(&target)?.open_session(&existing.thread_id)?;
-                return Ok(
-                    json!({"thread_id":existing.thread_id,"run_id":existing.id,"resumed":true}),
-                );
-            }
-            let mut result = self.handling_start(&args)?;
-            let run_id = str_at(&result, "run_id");
-            let thread = str_at(&result, "thread_id");
-            ai_backend::backend(&target)?.open_session(thread)?;
-            // Keep SS ownership until the user explicitly hands the new Codex
-            // session to its desktop; never pretend the DSH id was resumed.
-            self.log("handling_transfer", json!({"from":previous.id,"to":run_id}));
-            result["transferred"] = json!(true);
-            return Ok(result);
-        }
-        let _guard = self
-            .handling_action
-            .try_lock()
-            .map_err(|_| "正在处理会话，请稍后重试")?;
-        let run = self.run(task)?;
-        if self.run_connection(&run)?.driver == "dsh" {
-            return Err(
-                "Harness 不支持桌面会话跳转；请在 Harness 客户端按项目查看。当前处置仍由拾事管理"
-                    .into(),
-            );
-        }
-        if run.thread_id.is_empty() {
-            return Err("会话编号尚未确定，请先恢复连接".into());
-        }
-        if !run.desktop_control {
-            let context = context_config(self, &run)?;
-            let key = format!("run:{}", run.id);
-            let owned = self.handling_client.lock().unwrap().get(&key).cloned();
-            if let Some(c) = owned {
-                let mut turns = c.history(&run.thread_id)?;
-                if let Some(turn) = turns["data"]
-                    .as_array()
-                    .and_then(|v| v.iter().find(|t| t["status"] == "inProgress"))
-                {
-                    c.interrupt(&run.thread_id, str_at(turn, "id"))?;
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-                    loop {
-                        turns = c.history(&run.thread_id)?;
-                        if !turns["data"]
-                            .as_array()
-                            .ok_or("未返回轮次历史，不能确认停止")?
-                            .iter()
-                            .any(|t| t["status"] == "inProgress")
-                        {
-                            break;
-                        }
-                        if std::time::Instant::now() >= deadline {
-                            return Err("尚未确认当前轮停止，未释放会话；请稍后重试".into());
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(150));
-                    }
-                }
-                let meta = c.read(&run.thread_id)?;
-                let note = context_note(&run.id);
-                c.prepare_handoff(
-                    &run.thread_id,
-                    &context,
-                    if run.context_handoff_prepared {
-                        ""
-                    } else {
-                        &note
-                    },
-                )?;
-                self.update_run(&run.id, |r| {
-                    r.requests.clear();
-                    r.context_handoff_prepared = true;
-                    r.rollout_path = str_at(&meta["thread"], "path").into();
-                    apply_history(r, &turns["data"], &meta["thread"])
-                })?;
-                // This process belongs only to this run. Do not terminate shared observers.
-                c.close()?;
-                self.handling_client.lock().unwrap().remove(&key);
-            } else {
-                // A restarted SS must reattach the stopped local session before
-                // persisting the handoff note; no model turn is submitted.
-                let c = self.run_client(&run)?;
-                c.resume(&run.thread_id, &context)?;
-                let turns = c.history(&run.thread_id)?;
-                if turns["data"]
-                    .as_array()
-                    .is_some_and(|v| v.iter().any(|t| t["status"] == "inProgress"))
-                {
-                    return Err("会话仍在执行，请同步后停止本轮再交接".into());
-                }
-                c.prepare_handoff(&run.thread_id, &context, &context_note(&run.id))?;
-                let meta = c.read(&run.thread_id)?;
-                self.update_run(&run.id, |r| {
-                    r.context_handoff_prepared = true;
-                    r.rollout_path = str_at(&meta["thread"], "path").into();
-                    apply_history(r, &turns["data"], &meta["thread"]);
-                })?;
-                c.close()?;
-                self.handling_client.lock().unwrap().remove(&key);
-            }
-            self.update_run(&run.id, |r| {
-                r.desktop_control = true;
-                r.handoff_at = now();
-                r.handoff_turns = r.rounds.iter().map(|x| x.turn_id.clone()).collect();
-                r.desktop_status = "syncPending".into();
-                r.requests.clear();
-                r.error.clear();
-                r.watching = true;
-            })?;
-        }
-        // A failed deep link can be retried without stopping the desktop's new turn.
-        self.handling_open(&run.thread_id)?;
-        Ok(json!({"desktop_control":true}))
     }
     fn handling_connection(&self) -> Result<Connection, String> {
         ai_backend::connection(&self.state.lock().unwrap().config.for_kind("handling"))
@@ -546,23 +482,47 @@ impl App {
             .ok_or_else(|| "该处置记录缺少连接快照，请重新开始处置".into())
     }
     fn update_run(&self, id: &str, apply: impl FnOnce(&mut Run)) -> Result<(), String> {
+        self.update_run_inner(id, false, apply)
+    }
+    fn update_run_inner(
+        &self,
+        id: &str,
+        preview: bool,
+        apply: impl FnOnce(&mut Run),
+    ) -> Result<(), String> {
         let mut lock = self.state.lock().unwrap();
-        let mut next = lock.clone();
-        let run = next
+        let durable = lock
             .handling
             .runs
-            .iter_mut()
+            .iter()
             .find(|r| r.id == id)
             .ok_or("处置记录不存在")?;
-        let before = run.clone();
-        apply(run);
-        run.updated = now();
-        let after = run.clone();
+        if durable.stop_requested {
+            return Err(STOPPED.into());
+        }
+        let before = self.preview_run(durable);
+        let mut after = before.clone();
+        apply(&mut after);
+        after.updated = now().max(durable.updated + 1);
+        if preview && business_run(&before) == business_run(&after) {
+            self.handling_previews.lock().unwrap().insert(
+                id.into(),
+                Preview {
+                    base_updated: durable.updated,
+                    run: after,
+                },
+            );
+            self.handling_preview_revision
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+        let mut next = lock.clone();
+        *next.handling.runs.iter_mut().find(|r| r.id == id).unwrap() = after.clone();
         let mut logs = vec![];
         for round in &after.rounds {
             let old = before.rounds.iter().find(|r| r.id == round.id);
             if old.is_none_or(|r| r.status != round.status) {
-                logs.push(("handling_round", json!({"run_id":after.id,"round_id":round.id,"task_id":after.task_id,"thread_id":after.thread_id,"status":round.status,"source":after.connection.as_ref().map(|c| ai_backend::connection_source(c,&after.model)),"model":after.model,"reasoning_effort":after.effort,"question":short(&round.question,600),"conclusion":short(&round.conclusion,1200),"error":after.error,"usage":round.usage,"usage_known":round.usage.is_object()})));
+                logs.push(("handling_round", json!({"run_id":after.id,"round_id":round.id,"task_id":after.task_id,"thread_id":after.thread_id,"status":round.status,"source":after.connection.as_ref().map(|c| ai_backend::connection_source(c,&after.model)),"model":after.model,"reasoning_effort":after.effort,"question":short(&round.question,600),"conclusion":short(&round.conclusion,1200),"error":after.error,"elapsed_ms":round.duration_ms,"usage":round.usage,"usage_known":round.usage.is_object()})));
             }
         }
         if before.status != after.status || before.error != after.error {
@@ -603,6 +563,7 @@ impl App {
         }
         self.save(&next)?;
         *lock = next;
+        self.handling_previews.lock().unwrap().remove(id);
         drop(lock);
         for (kind, detail) in logs {
             self.log(kind, detail);
@@ -610,7 +571,11 @@ impl App {
         Ok(())
     }
     fn run(&self, task: &str) -> Result<Run, String> {
-        let connection = self.handling_connection()?;
+        let connection = match self.handling_connection() {
+            Ok(c) => Some(c),
+            Err(e) if e.starts_with("AI_UNCONFIGURED:") => None,
+            Err(e) => return Err(e),
+        };
         self.state
             .lock()
             .unwrap()
@@ -621,7 +586,8 @@ impl App {
             .find(|r| {
                 r.task_id == task
                     && r.status != "setupCancelled"
-                    && (source_matches(r, &connection) || r.connection.is_none())
+                    && (connection.as_ref().is_none_or(|c| source_matches(r, c))
+                        || r.connection.is_none())
             })
             .cloned()
             .ok_or("当前接入尚未创建处置会话".into())
@@ -657,7 +623,7 @@ impl App {
         // DSH has no project/list ACP method. Directory selection must not
         // depend on starting the execution transport.
         if connection.driver != "dsh" {
-            data.extend(self.handling_client(connection)?.projects()?);
+            data.extend(self.desktop(connection).projects()?);
         } else {
             // Native desktop workspaces are projected by the optional bridge;
             // reading them must not start an ACP process.
@@ -680,6 +646,7 @@ impl App {
         Ok(json!(data))
     }
     pub fn handling_prepare(&self, task: &str) -> Result<Value, String> {
+        self.require_ai_purpose("handling")?;
         let projects = self.handling_projects()?;
         let s = self.state.lock().unwrap();
         let t = s.tasks.iter().find(|t| t.id == task).ok_or("事项不存在")?;
@@ -708,6 +675,9 @@ impl App {
             .cloned()
             .collect::<Vec<_>>();
         for old in others {
+            if is_desktop(&old) {
+                return Err("已有 Codex 处置，请先结束本次处置再新建；结束不会停止 Codex".into());
+            }
             if !confirmed {
                 return Err("原处置尚未确认停止，请确认停止后重新处置".into());
             }
@@ -750,6 +720,9 @@ impl App {
         Ok(())
     }
     pub fn handling_start(&self, p: &Value) -> Result<Value, String> {
+        if p["connection_id"].as_str().is_none() {
+            self.require_ai_purpose("handling")?;
+        }
         let _guard = self
             .handling_action
             .try_lock()
@@ -880,6 +853,14 @@ impl App {
             instructions: instructions.into(),
             model: cfg.model.clone(),
             effort: cfg.reasoning_effort.clone(),
+            requested_model: cfg.model.clone(),
+            requested_effort: cfg.reasoning_effort.clone(),
+            transport: if connection.driver == "codex" {
+                "desktop"
+            } else {
+                "agent"
+            }
+            .into(),
             policy_version: version.id,
             created: now(),
             updated: now(),
@@ -898,8 +879,17 @@ impl App {
             self.save(&next)?;
             *lock = next;
         }
+        if connection.driver == "codex" {
+            return self.desktop_start(
+                &run,
+                &format!("拾事 · {}", task.title.chars().take(70).collect::<String>()),
+                &prompt,
+                &config,
+            );
+        }
         let result = (|| -> Result<Value, String> {
             let c = self.run_client(&run)?;
+            self.ensure_run_open(&run.id)?;
             let started = c.start(&run.cwd, &run.project_id, &config, &cfg)?;
             let thread = str_at(&started["thread"], "id");
             if thread.is_empty() {
@@ -978,21 +968,74 @@ impl App {
         })
     }
     pub fn handling_followup(&self, p: &Value) -> Result<Value, String> {
-        let _guard = self
-            .handling_action
-            .try_lock()
-            .map_err(|_| "正在同步或提交处置，请稍后再试")?;
-        let run = self.run(str_at(p, "task_id"))?;
-        Self::ensure_local_control(&run)?;
+        self.handling_followup_wait(p, Duration::from_secs(60))
+    }
+    fn followup_target(&self, expected: &Run) -> Result<(), String> {
+        let run = self.run(&expected.task_id)?;
+        if run.id != expected.id || run.thread_id != expected.thread_id {
+            return Err("处置会话已变化，追问未发送；请核对后重试".into());
+        }
+        Self::ensure_local_control(&run)
+    }
+    fn wait_followup_action(
+        &self,
+        run: &Run,
+        timeout: Duration,
+    ) -> Result<MutexGuard<'_, ()>, String> {
+        let started = Instant::now();
+        loop {
+            crate::process::check_running()?;
+            self.followup_target(run)?;
+            match self.handling_action.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => return Err("处置协调状态异常，追问未发送".into()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if started.elapsed() >= timeout {
+                return Err("等待会话就绪超时，追问尚未发送；请稍后重试".into());
+            }
+            std::thread::sleep(
+                Duration::from_millis(25).min(timeout.saturating_sub(started.elapsed())),
+            );
+        }
+    }
+    fn handling_followup_wait(&self, p: &Value, timeout: Duration) -> Result<Value, String> {
         let text = str_at(p, "text").trim();
         if text.is_empty() || text.len() > 24000 {
             return Err("请输入追问内容（最多 24000 字节）".into());
         }
+        let run = self.run(str_at(p, "task_id"))?;
+        Self::ensure_local_control(&run)?;
+        if p["run_id"].as_str().is_some_and(|id| id != run.id)
+            || p["thread_id"]
+                .as_str()
+                .is_some_and(|id| id != run.thread_id)
+        {
+            return Err("处置会话已变化，追问未发送；请核对后重试".into());
+        }
         if run.thread_id.is_empty() {
             return Err("会话尚未创建成功，请先恢复连接；追问草稿已保留".into());
         }
+        if !self
+            .handling_followups
+            .lock()
+            .unwrap()
+            .insert(run.id.clone())
+        {
+            return Err("此会话的追问正在等待或发送，请勿重复提交".into());
+        }
+        let _pending = FollowupReservation {
+            app: self,
+            run_id: run.id.clone(),
+        };
+        if is_desktop(&run) {
+            return self.desktop_followup(&run, text);
+        }
+        let _guard = self.wait_followup_action(&run, timeout)?;
+        self.followup_target(&run)?;
         let c = self.run_client(&run)?;
         let turns = c.history(&run.thread_id)?;
+        self.followup_target(&run)?;
         if let Some(turn) = turns["data"]
             .as_array()
             .and_then(|v| v.iter().find(|t| t["status"] == "inProgress"))
@@ -1005,6 +1048,7 @@ impl App {
                         id: input_id.clone(),
                         text: text.into(),
                         accepted: false,
+                        not_submitted: false,
                     });
                 }
             })?;
@@ -1024,7 +1068,11 @@ impl App {
         let config = context_config(self, &run)?;
         c.resume(&run.thread_id, &config)?;
         let mut cfg = self.reserve_ai(AiMode::Manual, None)?.for_kind("handling");
-        if ai_backend::connection(&cfg)?.cache_key() != self.run_connection(&run)?.cache_key() {
+        let saved_connection = self.run_connection(&run)?;
+        if ai_backend::connection(&cfg).ok().map(|c| c.cache_key())
+            != Some(saved_connection.cache_key())
+        {
+            cfg.selected_connection = saved_connection.id.clone();
             cfg.model = run.model.clone();
             cfg.reasoning_effort = run.effort.clone();
         }
@@ -1060,27 +1108,18 @@ impl App {
         };
         ai_backend::backend(&connection)?.open_session(thread)
     }
-    /// Repair a legacy desktop session without resuming or injecting into the
-    /// desktop's active turn. The user can paste the returned scope note.
-    pub fn handling_context_note(&self, task: &str) -> Result<Value, String> {
-        let run = self.run(task)?;
-        if self.run_connection(&run)?.driver != "codex" {
-            return Err("仅 Codex 会话使用此上下文接入".into());
-        }
-        let context = context_config(self, &run)?;
-        self.run_client(&run)?.prepare_handoff("", &context, "")?;
-        Ok(json!({"text":context_note(&run.id)}))
-    }
     pub fn handling_stream(&self) -> Result<bool, String> {
+        if !self.handling_followups.lock().unwrap().is_empty() {
+            return Ok(false);
+        }
         let Ok(_guard) = self.handling_action.try_lock() else {
             return Ok(false);
         };
         let runs = self.state.lock().unwrap().handling.runs.clone();
         let mut changed = false;
-        for run in runs
-            .iter()
-            .filter(|r| !r.desktop_control && !r.thread_id.is_empty())
-        {
+        for run in runs.iter().filter(|r| {
+            !r.stop_requested && !is_desktop(r) && !r.desktop_control && !r.thread_id.is_empty()
+        }) {
             let c = self
                 .handling_client
                 .lock()
@@ -1093,7 +1132,7 @@ impl App {
             if events.is_empty() && requests == run.requests {
                 continue;
             }
-            self.update_run(&run.id, |r| {
+            self.update_run_inner(&run.id, true, |r| {
                 for event in &events {
                     if event.thread_id != r.thread_id {
                         continue;
@@ -1111,32 +1150,21 @@ impl App {
         }
         Ok(changed)
     }
-    pub fn handling_observe_desktop(&self) -> bool {
-        let runs = self.state.lock().unwrap().handling.runs.clone();
-        let mut changed = false;
-        for run in runs
-            .iter()
-            .filter(|r| r.desktop_control && !r.rollout_path.is_empty())
-        {
-            if let Some(o) = crate::desktop_watch::observe(
-                Path::new(&run.rollout_path),
-                &run.thread_id,
-                run.handoff_at,
-                &run.handoff_turns,
-            ) {
-                if run.desktop_turn_id != o.turn || run.desktop_status != o.status {
-                    changed |= self
-                        .update_run(&run.id, |r| {
-                            r.desktop_turn_id = o.turn;
-                            r.desktop_status = o.status;
-                        })
-                        .is_ok();
+    pub fn handling_sync(&self, task: Option<&str>) -> Result<Value, String> {
+        if let Some(task) = task {
+            if let Ok(run) = self.run(task) {
+                if is_desktop(&run) {
+                    if !run.stop_requested && run.watching {
+                        context_config(self, &run)?;
+                        self.handling_sync_desktop(Some(task));
+                    }
+                    return Ok(json!(true));
                 }
             }
         }
-        changed
-    }
-    pub fn handling_sync(&self, task: Option<&str>) -> Result<Value, String> {
+        if task.is_none() && !self.handling_followups.lock().unwrap().is_empty() {
+            return Ok(json!(false));
+        }
         let _guard = self
             .handling_action
             .try_lock()
@@ -1149,25 +1177,14 @@ impl App {
             .runs
             .iter()
             .filter(|r| {
-                (r.watching || task.is_some_and(|t| t == r.task_id)) && !r.thread_id.is_empty()
+                !r.stop_requested
+                    && !is_desktop(r)
+                    && (r.watching || task.is_some_and(|t| t == r.task_id))
+                    && !r.thread_id.is_empty()
             })
             .cloned()
             .collect::<Vec<_>>();
-        if runs.is_empty() {
-            return Ok(json!(true));
-        }
-        // Drain each connection once so multiple runs receive their usage events.
-        let mut batches = std::collections::BTreeMap::new();
         for run in runs {
-            if run.desktop_control && task.is_some() {
-                context_config(self, &run)?;
-            }
-            let connection = self.run_connection(&run)?;
-            let key = if run.desktop_control {
-                connection.cache_key()
-            } else {
-                format!("run:{}", run.id)
-            };
             let c = match self.run_client(&run) {
                 Ok(c) => c,
                 Err(error) => {
@@ -1180,55 +1197,24 @@ impl App {
                     continue;
                 }
             };
-            let events = batches.entry(key).or_insert_with(|| c.events());
             let result = (|| -> Result<(), String> {
                 let meta = c.read(&run.thread_id)?;
                 let turns = c.history(&run.thread_id)?;
-                let mut requests = if run.desktop_control {
-                    vec![]
-                } else {
-                    c.requests(&run.thread_id)
-                };
+                let events = c.events();
+                let mut requests = c.requests(&run.thread_id);
                 enrich_requests(&mut requests, &turns["data"]);
                 self.update_run(&run.id, |r| {
                     r.requests = requests;
                     r.error.clear();
                     r.synced = now();
-                    for event in events.iter() {
-                        if event.thread_id != r.thread_id {
-                            continue;
-                        }
+                    for event in events
+                        .iter()
+                        .filter(|event| event.thread_id == run.thread_id)
+                    {
                         apply_notification(r, &event.notification);
                         apply_usage_event(r, event);
                     }
                     apply_history(r, &turns["data"], &meta["thread"]);
-                    if r.desktop_control {
-                        if r.rollout_path.is_empty() {
-                            r.rollout_path = str_at(&meta["thread"], "path").into();
-                        }
-                        if let Some(turn) = turns["data"].as_array().and_then(|v| v.first()) {
-                            let tid = str_at(turn, "id");
-                            let terminal = ["completed", "interrupted", "failed"]
-                                .contains(&r.desktop_status.as_str());
-                            let stale_running = r.desktop_turn_id == tid
-                                && terminal
-                                && turn["status"] == "inProgress";
-                            if !stale_running
-                                && !r.handoff_turns.iter().any(|s| s == tid)
-                                && (r.desktop_turn_id.is_empty()
-                                    || r.desktop_turn_id == tid
-                                    || turns["data"].as_array().is_some_and(|rows| {
-                                        rows.iter().any(|x| x["id"] == r.desktop_turn_id)
-                                    }))
-                            {
-                                r.desktop_turn_id = tid.into();
-                                r.desktop_status = str_at(turn, "status").into();
-                            }
-                        }
-                        if r.desktop_status.is_empty() {
-                            r.desktop_status = "syncPending".into();
-                        }
-                    }
                 })?;
                 let updated = self
                     .state
@@ -1240,22 +1226,15 @@ impl App {
                     .find(|r| r.id == run.id)
                     .cloned()
                     .ok_or("处置记录不存在")?;
-                if !updated.desktop_control && !active(&updated) && updated.requests.is_empty() {
+                if !active(&updated) && updated.requests.is_empty() {
                     let _ = c.unsubscribe(&run.thread_id);
                 }
                 Ok(())
             })();
-            if let Err(e) = result {
+            if let Err(error) = result {
                 self.update_run(&run.id, |r| {
-                    r.error = e;
-                    r.requests = if r.desktop_control {
-                        vec![]
-                    } else {
-                        c.requests(&run.thread_id)
-                    };
-                    if r.desktop_control {
-                        r.desktop_status = "syncPending".into();
-                    }
+                    r.error = error;
+                    r.requests = c.requests(&run.thread_id);
                     if active(r) {
                         r.status = "disconnected".into();
                     }
@@ -1265,6 +1244,9 @@ impl App {
         Ok(json!(true))
     }
     pub fn handling_reconnect(&self, p: &Value) -> Result<Value, String> {
+        if is_desktop(&self.run(str_at(p, "task_id"))?) {
+            return self.desktop_reconnect(p);
+        }
         let _guard = self
             .handling_action
             .try_lock()
@@ -1341,13 +1323,37 @@ impl App {
         Ok(json!(true))
     }
     pub fn handling_request(&self, p: &Value) -> Result<Value, String> {
+        // A decision and a durable stop marker cannot overtake one another.
+        let _decision = self.handling_decision.lock().unwrap();
         let _guard = self
             .handling_action
             .try_lock()
             .map_err(|_| "正在处理会话，请稍后重试")?;
-        let run = self.run(str_at(p, "task_id"))?;
+        let run = if let Some(id) = p["run_id"].as_str() {
+            self.state
+                .lock()
+                .unwrap()
+                .handling
+                .runs
+                .iter()
+                .find(|r| {
+                    r.id == id
+                        && r.task_id == str_at(p, "task_id")
+                        && r.thread_id == str_at(p, "thread_id")
+                })
+                .cloned()
+                .ok_or("审批所属处置已变化，请重新核对")?
+        } else {
+            self.run(str_at(p, "task_id"))?
+        };
         Self::ensure_local_control(&run)?;
+        if is_desktop(&run) {
+            return Err("请在 Codex 桌面处理审批和补充问题".into());
+        }
         let c = self.run_client(&run)?;
+        if !active(&run) {
+            return Err("审批所属轮次已结束，请同步状态".into());
+        }
         let key = str_at(p, "request_id");
         let requests = c.requests(&run.thread_id);
         if str_at(p, "action") == "acceptAll" {
@@ -1375,7 +1381,7 @@ impl App {
                 {
                     return Err("补充问题和外部服务请求不能批量批准".into());
                 }
-                crate::ai_backend::codex_agent::approval_result(
+                crate::ai_backend::agent_approval::approval_result(
                     request,
                     &json!({"action":"accept"}),
                 )?;
@@ -1404,22 +1410,118 @@ impl App {
         );
         Ok(json!(true))
     }
-    pub fn handling_interrupt(&self, task: &str) -> Result<Value, String> {
-        let _guard = self
-            .handling_action
-            .try_lock()
-            .map_err(|_| "正在处理会话，请稍后重试")?;
-        let run = self.run(task)?;
-        Self::ensure_local_control(&run)?;
-        let c = self.run_client(&run)?;
-        let turns = c.history(&run.thread_id)?;
-        let turn = &turns["data"][0];
-        if turn["status"] != "inProgress" {
-            return Err("没有正在运行的轮次，请同步状态".into());
+    /// Minimal, credential-free data for both approval surfaces, across sources.
+    pub fn desktop_approvals(&self) -> Vec<Value> {
+        let state = self.state.lock().unwrap();
+        let mut rows = Vec::new();
+        for r in state
+            .handling
+            .runs
+            .iter()
+            .filter(|r| !r.stop_requested && !is_desktop(r) && !r.desktop_control && active(r))
+        {
+            for request in &r.requests {
+                rows.push(json!({
+                    "run":{"id":r.id,"thread_id":r.thread_id,"task_id":r.task_id,"cwd":r.cwd,"project_name":r.project_name,"requests":r.requests},
+                    "task":{"id":r.task_id,"title":state.tasks.iter().find(|t|t.id==r.task_id).map(|t|t.title.as_str()).unwrap_or("当前事项")},
+                    "request":request,"key":format!("{}:{}:{}",r.id,r.thread_id,request["id"])
+                }));
+            }
         }
-        c.interrupt(&run.thread_id, str_at(turn, "id"))?;
+        rows
+    }
+
+    /// End only the local association. A desktop-owned conversation keeps
+    /// running; no client, process or remote turn is interrupted here.
+    /// Stop the backend owned by this run, without holding the submission lock.
+    /// This also works while thread/start or turn/start is waiting for a reply.
+    pub fn handling_terminate(&self, p: &Value) -> Result<Value, String> {
+        let target = self
+            .state
+            .lock()
+            .unwrap()
+            .handling
+            .runs
+            .iter()
+            .find(|r| r.id == str_at(p, "run_id") && r.task_id == str_at(p, "task_id"))
+            .cloned()
+            .ok_or("处置目标已变化")?;
+        if is_desktop(&target) {
+            return self.finish_desktop(p);
+        }
+        let _stop = self
+            .handling_stop
+            .try_lock()
+            .map_err(|_| "正在终止处置，请稍后重试")?;
+        let id = str_at(p, "run_id");
+        {
+            let _decision = self.handling_decision.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
+            let mut next = state.clone();
+            let run = next
+                .handling
+                .runs
+                .iter_mut()
+                .find(|r| r.id == id && r.task_id == str_at(p, "task_id"))
+                .ok_or("终止目标已变化，请重新核对")?;
+            if run.desktop_control {
+                return Err("会话已交接，请在 Codex 中终止".into());
+            }
+            if run.status == "terminated" {
+                return Ok(json!(true));
+            }
+            run.stop_requested = true;
+            run.status = "stopping".into();
+            run.requests.clear();
+            run.watching = false;
+            run.updated = now();
+            self.save(&next)?;
+            *state = next;
+        }
+        // run_client registers a dedicated child before any work is submitted.
+        // It rechecks the durable marker under the cache lock when creating it.
+        // Closing only this child also closes its Windows process-tree job.
+        let key = format!("run:{id}");
+        let client = self.handling_client.lock().unwrap().get(&key).cloned();
+        if let Some(client) = client {
+            client
+                .close()
+                .map_err(|e| format!("停止尚未确认，请重试终止：{e}"))?;
+            self.handling_client.lock().unwrap().remove(&key);
+        }
+        let mut state = self.state.lock().unwrap();
+        let mut next = state.clone();
+        let run = next
+            .handling
+            .runs
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or("处置记录不存在")?;
+        run.status = "terminated".into();
+        run.error.clear();
+        run.requests.clear();
+        run.watching = false;
+        run.updated = now();
+        for round in &mut run.rounds {
+            if matches!(
+                round.status.as_str(),
+                "submitting" | "inProgress" | "waiting"
+            ) {
+                round.status = "interrupted".into();
+                round.completed_at = Some(now());
+                round.duration_ms = round.started_at.map(|at| now().saturating_sub(at));
+            }
+        }
+        self.save(&next)?;
+        *state = next;
+        drop(state);
+        self.log(
+            "handling_status",
+            json!({"run_id":id,"task_id":p["task_id"],"status":"terminated"}),
+        );
         Ok(json!(true))
     }
+
     pub fn handling_history(&self) -> Value {
         let s = self.state.lock().unwrap();
         json!({"versions":s.handling.versions,"proposals":s.handling.proposals,"current":current(&s).id})
@@ -1508,9 +1610,8 @@ impl App {
     }
     pub fn handling_audit(&self, task: &str) -> Result<Value, String> {
         let r = self.run(task)?;
-        let path = self
-            .root
-            .join("data/handling-context")
+        let path = crate::storage::data_dir(&self.root)
+            .join("handling-context")
             .join(format!("{}.audit.jsonl", r.id));
         let rows = std::fs::read_to_string(path)
             .unwrap_or_default()
@@ -1738,6 +1839,9 @@ pub fn apply_learning(
 }
 
 fn apply_notification(run: &mut Run, event: &Value) {
+    if run.stop_requested {
+        return;
+    }
     let p = &event["params"];
     match str_at(event, "method") {
         "item/agentMessage/delta" => {
@@ -1827,6 +1931,26 @@ fn process_step(item: &Value) -> Option<Value> {
     let kind = str_at(item, "type");
     let text = match kind {
         "agentMessage" => str_at(item, "text").to_owned(),
+        "userMessage" => item["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "functionCall" => format!(
+            "{}\n{}",
+            str_at(item, "name"),
+            item["arguments"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| item["arguments"].to_string())
+        ),
+        "functionCallOutput" => item["output"]
+            .as_str()
+            .or_else(|| item["output"]["text"].as_str())
+            .unwrap_or("")
+            .to_owned(),
         "commandExecution" => format!(
             "{}\n{}",
             str_at(item, "command"),
@@ -1873,6 +1997,9 @@ fn enrich_requests(requests: &mut [Value], turns: &Value) {
     }
 }
 fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
+    if run.stop_requested {
+        return;
+    }
     let Some(turns) = data.as_array() else {
         run.error = "所选接入未返回轮次记录".into();
         return;
@@ -1893,6 +2020,16 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
             .iter()
             .position(|r| {
                 r.turn_id == tid
+                    || (r.turn_id.is_empty()
+                        && !r.not_submitted
+                        && turn["items"].as_array().is_some_and(|items| {
+                            items.iter().any(|item| {
+                                item["type"] == "userMessage"
+                                    && item["content"].as_array().is_some_and(|parts| {
+                                        parts.iter().any(|part| part["text"] == r.question)
+                                    })
+                            })
+                        }))
                     || turn["items"].as_array().is_some_and(|items| {
                         items
                             .iter()
@@ -1975,13 +2112,18 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                     .or_else(|| item["id"].as_str())
                     .unwrap_or(&text)
                     .to_string();
-                if let Some(input) = r.supplements.iter_mut().find(|v| v.id == iid) {
+                if let Some(input) = r
+                    .supplements
+                    .iter_mut()
+                    .find(|v| v.id == iid || v.text == text)
+                {
                     input.accepted = true;
                 } else if !r.supplements.iter().any(|v| v.text == text) {
                     r.supplements.push(Supplement {
                         id: iid,
                         text,
                         accepted: true,
+                        not_submitted: false,
                     });
                 }
             }
@@ -2044,7 +2186,10 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
     if let Some(model) = thread["model"].as_str() {
         run.model = model.into();
     }
-    if !run.desktop_control && thread["status"]["type"] == "notLoaded" && run.status == "inProgress"
+    if !is_desktop(run)
+        && !run.desktop_control
+        && thread["status"]["type"] == "notLoaded"
+        && run.status == "inProgress"
     {
         run.status = "disconnected".into();
         run.error="此会话有未结束记录，当前连接尚未接管；可恢复连接核实，或在相应客户端查看。不会自动重发任务。".into();
@@ -2056,6 +2201,7 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai_backend::agent_approval::approval_result;
     #[test]
     fn legacy_desktop_owner_does_not_display_the_old_handoff_interrupt() {
         let mut state = State::default();
@@ -2182,45 +2328,6 @@ mod tests {
     }
 
     #[test]
-    fn harness_transfer_without_codex_preserves_local_ownership() {
-        let root = std::env::temp_dir().join(format!("shishi-dsh-handoff-{}", id()));
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().handling.runs.push(Run {
-            id: "run".into(),
-            task_id: "task".into(),
-            thread_id: "thread".into(),
-            status: "inProgress".into(),
-            connection: Some(Connection {
-                driver: "dsh".into(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        {
-            let mut state = app.state.lock().unwrap();
-            let connection = state.handling.runs[0].connection.clone().unwrap();
-            state.config.ai_connections = vec![Connection {
-                id: "dsh".into(),
-                ..connection
-            }];
-            state.config.selected_connection = "dsh".into();
-            state.handling.runs[0].connection = Some(state.config.ai_connections[0].clone());
-            state.config.codex.clear();
-        }
-        assert!(app.handling_handoff("task").unwrap_err().contains("Codex"));
-        let run = app.run("task").unwrap();
-        assert!(!run.desktop_control);
-        assert_eq!(run.status, "inProgress");
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
-    }
-    use crate::{
-        ai_backend::codex_agent::{approval_result, turn_params},
-        codex_bridge::Client,
-    };
-    use std::io::{BufRead, Write};
-
-    #[test]
     fn reinitialization_never_rebinds_an_old_run_to_the_current_provider() {
         let mut state = State::default();
         state.config.codex = "original.exe".into();
@@ -2236,286 +2343,6 @@ mod tests {
         assert!(restored.connection.is_none());
     }
 
-    // Runs only as a child fixture. No network, model, real Codex state or user projects.
-    #[test]
-    #[ignore = "Child JSON-RPC fixture, launched by persistent_flow test"]
-    fn mock_server() {
-        if std::env::var("SHISHI_RPC_FIXTURE").as_deref() != Ok("1") {
-            return;
-        }
-        println!();
-        std::io::stdout().flush().unwrap();
-        let mut turns: Vec<Value> = vec![];
-        let mut waiting = false;
-        let mut archived = false;
-        let send = |value: Value| {
-            println!("{value}");
-            std::io::stdout().flush().unwrap();
-        };
-        let thread = "01234567-89ab-4def-8123-456789abcdef";
-        for line in std::io::stdin().lock().lines() {
-            let Ok(v) = serde_json::from_str::<Value>(&line.unwrap()) else {
-                continue;
-            };
-            if v.get("method").is_none() {
-                if v["id"] == "approval-one" {
-                    waiting = false;
-                    turns[0]["status"] = json!("completed");
-                }
-                continue;
-            }
-            let p = &v["params"];
-            let method = str_at(&v, "method");
-            let legacy = std::env::var("SHISHI_RPC_LEGACY").as_deref() == Ok("1");
-            if legacy && ["project/list", "thread/turns/list"].contains(&method) {
-                send(json!({"id":v["id"],"error":{"code":-32601,"message":"Method not found"}}));
-                continue;
-            }
-            let result = match method {
-                "initialize" => json!({"userAgent":"fixture"}),
-                "config/read" => {
-                    json!({"config":{"mcp_servers":{"unrelated":{"command":"preserved"}}}})
-                }
-                "config/value/write" => {
-                    assert_eq!(p["keyPath"], "mcp_servers.shishi_context");
-                    assert_eq!(p["value"]["args"][0], "--context-mcp-root");
-                    json!({})
-                }
-                "thread/inject_items" => {
-                    assert!(p["items"][0]["content"][0]["text"]
-                        .as_str()
-                        .unwrap()
-                        .contains("context_token"));
-                    json!({})
-                }
-                "mcpServerStatus/list" => {
-                    json!({"data":[{"name":"shishi_context","tools":{"get_task_context":{}}}]})
-                }
-                "initialized" => continue,
-                "project/list" => {
-                    json!({"data":[{"id":"project","name":"Fixture project","roots":[{"path":std::env::current_dir().unwrap()}]}],"nextCursor":null})
-                }
-                "thread/start" => {
-                    if legacy {
-                        assert!(p.get("projectId").is_none());
-                    } else {
-                        assert_eq!(p["projectId"], "project");
-                    }
-                    assert_eq!(p["ephemeral"], false);
-                    assert!(p["config"]["mcp_servers.shishi_context"]["args"].is_array());
-                    for k in [
-                        "sandbox",
-                        "approvalPolicy",
-                        "approvalsReviewer",
-                        "permissions",
-                        "baseInstructions",
-                    ] {
-                        assert!(p.get(k).is_none());
-                    }
-                    json!({"thread":{"id":thread},"model":"fixture-model","approvalPolicy":"on-request"})
-                }
-                "thread/name/set" => json!({}),
-                "thread/read" => {
-                    json!({"thread":{"id":thread,"projectId":if legacy{Value::Null}else{json!("project")},"cwd":std::env::current_dir().unwrap(),"turns":turns.iter().rev().collect::<Vec<_>>(),"status":{"type":if waiting{"active"}else{"idle"}}}})
-                }
-                "turn/steer" => {
-                    assert_eq!(p["threadId"], thread);
-                    assert_eq!(p["expectedTurnId"], turns[0]["id"]);
-                    assert!(waiting);
-                    turns[0]["items"].as_array_mut().unwrap().push(json!({"type":"userMessage","clientId":p["clientUserMessageId"],"content":p["input"]}));
-                    json!({"turnId":turns[0]["id"]})
-                }
-                "turn/interrupt" => {
-                    waiting = false;
-                    if let Some(turn) = turns.first_mut() {
-                        turn["status"] = json!("interrupted");
-                    }
-                    json!({})
-                }
-                "turn/start" => {
-                    assert_eq!(p["threadId"], thread);
-                    assert_eq!(p["model"], "fixture-model");
-                    assert_eq!(p["effort"], "low");
-                    for k in ["sandboxPolicy", "approvalPolicy", "permissions"] {
-                        assert!(p.get(k).is_none());
-                    }
-                    let id = format!("turn-{}", turns.len() + 1);
-                    let turn = json!({"id":id,"status":if turns.is_empty(){"inProgress"}else{"completed"},"startedAt":chrono::Utc::now().timestamp(),"items":[{"type":"userMessage","clientId":p["clientUserMessageId"],"content":p["input"]},{"type":"agentMessage","phase":"commentary","text":"Checking fixture evidence"},{"type":"agentMessage","phase":"final_answer","text":"Verified fixture evidence; suggested next step."}]});
-                    if turns.is_empty() {
-                        waiting = true;
-                        send(
-                            json!({"id":"approval-one","method":"item/commandExecution/requestApproval","params":{"threadId":thread,"turnId":id,"command":"fixture-read-only","cwd":"fixture","reason":"fixture request"}}),
-                        );
-                    }
-                    send(
-                        json!({"method":"thread/tokenUsage/updated","params":{"threadId":thread,"turnId":id,"tokenUsage":{"total":{"inputTokens":100*(turns.len()+1),"outputTokens":23*(turns.len()+1),"cachedInputTokens":40*(turns.len()+1)},"last":{"inputTokens":100,"outputTokens":23,"cachedInputTokens":40}}}}),
-                    );
-                    turns.insert(0, turn.clone());
-                    json!({"turn":turn})
-                }
-                "thread/turns/list" => json!({"data":turns,"nextCursor":null}),
-                "thread/unsubscribe" => {
-                    archived = true;
-                    json!({"status":"unloaded"})
-                }
-                "thread/resume" => {
-                    assert!(archived);
-                    assert_eq!(p["threadId"], thread);
-                    assert_eq!(p["excludeTurns"], true);
-                    json!({"thread":{"id":thread,"status":{"type":"idle"}},"model":"fixture-model"})
-                }
-                "fixture/crash" => break,
-                _ => panic!("Unexpected fixture method: {method}"),
-            };
-            send(json!({"id":v["id"],"result":result}));
-        }
-    }
-    #[test]
-    fn persistent_flow_approval_followup_restart_and_no_poll_ai() {
-        persistent_flow(false);
-    }
-    #[test]
-    fn cli_only_project_and_history_fallback_support_same_conversation() {
-        persistent_flow(true);
-    }
-    fn persistent_flow(legacy: bool) {
-        let root = std::env::temp_dir().join(format!("shishi-handling-test-{}", id()));
-        let app = App::load(root.clone()).unwrap();
-        app.test_force_working();
-        {
-            let mut s = app.state.lock().unwrap();
-            s.config.model = "fixture-model".into();
-            s.config.model_profiles = None;
-            s.config.reasoning_effort = "low".into();
-            s.config.daily_calls = 10;
-            s.tasks.push(Task {
-                id: "task".into(),
-                title: "Fixture investigation".into(),
-                status: "待处理".into(),
-                ..Default::default()
-            });
-        }
-        app.persist().unwrap();
-        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-        cmd.args([
-            "--exact",
-            "handling::tests::mock_server",
-            "--nocapture",
-            "--ignored",
-            "--format=terse",
-        ])
-        .env("SHISHI_RPC_FIXTURE", "1")
-        .env("SHISHI_RPC_LEGACY", if legacy { "1" } else { "0" });
-        let c = Client::connect_command(cmd).unwrap();
-        app.handling_client
-            .lock()
-            .unwrap()
-            .insert(app.handling_connection().unwrap().cache_key(), c.clone());
-        let project = if legacy {
-            app.handling_add_project(&json!({"cwd":std::env::current_dir().unwrap()}))
-                .unwrap()
-        } else {
-            json!({"id":"project","cwd":std::env::current_dir().unwrap()})
-        };
-        let p = json!({"task_id":"task","project_id":project["id"],"cwd":project["cwd"],"instructions":"Investigate only"});
-        app.handling_start(&p).unwrap();
-        let original_connection = app.run("task").unwrap().connection.unwrap();
-        // Switching settings must not reconnect or submit this run to a different CLI.
-        {
-            let mut state = app.state.lock().unwrap();
-            state.config.codex = "not-a-real-cli-must-not-launch.exe".into();
-            state.config.model = "wrong-model-for-existing-session".into();
-        }
-        assert!(app.handling_start(&p).is_err());
-        app.handling_sync(Some("task")).unwrap();
-        let r = app.run("task").unwrap();
-        assert_eq!(r.status, "waiting");
-        assert!(r.rounds[0].conclusion.is_empty());
-        assert_eq!(r.requests.len(), 1);
-        let inserted = app
-            .handling_followup(
-                &json!({"task_id":"task","text":"Correction: inspect the new evidence"}),
-            )
-            .unwrap();
-        assert_eq!(inserted["steered"], true);
-        app.handling_sync(Some("task")).unwrap();
-        let inserted = app.run("task").unwrap();
-        assert_eq!(inserted.rounds.len(), 1);
-        assert_eq!(inserted.rounds[0].supplements.len(), 1);
-        assert!(inserted.rounds[0].supplements[0].accepted);
-        let logs = app.activity.lock().unwrap().len();
-        app.handling_sync(Some("task")).unwrap();
-        assert_eq!(app.activity.lock().unwrap().len(), logs);
-        assert_eq!(app.state.lock().unwrap().input_tokens, 100);
-        assert_eq!(app.state.lock().unwrap().calls, 1);
-        app.handling_request(
-            &json!({"task_id":"task","request_id":"\"approval-one\"","action":"decline"}),
-        )
-        .unwrap();
-        app.handling_sync(Some("task")).unwrap();
-        let r = app.run("task").unwrap();
-        assert_eq!(r.status, "completed");
-        assert!(r.rounds[0].conclusion.contains("Verified"));
-        assert_eq!(app.state.lock().unwrap().tasks[0].status, "待处理");
-        app.handling_followup(&json!({"task_id":"task","text":"Please verify the result"}))
-            .unwrap();
-        app.handling_sync(Some("task")).unwrap();
-        assert_eq!(app.run("task").unwrap().rounds.len(), 2);
-        assert_eq!(app.state.lock().unwrap().calls, 2);
-        assert_eq!(app.state.lock().unwrap().input_tokens, 200);
-        assert_eq!(app.state.lock().unwrap().unreported_calls, 0);
-        assert!(app
-            .activity
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|v| v["kind"] == "handling_round" && v["detail"]["status"] == "completed"));
-        let evidence = learning_batch(&app.state.lock().unwrap());
-        assert_eq!(evidence.evidence.len(), 2);
-        assert!(evidence.evidence[0]["corrections"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v.as_str().unwrap().contains("Correction")));
-        assert!(!evidence
-            .payload()
-            .to_string()
-            .contains(crate::prompt_config::get("handling_boundary")));
-        apply_learning(
-            &mut app.state.lock().unwrap(),
-            &evidence,
-            &json!({"improved":false,"evidence_sufficient":true,"reason":"No general change"}),
-        )
-        .unwrap();
-        assert!(learning_batch(&app.state.lock().unwrap())
-            .evidence
-            .is_empty());
-        app.handling_handoff("task").unwrap();
-        assert!(app.run("task").unwrap().desktop_control);
-        assert!(!c.is_alive());
-        assert!(app
-            .handling_followup(&json!({"task_id":"task","text":"do not submit"}))
-            .is_err());
-        assert!(app
-            .handling_request(&json!({"task_id":"task","action":"accept"}))
-            .is_err());
-        assert!(app.handling_interrupt("task").is_err());
-        assert!(app.handling_reconnect(&json!({"task_id":"task"})).is_err());
-        app.handling_handoff("task").unwrap(); // Idempotent retry only opens the desktop.
-        assert!(c.call("fixture/crash", json!({})).is_err());
-        drop(app);
-        drop(c);
-        let restored = App::load(root.clone()).unwrap();
-        let r = restored.run("task").unwrap();
-        assert_eq!(r.thread_id, "01234567-89ab-4def-8123-456789abcdef");
-        assert_eq!(r.rounds.len(), 2);
-        assert_eq!(r.connection.as_ref(), Some(&original_connection));
-        assert_eq!(r.model, "fixture-model");
-        assert!(r.requests.is_empty());
-        drop(restored);
-        assert!(root.starts_with(std::env::temp_dir()));
-        std::fs::remove_dir_all(root).unwrap();
-    }
     #[test]
     fn learning_keeps_structured_first_question_and_reports_real_truncation() {
         let mut s = State::default();
@@ -2714,20 +2541,6 @@ mod tests {
         assert!(match_route(&t, &[r.clone(), r]).is_none());
     }
     #[test]
-    fn turn_keeps_codex_permissions() {
-        let p = turn_params("t", "hello", &Config::default(), "message");
-        for key in [
-            "permissions",
-            "sandboxPolicy",
-            "approvalPolicy",
-            "approvalsReviewer",
-            "parentTurnId",
-        ] {
-            assert!(p.get(key).is_none());
-        }
-        assert_eq!(p["input"][0]["text"], "hello");
-    }
-    #[test]
     fn conclusion_requires_completed_turn() {
         let mut r = Run::default();
         let mut turn = json!({"id":"turn","status":"inProgress","items":[{"type":"agentMessage","phase":"commentary","text":"checking"},{"type":"agentMessage","phase":"final_answer","text":"actual finding"}]});
@@ -2854,65 +2667,5 @@ mod tests {
             .as_str()
             .unwrap()
             .ends_with("中文输出 🚀"));
-    }
-
-    #[test]
-    fn handoff_interrupts_waiting_round_and_leaves_other_process_alive() {
-        let root = std::env::temp_dir().join(format!("shishi-handoff-{}", id()));
-        let app = App::load(root.clone()).unwrap();
-        app.test_force_working();
-        app.state.lock().unwrap().tasks.push(Task {
-            id: "task".into(),
-            title: "Fixture".into(),
-            status: "待处理".into(),
-            suggested_project_id: "project".into(),
-            suggested_project_reason: "Explicit fixture project".into(),
-            ..Default::default()
-        });
-        let make_client = || {
-            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
-            cmd.args([
-                "--exact",
-                "handling::tests::mock_server",
-                "--nocapture",
-                "--ignored",
-                "--format=terse",
-            ])
-            .env("SHISHI_RPC_FIXTURE", "1");
-            Client::connect_command(cmd).unwrap()
-        };
-        let c = make_client();
-        let other = make_client();
-        app.handling_client
-            .lock()
-            .unwrap()
-            .insert(app.handling_connection().unwrap().cache_key(), c.clone());
-        app.handling_client
-            .lock()
-            .unwrap()
-            .insert("run:other".into(), other.clone());
-        assert_eq!(
-            app.handling_prepare("task").unwrap()["suggested"]["project_id"],
-            "project"
-        );
-        app.state.lock().unwrap().tasks[0].suggested_project_id = "not-provided".into();
-        assert!(app.handling_prepare("task").unwrap()["suggested"].is_null());
-        app.state.lock().unwrap().config.model = "fixture-model".into();
-        app.state.lock().unwrap().config.model_profiles = None;
-        app.state.lock().unwrap().config.reasoning_effort = "low".into();
-        app.handling_start(&json!({"task_id":"task","project_id":"project","cwd":std::env::current_dir().unwrap()})).unwrap();
-        app.handling_sync(Some("task")).unwrap();
-        assert_eq!(app.run("task").unwrap().status, "waiting");
-        app.handling_handoff("task").unwrap();
-        assert_eq!(app.run("task").unwrap().status, "interrupted");
-        assert!(app.run("task").unwrap().desktop_control);
-        assert!(!c.is_alive());
-        assert!(other.is_alive());
-        app.handling_handoff("task").unwrap();
-        assert!(other.is_alive());
-        drop(app);
-        drop(c);
-        drop(other);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

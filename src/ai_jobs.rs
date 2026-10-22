@@ -60,7 +60,7 @@ pub fn start(app: &Arc<crate::engine::App>, p: &Value) -> Result<Value, String> 
         }))
         .unwrap_or_else(|_| Err("后台操作异常终止，请查看日志".into()));
         if let Err(ref error) = result {
-            if error != crate::ai_control::CANCELLED {
+            if error != crate::ai_control::CANCELLED && !error.starts_with("AI_UNCONFIGURED:") {
                 worker.log(
                     "request_error",
                     json!({"method":request["method"],"job_id":key,"error":error}),

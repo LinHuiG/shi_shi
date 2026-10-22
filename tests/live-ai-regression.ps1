@@ -3,6 +3,7 @@ param(
     [switch]$AllowLiveAi,
     [ValidateSet('codex','dsh','api')][string]$OnlySource,
     [string]$OnlyScenario,
+    [switch]$UseAnalysisRoute,
     [string]$OutputDirectory,
     [string]$Binary
 )
@@ -16,6 +17,7 @@ if(!(Test-Path -LiteralPath $binary -PathType Leaf)){throw '请先构建 release
 $testArgs=@('--live-ai-regression','--allow-live-ai','--config-root',$ConfigRoot,'--root',$OutputDirectory)
 if($OnlySource){$testArgs+=@('--only-source',$OnlySource)}
 if($OnlyScenario){$testArgs+=@('--only-scenario',$OnlyScenario)}
+if($UseAnalysisRoute){$testArgs+='--use-analysis-route'}
 $startInfo=[Diagnostics.ProcessStartInfo]::new($binary)
 $startInfo.UseShellExecute=$false
 $startInfo.CreateNoWindow=$true

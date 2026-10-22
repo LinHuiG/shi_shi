@@ -225,6 +225,10 @@ fn batch_limited(
     };
     let mut payload = json!({
         "evidence":audits,
+        "archive_memory_sources": evidence_ids.iter().map(|i| {
+            let audit=&s.audit[*i];
+            json!({"evidence_id":format!("audit:{i}"),"task_id":audit.task_id,"kind":audit.kind})
+        }).collect::<Vec<_>>(),
         "archive_note_sources": evidence_ids.iter().filter_map(|i| {
             let audit = &s.audit[*i];
             (audit.kind == "manual_archive").then_some(audit.after["archive_note"].as_str()).flatten()
@@ -317,7 +321,7 @@ fn apply_memory_changes(
     s: &mut State,
     changes: &[Value],
     allowed: &BTreeSet<String>,
-    notes: &BTreeSet<String>,
+    memory_sources: &BTreeSet<String>,
     at: i64,
 ) -> Result<usize, String> {
     if changes.len() > 16 {
@@ -360,8 +364,8 @@ fn apply_memory_changes(
         {
             return Err("归档记忆缺少有效来源".into());
         }
-        if !source.iter().any(|id| notes.contains(id)) {
-            return Err("归档记忆必须来自本批事项归档备注".into());
+        if !source.iter().any(|id| memory_sources.contains(id)) {
+            return Err("归档记忆必须引用本批操作记录或归档备注".into());
         }
         if scope == "once" {
             // A one-off exception stays with the task/note and is only recorded.
@@ -369,7 +373,7 @@ fn apply_memory_changes(
                 time: at,
                 kind: "archive_memory_once".into(),
                 task_id: change["task_id"].as_str().unwrap_or("").into(),
-                detail: format!("一次性归档备注：{key}"),
+                detail: format!("一次性归档经验：{key}"),
                 before: Value::Null,
                 after: json!({"key":key,"text":change["text"],"source":source}),
             });
@@ -504,26 +508,16 @@ fn apply(s: &mut State, candidate: &Candidate, result: Value, at: i64) -> Result
         .cloned()
         .unwrap_or_default();
     let allowed = candidate.evidence_refs();
-    let notes = candidate
-        .learning_ids
+    let memory_sources = candidate
+        .evidence_ids
         .iter()
-        .filter(|index| {
-            s.audit.get(**index).is_some_and(|audit| {
-                audit.kind == "manual_archive"
-                    && !audit.after["archive_note"]
-                        .as_str()
-                        .unwrap_or("")
-                        .trim()
-                        .is_empty()
-            })
-        })
         .map(|index| format!("audit:{index}"))
         .collect::<BTreeSet<_>>();
 
     // The only AI-maintained policy data admitted by archive is archived memory.
     // Legacy/unsolicited policy outputs have no mutation path, even if old
     // automatic-adoption flags remain set in an upgraded configuration.
-    let memory_applied = apply_memory_changes(s, &memory_changes, &allowed, &notes, at)?;
+    let memory_applied = apply_memory_changes(s, &memory_changes, &allowed, &memory_sources, at)?;
 
     // Completed tasks become archived only in the successful commit. Tasks
     // edited while the model was running are left for a later archive.
@@ -655,9 +649,6 @@ fn fallback_report(s: &State, candidate: &Candidate, at: i64) -> Value {
 }
 
 impl App {
-    fn latest_attempt(s: &State) -> Option<&ArchiveAttempt> {
-        s.archive_attempts.last()
-    }
     fn upsert_attempt(&self, attempt: ArchiveAttempt) -> Result<(), String> {
         let mut lock = self.state.lock().unwrap();
         let mut s = lock.clone();
@@ -687,10 +678,12 @@ impl App {
         // looking as if it were still running.
         *lock = s;
         drop(lock);
-        self.log(
-            "archive_failed",
-            json!({"kind":"archive","attempt_id":id,"error":error}),
-        );
+        if !error.starts_with("AI_UNCONFIGURED:") {
+            self.log(
+                "archive_failed",
+                json!({"kind":"archive","attempt_id":id,"error":error}),
+            );
+        }
         saved
     }
     fn mark_attempt_failed_in_memory(&self, id: &str, error: &str) {
@@ -918,6 +911,12 @@ impl App {
                 return Err(crate::work_hours::DEFERRED.into());
             }
         }
+        if let Err(error) = self.require_ai_purpose("archive") {
+            if let Some(existing) = &existing {
+                self.fail_attempt(&existing.id, &error)?;
+            }
+            return Err(error);
+        }
         let attempt = self.start_attempt(trigger, at, existing)?;
         let mut call = self.begin_ai_for("archive").map_err(|error| {
             let _ = self.fail_attempt(&attempt.id, &error);
@@ -1043,8 +1042,8 @@ impl App {
         }
         run
     }
-    fn write_report_file(&self, report: &Value) -> Result<(), String> {
-        let dir = self.root.join("data/reports");
+    pub(crate) fn write_report_file(&self, report: &Value) -> Result<(), String> {
+        let dir = crate::storage::data_dir(&self.root).join("reports");
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         fs::write(
             dir.join(format!(
@@ -1468,6 +1467,7 @@ mod tests {
     fn archive_uses_full_rendered_budget_instead_of_fixed_event_or_task_caps() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         batch_fixture(&app, 60_000, 40);
         let frozen = app.state.lock().unwrap().clone();
         let attempt = ArchiveAttempt {
@@ -1502,6 +1502,7 @@ mod tests {
         for automatic in [false, true] {
             let root = root();
             let app = App::load(root.clone()).unwrap();
+            app.state.lock().unwrap().config.model_profiles = None;
             app.test_force_working();
             batch_fixture(&app, 10_000, 40);
             let existing = if automatic {
@@ -1583,6 +1584,7 @@ mod tests {
         for stop in ["failure", "cancel", "timeout"] {
             let root = root();
             let app = App::load(root.clone()).unwrap();
+            app.state.lock().unwrap().config.model_profiles = None;
             batch_fixture(&app, 10_000, 40);
             if stop == "timeout" {
                 app.state.lock().unwrap().config.ai_timeout_seconds = 1;
@@ -1629,6 +1631,7 @@ mod tests {
     fn invalid_result_and_save_failure_leave_every_business_effect_unchanged() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         let task = seed(&app, "明确说明只做一次");
         let latest = app.state.lock().unwrap().archive_attempts.last().cloned();
         assert!(latest.is_none());
@@ -1682,6 +1685,7 @@ mod tests {
     fn successful_commit_sets_success_cursor_and_effects_in_one_save() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         seed(&app, "普通确认");
         let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
         let candidate = {
@@ -1724,11 +1728,13 @@ mod tests {
     fn restart_before_commit_fails_without_replay_and_success_survives() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         seed(&app, "重启前");
         let queued = app.queue_attempt("nightly_archive", now()).unwrap();
         assert_eq!(queued["queued"], true);
         drop(app);
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         let s = app.state.lock().unwrap();
         assert_eq!(s.archive_attempts.last().unwrap().status, "failed");
         assert!(s
@@ -1754,6 +1760,7 @@ mod tests {
         app.commit(candidate, result("成功"), now()).unwrap();
         drop(app);
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         let s = app.state.lock().unwrap();
         assert_eq!(s.archive_attempts.last().unwrap().status, "succeeded");
         drop(s);
@@ -1764,6 +1771,7 @@ mod tests {
     fn no_new_input_reuses_report_and_first_empty_uses_fallback() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         let empty = app.archive(AiMode::Manual).unwrap();
         assert_eq!(empty["summary_status"], "fallback");
@@ -1795,6 +1803,7 @@ mod tests {
     fn memory_changes_support_lasting_once_correction_and_revoke() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         let task = seed(&app, "以后默认先核对环境，只此一次忽略版本");
         let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
         let candidate = {
@@ -1855,40 +1864,60 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
     #[test]
-    fn archive_contract_limits_memory_to_frozen_notes_and_rejects_other_evidence_atomically() {
+    fn archive_contract_accepts_operation_learning_without_notes_and_rejects_unseen_sources() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
-        let task = seed(&app, "持续核对原始证据");
+        app.state.lock().unwrap().config.model_profiles = None;
+        let task = seed(&app, "");
         let candidate = {
             let s = app.state.lock().unwrap();
             batch(&s, AiMode::Manual, now(), "attempt", "day")
         };
-        let sources = candidate.payload["archive_note_sources"]
+        assert!(candidate.payload["archive_note_sources"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let sources = candidate.payload["archive_memory_sources"]
             .as_array()
             .unwrap();
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0]["task_id"], task);
-        let source = sources[0]["evidence_id"].clone();
+        assert!(!sources.is_empty());
         let config = app.state.lock().unwrap().config.clone();
         let prepared = crate::ai::prepare(&config, "archive", &candidate.payload);
         let schema = &prepared.schema["properties"]["memory_changes"];
+        assert_eq!(schema["maxItems"], 16);
         assert_eq!(
             schema["items"]["properties"]["source"]["items"]["enum"],
-            json!([source])
+            json!(sources
+                .iter()
+                .map(|r| r["evidence_id"].clone())
+                .collect::<Vec<_>>())
         );
-        assert!(prepared.prompt.contains("archive_note_sources"));
-        assert!(prepared.prompt.contains("普通消息"));
-        let mut s = app.state.lock().unwrap().clone();
-        let before = serde_json::to_value(&s).unwrap();
+        assert!(prepared.prompt.contains("archive_memory_sources"));
+        let source = sources[0]["evidence_id"].clone();
         let mut value = result("汇总");
-        value["memory_changes"] = json!([{"action":"add","scope":"lasting","key":"经验","text":"合成经验","source":["audit:0"],"task_id":task}]);
-        // audit:0 is a normal task edit, not this task's archive note.
-        assert!(apply(&mut s, &candidate, value, now()).is_err());
-        assert_eq!(serde_json::to_value(&s).unwrap(), before);
-        let mut no_notes = candidate.payload.clone();
-        no_notes["archive_note_sources"] = json!([]);
+        value["memory_changes"] = json!([{"action":"add","scope":"lasting","key":"核对习惯","text":"优先核对合成证据","source":[source],"task_id":task}]);
+        let mut state = app.state.lock().unwrap().clone();
+        apply(&mut state, &candidate, value.clone(), now()).unwrap();
         assert_eq!(
-            crate::ai::prepare(&config, "archive", &no_notes).schema["properties"]
+            state.analysis_memory.archived_entries[0].text,
+            "优先核对合成证据"
+        );
+        assert_eq!(
+            state.analysis_memory.temporary,
+            app.state.lock().unwrap().analysis_memory.temporary
+        );
+        let mut state = app.state.lock().unwrap().clone();
+        let before = json!(state);
+        value["memory_changes"][0]["source"] = json!(["audit:999999"]);
+        assert!(apply(&mut state, &candidate, value.clone(), now()).is_err());
+        assert_eq!(json!(state), before);
+        value["memory_changes"][0]["source"] = json!(["unseen-message"]);
+        assert!(apply(&mut state, &candidate, value, now()).is_err());
+        assert_eq!(json!(state), before);
+        let mut no_operations = candidate.payload.clone();
+        no_operations["archive_memory_sources"] = json!([]);
+        assert_eq!(
+            crate::ai::prepare(&config, "archive", &no_operations).schema["properties"]
                 ["memory_changes"]["maxItems"],
             0
         );
@@ -1899,6 +1928,7 @@ mod tests {
     fn manual_archive_with_its_own_attempt_reaches_quota_outside_work_hours() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         seed(&app, "合成归档备注");
         app.test_force_working();
         app.test_end_overtime();
@@ -1918,6 +1948,7 @@ mod tests {
     fn corrupt_snapshot_rebuild_failure_prevents_archive_side_effects() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         seed(&app, "快照失败也要保留");
         let before = json!(*app.state.lock().unwrap());
@@ -1937,6 +1968,7 @@ mod tests {
     fn rollback_creates_a_new_group_without_rewinding_cursor_or_task_state() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         let task = seed(&app, "整组回滚依据");
         let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
@@ -1998,6 +2030,7 @@ mod tests {
     fn queued_archive_needs_the_matching_claim_and_failures_are_not_retried() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         {
             let mut s = app.state.lock().unwrap();
@@ -2082,6 +2115,7 @@ mod tests {
         for enabled in [false, true] {
             let root = root();
             let app = App::load(root.clone()).unwrap();
+            app.state.lock().unwrap().config.model_profiles = None;
             let task = seed(&app, "以后优先核对原始证据");
             {
                 let mut s = app.state.lock().unwrap();
@@ -2163,6 +2197,7 @@ mod tests {
     fn note_only_archive_advances_shared_cursor_and_archives_after_success() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         seed(&app, "只有新增备注也构成新材料");
         let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
         let candidate = {
@@ -2241,6 +2276,7 @@ mod tests {
     fn archive_candidate_freezes_snapshot_and_version_checks_memory_and_task_edits() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         let task = seed(&app, "并发修改依据");
         {
             let mut s = app.state.lock().unwrap();
@@ -2301,6 +2337,7 @@ mod tests {
     fn a_task_with_a_later_unprocessed_completion_or_note_is_not_archived_early() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
             let mut task = Task {
@@ -2383,6 +2420,7 @@ mod tests {
     fn large_delta_only_finalizes_covered_tasks_and_keeps_unprocessed_temporary_memory() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
             s.analysis_memory.temporary = "尚未完整处理的临时记忆".into();
@@ -2455,6 +2493,7 @@ mod tests {
         fn group_app() -> (App, String, std::path::PathBuf) {
             let root = root();
             let app = App::load(root.clone()).unwrap();
+            app.state.lock().unwrap().config.model_profiles = None;
             seed(&app, "回滚冲突依据");
             {
                 let mut s = app.state.lock().unwrap();
@@ -2568,6 +2607,7 @@ mod tests {
         let (app, group, root) = {
             let root = root();
             let app = App::load(root.clone()).unwrap();
+            app.state.lock().unwrap().config.model_profiles = None;
             seed(&app, "紧凑组依据");
             {
                 let mut s = app.state.lock().unwrap();
@@ -2624,6 +2664,7 @@ mod tests {
     fn derived_report_file_failure_after_atomic_commit_is_a_success_with_diagnostic() {
         let root = root();
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         seed(&app, "报表文件失败依据");
         let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
         let candidate = {

@@ -30,8 +30,8 @@ impl EndArchiveAttemptLookup for State {
 
 fn cache_dir(root: &Path) -> Result<std::path::PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let dir = root.join("data/holidays");
-    for path in [root.join("data"), dir.clone()] {
+    let dir = crate::storage::data_dir(&root).join("holidays");
+    for path in [crate::storage::data_dir(&root), dir.clone()] {
         if let Ok(meta) = fs::symlink_metadata(&path) {
             use std::os::windows::fs::MetadataExt;
             if !meta.is_dir() || meta.file_attributes() & 0x400 != 0 {

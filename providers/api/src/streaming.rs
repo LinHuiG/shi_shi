@@ -2,9 +2,18 @@
 //! has passed the caller's tool-name and schema validation.
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 pub enum ApiEvent {
     Phase(&'static str),
+    /// Reported cumulative output across this analysis, excluding terminal-only
+    /// usage. Unknown when a preceding response did not report output usage.
+    OutputTokens(Option<u64>),
+    /// One assembled response, with provider usage and measured decode time.
+    StepFinished {
+        output_tokens: Option<u64>,
+        decode_ms: Option<u64>,
+    },
     Text {
         kind: &'static str,
         text: String,
@@ -27,9 +36,17 @@ pub(crate) struct StreamCollector {
     tools: BTreeMap<u64, Value>,
     finish: Option<String>,
     usage: Option<Value>,
+    output_base: Option<u64>,
     done: bool,
+    first_token: Option<Instant>,
 }
 impl StreamCollector {
+    pub fn with_output_base(output_base: Option<u64>) -> Self {
+        Self {
+            output_base,
+            ..Self::default()
+        }
+    }
     pub fn push(&mut self, bytes: &[u8], event: &mut dyn FnMut(ApiEvent)) -> Result<(), ()> {
         self.received_bytes = self.received_bytes.saturating_add(bytes.len());
         if self.received_bytes > super::openai::DEFAULT_MAX_RESPONSE_BYTES {
@@ -81,16 +98,28 @@ impl StreamCollector {
             self.usage = Some(v["usage"].clone());
         }
         let choices = v["choices"].as_array().ok_or(())?;
+        if !choices.is_empty()
+            && (choices.len() != 1 || choices[0]["index"].as_u64().unwrap_or(0) != 0)
+        {
+            return Err(());
+        }
+        if let Some(reason) = choices.first().and_then(|c| c["finish_reason"].as_str()) {
+            self.finish = Some(reason.to_owned());
+        }
+        if v["usage"].is_object() {
+            // A final usage chunk must never look like one second of output.
+            if self.finish.is_none() {
+                event(ApiEvent::OutputTokens(
+                    self.output_base
+                        .zip(v["usage"]["completion_tokens"].as_u64())
+                        .and_then(|(base, current)| base.checked_add(current)),
+                ));
+            }
+        }
         if choices.is_empty() {
             return Ok(());
         }
-        if choices.len() != 1 || choices[0]["index"].as_u64().unwrap_or(0) != 0 {
-            return Err(());
-        }
         let c = &choices[0];
-        if let Some(reason) = c["finish_reason"].as_str() {
-            self.finish = Some(reason.to_owned());
-        }
         let delta = &c["delta"];
         for (key, kind, target) in [
             ("reasoning_content", "reasoning", &mut self.reasoning),
@@ -100,6 +129,7 @@ impl StreamCollector {
             if let Some(text) = delta[key].as_str() {
                 target.push_str(text);
                 if !text.is_empty() {
+                    self.first_token.get_or_insert_with(Instant::now);
                     event(ApiEvent::Text {
                         kind,
                         text: text.to_owned(),
@@ -122,6 +152,13 @@ impl StreamCollector {
                 return Err(());
             }
             for call in calls {
+                if ["name", "arguments"].iter().any(|key| {
+                    call["function"][key]
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty())
+                }) {
+                    self.first_token.get_or_insert_with(Instant::now);
+                }
                 let index = call["index"].as_u64().ok_or(())?;
                 if index >= super::openai::MAX_TOOL_CALLS_PER_RESPONSE as u64 {
                     return Err(());
@@ -180,6 +217,15 @@ impl StreamCollector {
                 .into_values()
                 .collect::<Vec<_>>());
         }
+        event(ApiEvent::StepFinished {
+            output_tokens: self
+                .usage
+                .as_ref()
+                .and_then(|u| u["completion_tokens"].as_u64()),
+            decode_ms: self
+                .first_token
+                .map(|first| first.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        });
         Ok(json!({"choices":[{"message":message,"finish_reason":self.finish}],"usage":self.usage}))
     }
 }
@@ -187,6 +233,81 @@ impl StreamCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn finished_step_uses_reported_tokens_and_first_delta_to_assembly_time() {
+        let mut c = StreamCollector::with_output_base(Some(0));
+        c.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\n",
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(c.first_token.is_some());
+        c.first_token = Some(Instant::now() - std::time::Duration::from_secs(2));
+        c.push(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"choices\":[],\"usage\":{\"completion_tokens\":46}}\n\ndata: [DONE]\n\n",&mut |_|{}).unwrap();
+        let mut stats = Vec::new();
+        c.finish(&mut |e| {
+            if let ApiEvent::StepFinished {
+                output_tokens,
+                decode_ms,
+            } = e
+            {
+                stats.push((output_tokens, decode_ms));
+            }
+        })
+        .unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].0, Some(46));
+        assert!(stats[0].1.unwrap() >= 2000);
+        let mut c = StreamCollector::default();
+        c.push(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            &mut |_| {},
+        )
+        .unwrap();
+        c.finish(&mut |e| {
+            if let ApiEvent::StepFinished {
+                output_tokens,
+                decode_ms,
+            } = e
+            {
+                assert_eq!((output_tokens, decode_ms), (None, None));
+            }
+        })
+        .unwrap();
+    }
+    #[test]
+    fn ongoing_usage_is_cumulative_and_terminal_totals_are_never_live_samples() {
+        for (base, expected) in [
+            (Some(30), vec![Some(32), Some(35), None]),
+            (None, vec![None, None, None]),
+        ] {
+            let mut collector = StreamCollector::with_output_base(base);
+            let mut counts = Vec::new();
+            let mut event = |e| {
+                if let ApiEvent::OutputTokens(count) = e {
+                    counts.push(count);
+                }
+            };
+            for frame in [
+                json!({"choices":[{"delta":{"content":"{"}}],"usage":{"completion_tokens":2}}),
+                json!({"choices":[{"delta":{"content":"}"}}],"usage":{"completion_tokens":5}}),
+                json!({"choices":[],"usage":{"completion_tokens":-1}}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"completion_tokens":900}}),
+                json!({"choices":[],"usage":{"completion_tokens":1000}}),
+            ] {
+                let bytes = format!("data: {frame}\n\n");
+                for chunk in bytes.as_bytes().chunks(7) {
+                    collector.push(chunk, &mut event).unwrap();
+                }
+            }
+            collector.push(b"data: [DONE]\n\n", &mut event).unwrap();
+            assert_eq!(
+                collector.finish(&mut event).unwrap()["usage"]["completion_tokens"],
+                1000
+            );
+            assert_eq!(counts, expected);
+        }
+    }
     #[test]
     fn fragmented_utf8_multiline_heartbeat_and_final_usage() {
         let wire = ": ping\r\n\r\ndata: {\"choices\":[{\"delta\":{\"reasoning_content\":\"核对\"}}]}\r\n\r\ndata: {\"choices\":[\ndata: {\"delta\":{\"content\":\"{}\"},\"finish_reason\":\"stop\"}],\"usage\":{\"total_tokens\":9}}\n\ndata: [DONE]\n\n";

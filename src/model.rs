@@ -10,9 +10,11 @@ pub const STATE_SCHEMA_VERSION: u32 = 1;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    pub auto_update: bool,
     pub ai_connections: Vec<crate::ai_backend::Connection>,
     #[serde(skip)]
     pub selected_connection: String,
+    #[serde(default = "legacy_model_profiles")]
     pub model_profiles: Option<ModelProfiles>,
     pub message_retention_days: u32,
     pub handling_prompt: String,
@@ -44,7 +46,8 @@ pub struct Config {
     /// separately from the first-turn `max_input_chars`.
     #[serde(alias = "context_read_chars")]
     pub retrieval_budget_chars: usize,
-    /// Windows 11 Mica window backdrop; applied at startup.
+    /// Retired preference: accept old files, but choose the backdrop by runtime capability.
+    #[serde(skip_serializing)]
     pub window_backdrop: bool,
     pub model: String,
     pub reasoning_effort: String,
@@ -76,17 +79,25 @@ fn default_model(effort: &str) -> ModelChoice {
         reasoning_effort: effort.into(),
     }
 }
+fn legacy_model_profiles() -> Option<ModelProfiles> {
+    Some(ModelProfiles {
+        filter: Some(default_model("low")),
+        analysis: Some(default_model("low")),
+        handling: Some(default_model("medium")),
+        review: Some(default_model("high")),
+    })
+}
+fn legacy_model_choice() -> Option<ModelChoice> {
+    Some(ModelChoice::default())
+}
+pub const UNCONFIGURED_CONNECTION: &str = "__unconfigured_purpose__";
 impl Default for Config {
     fn default() -> Self {
         Self {
+            auto_update: true,
             ai_connections: vec![],
             selected_connection: String::new(),
-            model_profiles: Some(ModelProfiles {
-                filter: default_model("low"),
-                analysis: default_model("low"),
-                handling: default_model("medium"),
-                review: default_model("high"),
-            }),
+            model_profiles: Some(ModelProfiles::default()),
             message_retention_days: 90,
             handling_prompt: String::new(),
             review_prompt: String::new(),
@@ -96,22 +107,22 @@ impl Default for Config {
             codex_name: "默认 Codex".into(),
             ai_timeout_seconds: 600,
             analysis_workdir: "ShiShi".into(),
-            interval_minutes: 1,
+            interval_minutes: 3,
             analysis_interval_minutes: 30,
             analysis_lookback_hours: 24,
             analysis_related_only: false,
             leaders: vec![],
-            enabled: false,
+            enabled: true,
             auto_ai: true,
-            message_filter_enabled: false,
+            message_filter_enabled: true,
             auto_adopt_advice: false,
             auto_adopt_prompt: false,
             retain_ai_traces: false,
             work_start: "08:00".into(),
             work_end: "20:00".into(),
-            daily_calls: 50,
-            max_input_chars: 60_000,
-            retrieval_budget_chars: crate::analysis_context::DEFAULT_BUDGET,
+            daily_calls: 150,
+            max_input_chars: 80_000,
+            retrieval_budget_chars: 80_000,
             window_backdrop: true,
             model: "gpt-6-astra".into(),
             reasoning_effort: "low".into(),
@@ -132,12 +143,22 @@ pub struct ModelChoice {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelProfiles {
-    pub filter: ModelChoice,
-    pub analysis: ModelChoice,
-    pub handling: ModelChoice,
-    pub review: ModelChoice,
+    #[serde(default = "legacy_model_choice")]
+    pub filter: Option<ModelChoice>,
+    #[serde(default = "legacy_model_choice")]
+    pub analysis: Option<ModelChoice>,
+    #[serde(default = "legacy_model_choice")]
+    pub handling: Option<ModelChoice>,
+    #[serde(default = "legacy_model_choice")]
+    pub review: Option<ModelChoice>,
 }
 impl Config {
+    pub fn automatic_analysis_enabled(&self) -> bool {
+        self.enabled && self.auto_ai
+    }
+    pub fn early_analysis_enabled(&self) -> bool {
+        self.automatic_analysis_enabled() && self.message_filter_enabled
+    }
     pub fn for_kind(&self, kind: &str) -> Self {
         let mut c = self.clone();
         if let Some(p) = &self.model_profiles {
@@ -148,7 +169,13 @@ impl Config {
                 | "advice_revision" => &p.review,
                 _ => &p.analysis,
             };
-            // A partial profile (for example one saved before the filter
+            let Some(choice) = choice else {
+                c.selected_connection = UNCONFIGURED_CONNECTION.into();
+                c.model.clear();
+                c.reasoning_effort.clear();
+                return c;
+            };
+            // A legacy partial profile (for example one saved before the filter
             // purpose existed) keeps the base value for fields it does not set.
             // It never silently becomes an empty model or connection.
             if !choice.connection_id.is_empty() {
@@ -162,6 +189,36 @@ impl Config {
             }
         }
         c
+    }
+    pub fn clear_connection_routes(&mut self, id: &str) {
+        let resolved =
+            ["message_filter", "classify", "handling", "archive"].map(|kind| self.for_kind(kind));
+        let materialized = |c: &Config| {
+            Some(ModelChoice {
+                connection_id: c.selected_connection.clone(),
+                model: c.model.clone(),
+                reasoning_effort: c.reasoning_effort.clone(),
+            })
+        };
+        let p = self.model_profiles.get_or_insert_with(|| ModelProfiles {
+            filter: materialized(&resolved[0]),
+            analysis: materialized(&resolved[1]),
+            handling: materialized(&resolved[2]),
+            review: materialized(&resolved[3]),
+        });
+        for (choice, c) in [
+            &mut p.filter,
+            &mut p.analysis,
+            &mut p.handling,
+            &mut p.review,
+        ]
+        .into_iter()
+        .zip(resolved)
+        {
+            if c.selected_connection == id {
+                *choice = None;
+            }
+        }
     }
 }
 
@@ -483,6 +540,7 @@ pub struct State {
     pub config: Config,
     pub messages: BTreeMap<String, Message>,
     pub tasks: Vec<Task>,
+    pub task_numbers: BTreeMap<String, u64>,
     pub schedules: Vec<Schedule>,
     pub audit: Vec<Audit>,
     pub suggestions: Vec<Suggestion>,
@@ -547,6 +605,7 @@ impl Default for State {
             config: Config::default(),
             messages: BTreeMap::new(),
             tasks: Vec::new(),
+            task_numbers: BTreeMap::new(),
             schedules: Vec::new(),
             audit: Vec::new(),
             suggestions: Vec::new(),
@@ -810,9 +869,35 @@ mod tests {
     #[test]
     fn default_policy() {
         let c = Config::default();
-        assert_eq!(c.interval_minutes, 1);
-        assert!(!c.enabled);
+        assert_eq!(c.interval_minutes, 3);
+        assert!(c.enabled);
         assert!(c.leaders.is_empty());
+    }
+    #[test]
+    fn automation_effective_states_cascade_and_retired_backdrop_is_read_only_compatibility() {
+        let mut c = Config::default();
+        for scan in [false, true] {
+            for analysis in [false, true] {
+                for early in [false, true] {
+                    c.enabled = scan;
+                    c.auto_ai = analysis;
+                    c.message_filter_enabled = early;
+                    assert_eq!(c.automatic_analysis_enabled(), scan && analysis);
+                    assert_eq!(c.early_analysis_enabled(), scan && analysis && early);
+                    assert_eq!(
+                        (c.enabled, c.auto_ai, c.message_filter_enabled),
+                        (scan, analysis, early)
+                    );
+                }
+            }
+        }
+        let legacy: Config =
+            serde_json::from_value(serde_json::json!({"window_backdrop":false})).unwrap();
+        assert!(!legacy.window_backdrop);
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("window_backdrop")
+            .is_none());
     }
     #[test]
     fn withdrawn_not_relevant() {

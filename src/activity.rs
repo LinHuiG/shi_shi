@@ -97,7 +97,13 @@ fn visit(path: &Path, mut row: impl FnMut(Value)) -> Result<usize, String> {
 }
 impl App {
     pub fn activity_query(&self, p: &Value) -> Result<Value, String> {
-        let day = p["day"].as_str().map(str::to_owned).unwrap_or_else(date);
+        self.log_writer.flush()?;
+        let day = p["day"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(date);
         let parsed =
             chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| "日志日期无效")?;
         if parsed.to_string() != day {
@@ -123,9 +129,20 @@ impl App {
             return Err("AI 用途筛选无效".into());
         }
         let page = p["page"].as_u64().unwrap_or(1).clamp(1, 1000) as usize;
+        let terms = crate::task_history::terms(p)?;
+        let (task_labels, task_numbers) = {
+            let s = self.state.lock().unwrap();
+            let numbers = &s.task_numbers;
+            let labels = s
+                .tasks
+                .iter()
+                .map(|t| (t.id.clone(), (t.title.clone(), numbers.get(&t.id).copied())))
+                .collect::<BTreeMap<_, _>>();
+            (labels, s.task_numbers.clone())
+        };
         let size = p["page_size"].as_u64().unwrap_or(50).clamp(1, 100) as usize;
         let mut paths = Vec::new();
-        match fs::read_dir(self.root.join("data/logs")) {
+        match fs::read_dir(crate::storage::data_dir(&self.root).join("logs")) {
             Ok(entries) => {
                 for item in entries {
                     let item = item.map_err(|e| e.to_string())?;
@@ -161,13 +178,35 @@ impl App {
         let mut rows = BTreeMap::new();
         let mut total = 0usize;
         let mut sequence = 0usize;
-        let mut insert = |r: Value| {
+        let mut insert = |mut r: Value| {
             sequence += 1;
+            let task_id = r["task_id"]
+                .as_str()
+                .or_else(|| r["detail"]["task_id"].as_str())
+                .unwrap_or("")
+                .to_string();
+            if !task_id.is_empty() {
+                r["task_id"] = json!(task_id);
+            }
+            if let Some((title, number)) = task_labels.get(&task_id) {
+                r["task_title"] = json!(title);
+                r["task_number"] = json!(number);
+                r["task_label"] = json!(format!("#{}", number.unwrap_or(0)));
+            } else if let Some(number) = task_numbers.get(&task_id) {
+                r["task_number"] = json!(number);
+                r["task_label"] = json!(format!("#{number}"));
+                r["task_title"] = r["after"]["title"]
+                    .as_str()
+                    .or_else(|| r["before"]["title"].as_str())
+                    .map(|s| json!(s))
+                    .unwrap_or(Value::Null);
+            }
             let time = r["time"].as_i64().unwrap_or(0);
             if time < start
                 || time >= end
                 || !matches_filter(&r, filter)
                 || (filter == "ai" && !matches_purpose(&r, purpose))
+                || !crate::task_history::matches(&r, &terms)
             {
                 return;
             }
@@ -212,13 +251,80 @@ impl App {
             .skip((page - 1) * size)
             .take(size)
             .collect::<Vec<_>>();
-        Ok(json!({"rows":rows,"page":page,"pages":pages,"total":total,"invalid_lines":invalid}))
+        Ok(
+            json!({"day":day,"rows":rows,"page":page,"pages":pages,"total":total,"invalid_lines":invalid}),
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fuzzy_search_combines_scope_and_matches_task_number_title_and_body_before_paging() {
+        let root = std::env::temp_dir().join(format!("shishi-log-search-{}", crate::model::id()));
+        let app = App::load(root.clone()).unwrap();
+        {
+            let mut s = app.state.lock().unwrap();
+            s.tasks.push(crate::model::Task {
+                id: "synthetic-task".into(),
+                title: "合成事项 Alpha".into(),
+                ..Default::default()
+            });
+            s.task_numbers.insert("synthetic-task".into(), 42);
+        }
+        for i in 0..65 {
+            app.log("handling_status",json!({"task_id":"synthetic-task","status":"completed","text":format!("Synthetic detail {i}")}));
+        }
+        app.log("error", json!({"error":"other row"}));
+        let rows = app
+            .activity_query(&json!({"filter":"all","query":"#42 ALPHA","page":2}))
+            .unwrap();
+        assert_eq!(rows["total"], 65);
+        assert_eq!(rows["rows"].as_array().unwrap().len(), 15);
+        assert_eq!(rows["rows"][0]["task_number"], 42);
+        assert_eq!(
+            app.activity_query(&json!({"filter":"all","query":"synthetic detail 64"}))
+                .unwrap()["total"],
+            1
+        );
+        assert_eq!(
+            app.activity_query(&json!({"filter":"errors","query":"Alpha"}))
+                .unwrap()["total"],
+            0
+        );
+        assert_eq!(
+            app.activity_query(&json!({"filter":"all","query":"#999"}))
+                .unwrap()["total"],
+            0
+        );
+        assert!(app
+            .activity_query(&json!({"query":"a".repeat(201)}))
+            .is_err());
+        drop(app);
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn blank_dates_resolve_to_shanghai_today_without_changing_explicit_dates() {
+        let root = std::env::temp_dir().join(format!("shishi-log-date-{}", crate::model::id()));
+        let app = App::load(root.clone()).unwrap();
+        for params in [
+            json!({}),
+            json!({"day":null}),
+            json!({"day":""}),
+            json!({"day":"  "}),
+        ] {
+            assert_eq!(app.activity_query(&params).unwrap()["day"], date());
+        }
+        assert_eq!(
+            app.activity_query(&json!({"day":"2026-10-01"})).unwrap()["day"],
+            "2026-10-01"
+        );
+        for day in ["2026-99-01", "2026/10/01", "../state"] {
+            assert!(app.activity_query(&json!({"day":day})).is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn archive_commit_and_failure_are_visible_with_their_final_status() {
         let root = std::env::temp_dir().join(format!("shishi-archive-log-{}", crate::model::id()));

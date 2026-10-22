@@ -120,6 +120,21 @@ fn model(config: &Config, c: &ai_backend::Connection) -> Result<(String, String)
 fn save(path: &Path, report: &Value) -> Result<(), String> {
     fs::write(path, serde_json::to_vec_pretty(report).unwrap()).map_err(|e| e.to_string())
 }
+fn analysis_route(config: &Config) -> Result<(ai_backend::Connection, String, String), String> {
+    let configured = config.for_kind("classify");
+    let connection = ai_backend::connection(&configured)?;
+    if connection.driver != "api"
+        || !connection
+            .models
+            .iter()
+            .any(|m| m["model"] == configured.model)
+    {
+        return Err(
+            "The configured analysis API/model is unavailable; no alternative was selected".into(),
+        );
+    }
+    Ok((connection, configured.model, configured.reasoning_effort))
+}
 pub fn run(args: &[String]) -> Result<(), String> {
     if !args.iter().any(|a| a == "--allow-live-ai") {
         return Err("Real model tests require --allow-live-ai".into());
@@ -156,11 +171,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .trim_start_matches(r"\\?\")
             .replace('\\', "/"),
     );
+    crate::storage::initialize(&source)?;
     let saved: SettingsOnly = serde_json::from_slice(
-        &fs::read(source.join("data/state.json")).map_err(|e| e.to_string())?,
+        &fs::read(crate::storage::data_dir(&source).join("state.json"))
+            .map_err(|e| e.to_string())?,
     )
     .map_err(|_| "Saved connection configuration cannot be read")?;
-    let _credential_cleanup = CredentialCleanup(root.join("data/credentials"));
+    let _credential_cleanup =
+        CredentialCleanup(crate::storage::data_dir(&root).join("credentials"));
     let mut connections = saved.config.ai_connections.clone();
     connections.insert(
         0,
@@ -181,15 +199,28 @@ pub fn run(args: &[String]) -> Result<(), String> {
         .iter()
         .position(|a| a == "--only-scenario")
         .and_then(|i| args.get(i + 1));
+    let use_analysis_route = args.iter().any(|a| a == "--use-analysis-route");
+    if use_analysis_route
+        && (filter.map(String::as_str) != Some("api")
+            || scenario_filter.map(String::as_str) != Some("classify"))
+    {
+        return Err(
+            "--use-analysis-route requires --only-source api --only-scenario classify".into(),
+        );
+    }
     for driver in ["codex", "dsh", "api"] {
         if filter.is_some_and(|v| v != driver) {
             continue;
         }
-        let selection = connections
-            .iter()
-            .find(|c| c.driver == driver)
-            .cloned()
-            .ok_or(format!("Missing configured {driver} source"));
+        let selection = if use_analysis_route {
+            analysis_route(&saved.config).map(|route| route.0)
+        } else {
+            connections
+                .iter()
+                .find(|c| c.driver == driver)
+                .cloned()
+                .ok_or(format!("Missing configured {driver} source"))
+        };
         let mut c = match selection {
             Ok(c) => c,
             Err(e) => {
@@ -208,7 +239,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .ok_or("DSH did not return a live model catalog")?
                 .clone();
         }
-        let (model, effort) = match model(&saved.config, &c) {
+        let model_selection = if use_analysis_route {
+            analysis_route(&saved.config).map(|(_, model, effort)| (model, effort))
+        } else {
+            model(&saved.config, &c)
+        };
+        let (model, effort) = match model_selection {
             Ok(m) => m,
             Err(e) => {
                 report["rows"]
@@ -227,14 +263,15 @@ pub fn run(args: &[String]) -> Result<(), String> {
         config.codex = c.executable.clone();
         config.codex_models = c.models.clone();
         if driver == "api" {
-            let secret = CredentialStore::new(source.join("data/credentials"))
-                .resolve(
-                    c.credential_id.as_deref().unwrap_or(&c.id),
-                    c.key_env.as_deref(),
-                )
-                .map_err(|e| e.to_string())?
-                .ok_or("Missing API credential")?;
-            CredentialStore::new(root.join("data/credentials"))
+            let secret =
+                CredentialStore::new(crate::storage::data_dir(&source).join("credentials"))
+                    .resolve(
+                        c.credential_id.as_deref().unwrap_or(&c.id),
+                        c.key_env.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())?
+                    .ok_or("Missing API credential")?;
+            CredentialStore::new(crate::storage::data_dir(&root).join("credentials"))
                 .set("synthetic-live", secret.expose_secret())
                 .map_err(|e| e.to_string())?;
             c.credential_id = Some("synthetic-live".into());
@@ -287,6 +324,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                         } else {
                             Err("API handling was not explicitly rejected".into())
                         };
+                    }
+                    if driver == "codex" {
+                        return desktop_handling(&root, &c, &config, &trace);
                     }
                     let agent = backend.agent(&c)?;
                     let context = ContextTool {
@@ -367,6 +407,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 );
                 let payload = json!({});
                 let cancel = AtomicBool::new(false);
+                let mut public_events = 0_u64;
+                let mut public_chars = 0_u64;
+                let mut first_public_ms = None;
+                let mut output_samples = Vec::new();
+                let mut step_metrics = Vec::new();
                 let (value, usage) = backend.analyze(
                     &c,
                     AnalysisRequest {
@@ -381,7 +426,20 @@ pub fn run(args: &[String]) -> Result<(), String> {
                         tools: None,
                         cancel: &cancel,
                     },
-                    &mut |_| {},
+                    &mut |event| match event {
+                        ai_backend::AnalysisEvent::StepFinished { output_tokens, decode_ms } if step_metrics.len()<4096 => {
+                            step_metrics.push(json!({"output_tokens":output_tokens,"decode_ms":decode_ms}));
+                        }
+                        ai_backend::AnalysisEvent::OutputTokens(count) if output_samples.len() < 4096 => {
+                            output_samples.push(json!({"elapsed_ms":start.elapsed().as_millis(),"output_tokens":count}));
+                        }
+                        ai_backend::AnalysisEvent::Stream {kind, text, ..} if matches!(kind.as_str(), "reasoning" | "content") && !text.is_empty() => {
+                            public_events += 1;
+                            public_chars += text.chars().count() as u64;
+                            first_public_ms.get_or_insert(start.elapsed().as_millis());
+                        }
+                        _ => {}
+                    },
                 )?;
                 let raw: Value = serde_json::from_slice(
                     &fs::read(trace.join("output.txt"))
@@ -393,7 +451,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 if outcome(&raw) != outcome(&expected) {
                     return Err("Output differs from the synthetic expected result".into());
                 }
-                Ok(json!({"usage":usage,"structured_result":value.is_object()}))
+                Ok(
+                    json!({"usage":usage,"structured_result":value.is_object(),"stream":{"first_public_ms":first_public_ms,"public_events":public_events,"public_chars":public_chars,"reported_output_samples":output_samples,"completed_steps":step_metrics}}),
+                )
             })();
             let row = match outcome {
                 Ok(detail) => {
@@ -407,7 +467,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             save(&report_path, &report)?;
         }
     }
-    let credentials = root.join("data/credentials");
+    let credentials = crate::storage::data_dir(&root).join("credentials");
     if credentials.exists() {
         fs::remove_dir_all(credentials).map_err(|e| e.to_string())?;
     }
@@ -425,9 +485,99 @@ pub fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn desktop_handling(
+    root: &Path,
+    connection: &ai_backend::Connection,
+    config: &Config,
+    trace: &Path,
+) -> Result<Value, String> {
+    use crate::desktop_bridge::{Desktop, DesktopApi};
+    let desktop = Desktop::new(root.to_owned(), connection.executable.clone());
+    let cwd = root.join("workspace");
+    fs::create_dir_all(&cwd).map_err(|e| e.to_string())?;
+    let context = ContextTool {
+        cwd: cwd.clone(),
+        executable: std::env::current_exe().map_err(|e| e.to_string())?,
+        context_path: root.join("data/handling-context/synthetic.json"),
+    };
+    let first = "Synthetic transport test. Do not use tools. Reply exactly SS_TEST_OK.";
+    let session = desktop.create(
+        cwd.to_str().ok_or("Invalid synthetic directory")?,
+        "ShiShi synthetic desktop handling",
+        first,
+        &config.model,
+        &config.reasoning_effort,
+        &context,
+    )?;
+    let thread = session["threadId"]
+        .as_str()
+        .ok_or("No desktop thread id; not resubmitted")?;
+    fs::write(trace.join("session.json"), session.to_string()).map_err(|e| e.to_string())?;
+    for (index, expected) in ["SS_TEST_OK", "SS_FOLLOWUP_OK"].iter().enumerate() {
+        if index > 0 {
+            desktop.send(
+                thread,
+                "Reply exactly SS_FOLLOWUP_OK. Do not use tools.",
+                None,
+                None,
+            )?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(240);
+        loop {
+            let history = desktop.read(thread)?;
+            if history["turns"].as_array().is_some_and(|rows| {
+                rows.iter().any(|r| {
+                    r["status"] == "completed" && r["items"].to_string().contains(expected)
+                })
+            }) {
+                fs::write(trace.join("history.json"), history.to_string())
+                    .map_err(|e| e.to_string())?;
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err("Desktop handling timeout; input not resubmitted".into());
+            }
+            std::thread::sleep(Duration::from_millis(750));
+        }
+    }
+    Ok(json!({"followup":true,"desktop_owned":true,"session_id":thread}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn analysis_probe_uses_exact_saved_route_and_never_falls_back() {
+        let mut config = Config::default();
+        config.ai_connections = vec![
+            ai_backend::Connection {
+                id: "first".into(),
+                driver: "api".into(),
+                models: vec![json!({"model":"first-flash"})],
+                ..Default::default()
+            },
+            ai_backend::Connection {
+                id: "selected".into(),
+                driver: "api".into(),
+                models: vec![json!({"model":"selected-flash"})],
+                ..Default::default()
+            },
+        ];
+        config.model_profiles.as_mut().unwrap().analysis = Some(crate::model::ModelChoice {
+            connection_id: "selected".into(),
+            model: "selected-flash".into(),
+            reasoning_effort: "low".into(),
+        });
+        let (connection, model, effort) = analysis_route(&config).unwrap();
+        assert_eq!(
+            (connection.id, model, effort),
+            ("selected".into(), "selected-flash".into(), "low".into())
+        );
+        config.ai_connections.pop();
+        assert!(analysis_route(&config).is_err());
+        config.model_profiles.as_mut().unwrap().analysis = None;
+        assert!(analysis_route(&config).is_err());
+    }
     #[test]
     fn synthetic_expected_results_cover_every_structured_purpose() {
         for kind in crate::model::PURPOSES {

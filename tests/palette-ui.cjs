@@ -20,7 +20,7 @@ const html=bundle().replace('<script>','<script>'+mock+'\n');
  assert.equal(await page.locator('#palette').count(),0,'Ctrl+K toggles');
  // Global shortcuts.
  await page.keyboard.press('Control+1');assert.equal(await title(),'事项');
- await page.keyboard.press('Control+7');await page.waitForFunction(()=>document.querySelector('#page-title').textContent==='日志与操作');
+ await page.keyboard.press('Control+7');await page.waitForFunction(()=>document.querySelector('#page-title').textContent==='系统日志');
  await page.keyboard.press('Control+1');await page.keyboard.press('/');
  assert.equal(await page.evaluate(()=>document.activeElement.id),'task-search');
  await page.keyboard.type('/');assert.equal(await page.locator('#task-search').inputValue(),'/','"/" types normally inside inputs');

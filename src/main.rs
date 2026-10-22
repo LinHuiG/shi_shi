@@ -7,6 +7,7 @@ mod ai_control;
 mod ai_jobs;
 mod ai_progress;
 mod analysis_context;
+mod approval_window;
 mod archive;
 mod archive_storage;
 mod backdrop;
@@ -16,9 +17,11 @@ mod calendar_service;
 mod codex_bridge;
 mod context_budget;
 mod context_mcp;
+mod desktop_bridge;
 mod engine;
 mod evolution;
 mod handling;
+mod handling_preview;
 mod holiday;
 mod images;
 #[cfg(test)]
@@ -27,6 +30,7 @@ mod managed_data;
 mod message_progress;
 mod messages;
 mod model;
+mod native_dialog;
 mod plugins;
 mod process;
 mod prompt_config;
@@ -35,17 +39,21 @@ mod retention;
 mod schedule;
 mod snapshots;
 mod sources;
+mod storage;
 mod tags;
+mod task_history;
 mod tray;
 mod ui_bundle;
+mod ui_refresh;
+mod updates;
 mod wire_context;
 mod work_hours;
 mod work_scheduler;
 mod work_state;
 use shishi_api::http_client;
 mod credentials;
-mod desktop_watch;
 mod live_ai_regression;
+mod log_writer;
 mod memory_editor;
 mod message_filter;
 #[cfg(test)]
@@ -70,7 +78,10 @@ use work_hours::AiMode;
 use wry::{WebContext, WebViewBuilder, WebViewBuilderExtWindows};
 #[derive(Debug)]
 enum UiEvent {
+    StorageExit,
     Reply(Value),
+    ApprovalCommand(Value),
+    ApprovalReply(Value),
     Refresh,
     Ready(Value),
     Tray(tray::Action),
@@ -84,12 +95,19 @@ fn fatal(s: &str) {
 }
 fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
     process::check_running()?;
+    if app.storage_changing.load(Ordering::SeqCst) {
+        return Err("正在切换数据目录，请等待迁移窗口完成".into());
+    }
     let p = &v["params"];
     match v["method"].as_str().unwrap_or("") {
         "state" => Ok(if p.get("sections").is_some() {
             app.snapshot_sections(p.get("sections"))
         } else {
-            app.snapshot_page(p["page"].as_str())
+            app.snapshot_cached(
+                p["page"].as_str(),
+                p["core_revision"].as_str(),
+                p["task"].as_str(),
+            )
         }),
         "state_version" => Ok(app.state_version()),
         "work_state" => app.set_work_state(p),
@@ -105,14 +123,12 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         "handling_projects" => app.handling_projects(),
         "handling_add_project" => app.handling_add_project(p),
         "handling_start" => app.handling_start(p),
-        "handling_handoff" => app.handling_handoff(p["task_id"].as_str().unwrap_or("")),
-        "handling_context_note" => app.handling_context_note(p["task_id"].as_str().unwrap_or("")),
         "handling_followup" => app.handling_followup(p),
         "handling_sync" => app.handling_sync(p["task_id"].as_str()),
         "handling_request" => app.handling_request(p),
         "handling_reconnect" => app.handling_reconnect(p),
         "handling_reset_setup" => app.handling_reset_setup(p),
-        "handling_interrupt" => app.handling_interrupt(p["task_id"].as_str().unwrap_or("")),
+        "handling_terminate" => app.handling_terminate(p),
         "handling_history" => Ok(app.handling_history()),
         "handling_policy_save" => app.handling_policy_save(p),
         "handling_learn" => app.handling_learn(),
@@ -134,6 +150,10 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         "connection_save" => app.save_connection(p),
         "connection_delete" => app.delete_connection(p),
         "activity_query" => app.activity_query(p),
+        "task_changes" => app.task_changes(p),
+        "update_check" => crate::updates::check(app.clone(), false),
+        "update_install" => crate::updates::install(app, p["scheduled"].as_str()),
+        "about_open" => crate::updates::open_link(p["target"].as_str().unwrap_or("")),
         "dsh_initialize_acp" => {
             let connection =
                 serde_json::from_value(p["connection"].clone()).map_err(|e| e.to_string())?;
@@ -178,7 +198,9 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         "ai_trace" => {
             let id = p["id"].as_str().ok_or("缺少调用编号")?;
             uuid::Uuid::parse_str(id).map_err(|_| "无效的调用编号")?;
-            let dir = app.root.join("data/ai-traces").join(id);
+            let dir = crate::storage::data_dir(&app.root)
+                .join("ai-traces")
+                .join(id);
             if !dir.is_dir() {
                 let retain = app.state.lock().unwrap().config.retain_ai_traces;
                 return Err(if retain {
@@ -194,27 +216,28 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
                 let current_time = fs::metadata(dir.join("input.txt"))
                     .and_then(|m| m.modified())
                     .map_err(|_| "当前请求输入不可读")?;
-                let mut candidates = fs::read_dir(app.root.join("data/ai-traces"))
-                    .map_err(|_| "跟踪目录不可读")?
-                    .filter_map(Result::ok)
-                    .take(10000)
-                    .filter_map(|entry| {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name == id || uuid::Uuid::parse_str(&name).is_err() {
-                            return None;
-                        }
-                        let path = entry.path().join("input.txt");
-                        let other: Value = serde_json::from_slice(
-                            &fs::read(entry.path().join("request.json")).ok()?,
-                        )
-                        .ok()?;
-                        if other != identity {
-                            return None;
-                        }
-                        let time = fs::metadata(&path).ok()?.modified().ok()?;
-                        (time <= current_time).then_some((time, name, path))
-                    })
-                    .collect::<Vec<_>>();
+                let mut candidates =
+                    fs::read_dir(crate::storage::data_dir(&app.root).join("ai-traces"))
+                        .map_err(|_| "跟踪目录不可读")?
+                        .filter_map(Result::ok)
+                        .take(10000)
+                        .filter_map(|entry| {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name == id || uuid::Uuid::parse_str(&name).is_err() {
+                                return None;
+                            }
+                            let path = entry.path().join("input.txt");
+                            let other: Value = serde_json::from_slice(
+                                &fs::read(entry.path().join("request.json")).ok()?,
+                            )
+                            .ok()?;
+                            if other != identity {
+                                return None;
+                            }
+                            let time = fs::metadata(&path).ok()?.modified().ok()?;
+                            (time <= current_time).then_some((time, name, path))
+                        })
+                        .collect::<Vec<_>>();
                 candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
                 let (_, previous_id, path) =
                     candidates.first().ok_or("没有更早的已保留请求可供比较")?;
@@ -299,7 +322,7 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         }
         "open_data" => {
             std::process::Command::new("explorer.exe")
-                .arg(app.root.join("data"))
+                .arg(crate::storage::data_dir(&app.root))
                 .spawn()
                 .map_err(|e| e.to_string())?;
             Ok(json!(true))
@@ -317,9 +340,65 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
 }
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if let Some(i) = args.iter().position(|a| a == "--data-transfer") {
+        let result = args
+            .get(i + 1)
+            .ok_or("缺少迁移计划".to_string())
+            .and_then(|p| native_dialog::transfer_window(std::path::Path::new(p)));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--installer-confirm") {
+        let result = args
+            .get(i + 1)
+            .and_then(|a| a.parse::<isize>().ok())
+            .ok_or("缺少安装窗口句柄".to_string())
+            .and_then(|owner| native_dialog::installer_confirmation(owner, false));
+        std::process::exit(result.map(|(button, _)| button).unwrap_or(1));
+    }
+    if args.iter().any(|a| a == "--native-dialog-smoke") {
+        let result = args
+            .iter()
+            .position(|a| a == "--root")
+            .and_then(|i| args.get(i + 1))
+            .ok_or("自检需要隔离目录".to_string())
+            .and_then(|p| native_dialog::smoke(std::path::Path::new(p)));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--live-ai-regression") {
         if let Err(error) = live_ai_regression::run(&args) {
             eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--desktop-bridge-check") {
+        let value = |key: &str| {
+            args.iter()
+                .position(|a| a == key)
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+        };
+        let result = value("--root")
+            .ok_or("桌面桥接检查需要隔离 --root".to_string())
+            .and_then(|root| {
+                desktop_bridge::check(PathBuf::from(root), value("--codex").unwrap_or_default())
+            });
+        let report = match &result {
+            Ok(value) => value.clone(),
+            Err(error) => json!({"connected":false,"error":error,"model_calls":0}),
+        };
+        if let Some(output) = value("--output") {
+            let _ = fs::write(output, report.to_string());
+        }
+        if result.is_err() {
             std::process::exit(1);
         }
         return;
@@ -386,7 +465,10 @@ fn main() {
             a == "--read-once"
                 || matches!(
                     a.as_str(),
-                    "--ui-smoke" | "--ui-smoke-mica" | "--ui-smoke-mica-fallback"
+                    "--ui-smoke"
+                        | "--ui-smoke-approval"
+                        | "--ui-smoke-mica"
+                        | "--ui-smoke-mica-fallback"
                 )
         }) {
             if let Some(i) = args.iter().position(|a| a == "--root") {
@@ -407,7 +489,10 @@ fn main() {
                     .and_then(|p| p.parent().map(PathBuf::from))
             });
         if let Some(root) = root {
-            let _ = fs::write(root.join("data/startup-error.txt"), &e);
+            let _ = fs::write(
+                crate::storage::data_dir(&root).join("startup-error.txt"),
+                &e,
+            );
         }
         fatal(&e)
     }
@@ -425,11 +510,15 @@ fn load_ui(args: &[String]) -> Result<String, String> {
 }
 fn start() -> Result<(), String> {
     let args = std::env::args().collect::<Vec<_>>();
+    if let Some(i) = args.iter().position(|a| a == "--apply-update") {
+        return updates::helper(std::path::Path::new(args.get(i + 1).ok_or("缺少更新计划")?));
+    }
     let mica_smoke = args
         .iter()
         .any(|a| matches!(a.as_str(), "--ui-smoke-mica" | "--ui-smoke-mica-fallback"));
     let mica_failure = args.iter().any(|a| a == "--ui-smoke-mica-fallback");
-    let smoke = mica_smoke || args.iter().any(|a| a == "--ui-smoke");
+    let approval_smoke = args.iter().any(|a| a == "--ui-smoke-approval");
+    let smoke = mica_smoke || approval_smoke || args.iter().any(|a| a == "--ui-smoke");
     if smoke && !args.iter().any(|a| a == "--root") {
         return Err("启动自检必须通过 --root 指定隔离测试目录".into());
     }
@@ -442,12 +531,16 @@ fn start() -> Result<(), String> {
             .unwrap()
             .to_path_buf()
     };
-    fs::create_dir_all(root.join("data")).map_err(|e| e.to_string())?;
+    let root = std::path::absolute(root).map_err(|e| e.to_string())?;
+    let storage_transition = storage::transition_lock(&root)?;
+    storage::initialize(&root)?;
+    storage::plain_directory(&storage::data_dir(&root))?;
+    fs::create_dir_all(crate::storage::data_dir(&root)).map_err(|e| e.to_string())?;
     let lock = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
-        .open(root.join("data/app.lock"))
+        .open(crate::storage::data_dir(&root).join("app.lock"))
         .map_err(|e| e.to_string())?;
     if lock.try_lock_exclusive().is_err() {
         if !smoke && tray::show_existing(&root) {
@@ -461,6 +554,14 @@ fn start() -> Result<(), String> {
     let headless = smoke || args.iter().any(|a| a == "--read-once");
     managed_data::startup_with(&root, headless, managed_data::native_choice)?;
     let app = Arc::new(App::load(root.clone())?);
+    drop(storage_transition);
+    if !smoke
+        && !args
+            .iter()
+            .any(|a| a == "--read-once" || a == "--no-auto-update")
+    {
+        updates::start_scheduler(app.clone());
+    }
     if args.iter().any(|a| a == "--read-once") {
         {
             let mut s = app.state.lock().unwrap();
@@ -468,16 +569,26 @@ fn start() -> Result<(), String> {
         }
         let result = app.scan(AiMode::Automatic);
         fs::write(
-            root.join("data/smoke-result.json"),
+            crate::storage::data_dir(&root).join("smoke-result.json"),
             json!({"result":result,"state":app.snapshot()}).to_string(),
         )
         .map_err(|e| e.to_string())?;
         return Ok(());
     }
+    if approval_smoke {
+        let mut state = app.state.lock().unwrap();
+        state.tasks.push(model::Task {
+            id: "approval-fixture".into(),
+            title: "合成审批验证".into(),
+            status: "待处理".into(),
+            ..Default::default()
+        });
+        state.handling.runs.push(handling::Run{id:"approval-run".into(),task_id:"approval-fixture".into(),thread_id:"synthetic".into(),status:"waiting".into(),project_name:"合成项目".into(),requests:vec![json!({"id":"synthetic-request","method":"item/commandExecution/requestApproval","params":{"command":(0..80).map(|n|format!("synthetic command {n}\n")).collect::<String>(),"reason":"合成审批，只检查窗口，不执行命令"}})],..Default::default()});
+    }
     let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
     // Use DWM's full-client frame, not Tao's legacy transparent-window blur.
-    let backdrop = (!smoke || mica_smoke) && app.state.lock().unwrap().config.window_backdrop;
+    let backdrop = !smoke || mica_smoke;
     let window = WindowBuilder::new()
         .with_title("拾事")
         .with_transparent(false)
@@ -522,7 +633,10 @@ fn start() -> Result<(), String> {
         std::thread::sleep(Duration::from_secs(60));
         if !watch.load(Ordering::SeqCst) {
             let message="界面初始化超过60秒，页面未完成加载。请保留 data 中的 startup-error.txt 和日志，供排查启动阶段。";
-            let _ = fs::write(watch_root.join("data/startup-error.txt"), message);
+            let _ = fs::write(
+                crate::storage::data_dir(&watch_root).join("startup-error.txt"),
+                message,
+            );
             if !smoke {
                 fatal(message);
             }
@@ -530,7 +644,8 @@ fn start() -> Result<(), String> {
         }
     });
     let ui_html = load_ui(&args)?;
-    let mut context = WebContext::new(Some(root.join("data/webview")));
+    let mut context = WebContext::new(Some(crate::storage::data_dir(&root).join("webview")));
+    let window_handle = window.hwnd() as isize;
     let ipc_app = app.clone();
     let ipc_proxy = proxy.clone();
     let webview = WebViewBuilder::new_with_web_context(&mut context)
@@ -574,10 +689,21 @@ fn start() -> Result<(), String> {
             }
             let app = ipc_app.clone();
             let proxy = ipc_proxy.clone();
+            let parent_rect = native_dialog::rect(window_handle);
             std::thread::spawn(move || {
-                let result = dispatch(&app, &value);
+                let storage_change = value["method"] == "storage_change";
+                let result = if storage_change {
+                    storage::begin(&app, &value["params"], parent_rect).map(|_| json!(true))
+                } else {
+                    dispatch(&app, &value)
+                };
+                let restart =
+                    (storage_change || value["method"] == "update_install") && result.is_ok();
                 if let Err(ref e) = result {
-                    if e != ai_control::CANCELLED {
+                    if e != ai_control::CANCELLED
+                        && e != handling::STOPPED
+                        && !e.starts_with("AI_UNCONFIGURED:")
+                    {
                         app.log("request_error", json!({"method":value["method"],"error":e}));
                     }
                 }
@@ -586,6 +712,9 @@ fn start() -> Result<(), String> {
                     Err(e) => json!({"id":value["id"],"ok":false,"error":e}),
                 };
                 let _ = proxy.send_event(UiEvent::Reply(reply));
+                if restart {
+                    let _ = proxy.send_event(UiEvent::StorageExit);
+                }
             });
         })
         .build(&window)
@@ -594,6 +723,20 @@ fn start() -> Result<(), String> {
             format!("界面启动失败：{e}\n详细错误已记录在 data/startup-error.txt。")
         })?;
     app.log("webview_created", json!({}));
+    let mut approvals = match approval_window::DesktopApprovals::new(
+        &event_loop,
+        &mut context,
+        proxy.clone(),
+        approval_smoke,
+    ) {
+        Ok(surface) => Some(surface),
+        Err(error) => {
+            app.log("approval_window_unavailable", json!({"error":error}));
+            None
+        }
+    };
+    let mut approval_smoke_report = json!({});
+    let mut approval_smoke_done = false;
     let tray_proxy = proxy.clone();
     let mut tray = Some(
         tray::Tray::new(&root, move |action| {
@@ -622,24 +765,20 @@ fn start() -> Result<(), String> {
                 if handling.handling_stream().unwrap_or(false) {
                     let _ = handling_proxy.send_event(UiEvent::Refresh);
                 }
-                if handling.handling_observe_desktop() {
-                    let _ = handling_proxy.send_event(UiEvent::Refresh);
-                }
-                let desktop = handling
-                    .state
-                    .lock()
-                    .unwrap()
-                    .handling
-                    .runs
-                    .iter()
-                    .any(|r| {
-                        r.desktop_control
-                            && ["inProgress", "syncPending"].contains(&r.desktop_status.as_str())
-                    });
-                if last_reconcile.elapsed() >= Duration::from_secs(if desktop { 5 } else { 30 }) {
+                if last_reconcile.elapsed() >= Duration::from_secs(30) {
                     let _ = handling.handling_sync(None);
                     last_reconcile = std::time::Instant::now();
                 }
+            }
+        });
+        let desktop = app.clone();
+        let desktop_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            while !process::stopping() {
+                if desktop.handling_sync_desktop(None) {
+                    let _ = desktop_proxy.send_event(UiEvent::Refresh);
+                }
+                std::thread::sleep(Duration::from_millis(750));
             }
         });
         std::thread::spawn(move || {
@@ -747,11 +886,64 @@ fn start() -> Result<(), String> {
         });
     }
     let mut push_generation = 0u64;
+    let mut announced_update = String::new();
     event_loop.run(move |event, _, control_flow| {
         // Own all native/UI resources for the entire event loop lifetime.
         let _ = (&lock, &window, &context);
         *control_flow = ControlFlow::Wait;
         match event {
+            Event::UserEvent(UiEvent::StorageExit) => {
+                process::shutdown();
+                let _ = app.log_writer.stop();
+                drop(tray.take());
+                std::process::exit(0);
+            }
+            Event::UserEvent(UiEvent::ApprovalCommand(value)) => {
+                match value["method"].as_str().unwrap_or("") {
+                    "approval_ready"=>{if let Some(surface)=approvals.as_mut(){surface.ready();surface.refresh(&app,&window);surface.reply(&json!({"id":value["id"],"ok":true,"data":true}));}}
+                    "approval_hide"=>{if let Some(surface)=approvals.as_mut(){surface.hide_key(value["params"]["key"].as_str().unwrap_or(""));surface.reply(&json!({"id":value["id"],"ok":true,"data":true}));}}
+                    "approval_presented" if approval_smoke=>{
+                        if let Some(surface)=approvals.as_ref(){
+                            approval_smoke_report=value["params"].clone();
+                            approval_smoke_report["native"]=surface.metrics();
+                            unsafe{windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(surface.hwnd() as _,windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,0,0);}
+                        }
+                    }
+                    "handling_request" if !smoke=>{
+                        let worker=app.clone();let reply_proxy=smoke_proxy.clone();
+                        std::thread::spawn(move||{
+                            let reply=match dispatch(&worker,&value){
+                                Ok(data)=>json!({"id":value["id"],"ok":true,"data":data}),
+                                Err(error)=>json!({"id":value["id"],"ok":false,"error":error})
+                            };
+                            let _=reply_proxy.send_event(UiEvent::ApprovalReply(reply));
+                        });
+                    }
+                    _=>{if let Some(surface)=approvals.as_ref(){surface.reply(&json!({"id":value["id"],"ok":false,"error":"不支持的审批窗口操作"}));}}
+                }
+            }
+            Event::UserEvent(UiEvent::ApprovalReply(reply))=>{
+                if let Some(surface)=approvals.as_mut(){surface.reply(&reply);surface.refresh(&app,&window);}
+                push_generation+=1;
+                let _=webview.evaluate_script(&format!("window.stateChanged({push_generation})"));
+            }
+            Event::WindowEvent{window_id,event,..} if approvals.as_ref().is_some_and(|surface|surface.id()==window_id)=>{
+                if matches!(event,WindowEvent::Resized(_)|WindowEvent::ScaleFactorChanged{..}) {if let Some(surface)=approvals.as_ref().filter(|s|s.visible()){surface.position(&window);}}
+                if matches!(event,WindowEvent::CloseRequested){
+                    if let Some(surface)=approvals.as_mut(){
+                        surface.dismiss();
+                        if approval_smoke {
+                            approval_smoke_report["close_preserved_request"]=json!(app.desktop_approvals().len()==1);
+                            approval_smoke_report["hidden_on_close"]=json!(!surface.visible());
+                            app.state.lock().unwrap().handling.runs.iter_mut().for_each(|r|r.requests.clear());
+                            surface.refresh(&app,&window);
+                            approval_smoke_report["hidden_after_resolution"]=json!(!surface.visible());
+                            approval_smoke_done=true;
+                            if initialized.load(Ordering::SeqCst){unsafe{windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(window.hwnd() as _,windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE,0,0);}}
+                        }
+                    }
+                }
+            }
             Event::UserEvent(UiEvent::Tray(tray::Action::Show)) => {
                 if smoke {
                     if let Some(report) = smoke_report.as_mut() {
@@ -768,6 +960,7 @@ fn start() -> Result<(), String> {
             Event::UserEvent(UiEvent::Tray(tray::Action::Exit)) => {
                 app.log("exit_from_tray", json!({}));
                 process::shutdown();
+                let _ = app.log_writer.stop();
                 drop(tray.take());
                 if smoke {
                     let mut report = smoke_report.take().unwrap_or_default();
@@ -775,8 +968,14 @@ fn start() -> Result<(), String> {
                     let ok = ["ok", "closed_to_tray", "tray_message", "tray_removed"]
                         .iter()
                         .all(|key| report[*key] == true);
+                    let ok=ok&&(!approval_smoke || (approval_smoke_report["rendered"]==true
+                        && approval_smoke_report["footer_visible"]==true && approval_smoke_report["scrollable"]==true
+                        && approval_smoke_report["native"]["visible"]==true && approval_smoke_report["native"]["inside_work_area"]==true
+                        && approval_smoke_report["close_preserved_request"]==true && approval_smoke_report["hidden_on_close"]==true
+                        && approval_smoke_report["hidden_after_resolution"]==true));
+                    if approval_smoke{report["approval"]=approval_smoke_report.clone();report["ok"]=json!(ok);}
                     let saved =
-                        fs::write(root.join("data/ui-smoke.json"), report.to_string()).is_ok();
+                        fs::write(crate::storage::data_dir(&root).join("ui-smoke.json"), report.to_string()).is_ok();
                     std::process::exit(if ok && saved { 0 } else { 1 });
                 }
                 std::process::exit(0);
@@ -805,6 +1004,7 @@ fn start() -> Result<(), String> {
                             });
                             return;
                         }
+                        if approval_smoke&&!approval_smoke_done{return;}
                         // Exercise a real native close message without showing or focusing the window.
                         let sent = unsafe {
                             windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(
@@ -832,7 +1032,16 @@ fn start() -> Result<(), String> {
                 let _ = webview.evaluate_script(&format!("window.receive({})", v));
             }
             Event::UserEvent(UiEvent::Refresh) => {
+                let update=app.updates.snapshot();
+                if app.state.lock().unwrap().config.auto_update && update["status"]=="ready"
+                    && update["reminder"]["expires_at"].as_i64().is_some_and(|t|model::now()<t)
+                    && update["reminder"]["id"].as_str().is_some_and(|v|v!=announced_update) {
+                    announced_update=update["reminder"]["id"].as_str().unwrap_or("").to_owned();
+                    window.set_visible(true);
+                    window.set_focus();
+                }
                 push_generation += 1;
+                if let Some(surface)=approvals.as_mut(){surface.refresh(&app,&window);}
                 let _ = webview.evaluate_script(&format!("window.stateChanged({push_generation})"));
             }
             Event::WindowEvent {

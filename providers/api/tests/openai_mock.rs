@@ -1241,6 +1241,72 @@ fn streaming_response_and_reasoning_replay_share_the_actual_analysis_path() {
 }
 
 #[test]
+fn streaming_usage_updates_do_not_double_count_tool_rounds_or_final_only_usage() {
+    fn sse(frames: &[Value]) -> Reply {
+        let mut wire = frames
+            .iter()
+            .map(|v| format!("data: {v}\n\n"))
+            .collect::<String>();
+        wire.push_str("data: [DONE]\n\n");
+        Reply::raw(200, &wire)
+    }
+    for first_output in [Some(3), None] {
+        let mock = MockTransport::new(vec![
+            sse(&[
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"ctx","type":"function","function":{"name":"read_context","arguments":"{\"ids\":[]}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":first_output}}),
+            ]),
+            sse(&[
+                json!({"choices":[{"delta":{"content":final_content()}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}),
+                json!({"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":4}}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                json!({"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":5}}),
+            ]),
+        ]);
+        let schema = output_schema();
+        let cancel = AtomicBool::new(false);
+        let tools = [read_context_tool()];
+        let mut handler = FnToolHandler(|_: &shishi_api::ToolInvocation<'_>| Ok("{}".to_string()));
+        let mut counts = vec![];
+        let mut finished = vec![];
+        let output = test_client(&mock)
+            .analyze_with_events(
+                AnalyzeRequest {
+                    model: "synthetic-model",
+                    reasoning_effort: None,
+                    prompt: SYNTHETIC_PROMPT,
+                    schema: &schema,
+                    credential: SYNTHETIC_KEY,
+                    cancel: &cancel,
+                    timeout: Duration::from_secs(5),
+                    tools: &tools,
+                    tool_handler: Some(&mut handler),
+                },
+                true,
+                &mut |e| match e {
+                    shishi_api::ApiEvent::OutputTokens(count) => counts.push(count),
+                    shishi_api::ApiEvent::StepFinished { output_tokens, .. } => {
+                        finished.push(output_tokens)
+                    }
+                    _ => {}
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            if first_output.is_some() {
+                vec![Some(5), Some(7)]
+            } else {
+                vec![None, None]
+            }
+        );
+        assert_eq!(finished, vec![first_output, Some(5)]);
+        assert_eq!(output.usage.completion_tokens, first_output.map(|v| v + 5));
+        assert_eq!(output.usage.prompt_tokens, Some(6));
+        assert_eq!(output.usage.responses, 2);
+    }
+}
+
+#[test]
 fn stream_refusal_and_partial_tool_arguments_never_invoke_tools() {
     for wire in ["data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"refusal\"}]}\n\ndata: [DONE]\n\n", "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"x\",\"function\":{\"name\":\"read_context\",\"arguments\":\"{\"}}]}}]}\n\n"] {
         let mock=MockTransport::new(vec![Reply::raw(200,wire)]);let schema=output_schema();let cancel=AtomicBool::new(false);let tools=[read_context_tool()];let mut invoked=0;

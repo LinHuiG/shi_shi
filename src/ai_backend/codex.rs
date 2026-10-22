@@ -25,14 +25,15 @@ impl super::Backend for Codex {
     fn status(&self, c: &super::Connection, root: &Path) -> Result<Value, String> {
         let mut cmd = Command::new(resolve_cli(&c.executable)?);
         cmd.args(["login", "status"]);
-        let (o, e) = process::run(cmd, None, 15, &root.join("data/tmp"))?;
+        let (o, e) = process::run(cmd, None, 15, &crate::storage::data_dir(&root).join("tmp"))?;
         Ok(json!({"status":format!("{o}{e}")}))
     }
     fn agent(
         &self,
         c: &super::Connection,
     ) -> Result<std::sync::Arc<dyn super::AgentSession>, String> {
-        Ok(crate::codex_bridge::Client::connect(&c.executable)?)
+        let _ = c;
+        Err("Codex 处置使用桌面消息桥接，不提供独立执行连接".into())
     }
     fn open_session(&self, thread: &str) -> Result<(), String> {
         crate::codex_bridge::open_thread(thread)
@@ -58,7 +59,9 @@ fn analyze(
     if !Path::new(&config.codex).is_file() {
         return Err("未找到 Codex CLI，请在设置中选择 codex.exe".into());
     }
-    let job = root.join("data/ai-work").join(crate::model::id());
+    let job = crate::storage::data_dir(&root)
+        .join("ai-work")
+        .join(crate::model::id());
     fs::create_dir_all(&job).map_err(|e| e.to_string())?;
     let workdir = analysis_workdir(root, config)?;
     fs::create_dir_all(&workdir).map_err(|e| format!("无法创建分析工作目录：{e}"))?;
@@ -179,7 +182,7 @@ fn analyze(
         cmd,
         Some(prompt),
         config.ai_timeout_seconds,
-        &root.join("data/tmp"),
+        &crate::storage::data_dir(&root).join("tmp"),
         &|| cancel.load(std::sync::atomic::Ordering::SeqCst) || budget_stop.get(),
         &mut |line| {
             use std::io::Write;
@@ -634,7 +637,7 @@ fn exec_help(
         cmd,
         None,
         15,
-        &root.join("data/tmp"),
+        &crate::storage::data_dir(&root).join("tmp"),
         Some(cancel),
         &mut |_| {},
     )?;

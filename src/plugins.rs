@@ -232,7 +232,7 @@ pub fn catalog(root: &Path) -> (Vec<Plugin>, Vec<String>) {
     let mut found = std::collections::BTreeMap::new();
     let mut errors = vec![];
     // No bundled or legacy executable-adjacent plugins are loaded implicitly.
-    for parent in [root.join("data/plugins")] {
+    for parent in [crate::storage::data_dir(&root).join("plugins")] {
         if let Ok(entries) = fs::read_dir(parent) {
             for entry in entries.flatten() {
                 if entry.file_name().to_string_lossy().starts_with('.') {
@@ -289,7 +289,7 @@ fn install_zip(
     path: &Path,
     commit: impl FnOnce(&Manifest, bool) -> Result<(), String>,
 ) -> Result<Installed, String> {
-    let parent = root.join("data/tmp/plugin-packages");
+    let parent = crate::storage::data_dir(&root).join("tmp/plugin-packages");
     fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
     let parent = parent.canonicalize().map_err(|e| e.to_string())?;
     let unpack = parent.join(uuid::Uuid::new_v4().to_string());
@@ -313,8 +313,13 @@ fn install_zip(
             json!({"path":path.canonicalize().map_err(|e|e.to_string())?,"destination":unpack})
                 .to_string(),
         );
-        let (output, _) = crate::process::run(command, None, 90, &root.join("data/tmp"))
-            .map_err(|e| format!("插件 ZIP 解压或校验失败：{e}"))?;
+        let (output, _) = crate::process::run(
+            command,
+            None,
+            90,
+            &crate::storage::data_dir(&root).join("tmp"),
+        )
+        .map_err(|e| format!("插件 ZIP 解压或校验失败：{e}"))?;
         let value: Value = serde_json::from_str(output.trim())
             .map_err(|e| format!("插件 ZIP 返回结果无效：{e}"))?;
         let manifest = PathBuf::from(value["manifest"].as_str().ok_or("ZIP 中未找到插件描述")?)
@@ -389,7 +394,7 @@ fn install_manifest(
     commit: impl FnOnce(&Manifest, bool) -> Result<(), String>,
 ) -> Result<Installed, String> {
     let plugin = Plugin::read(path)?;
-    let parent = root.join("data/plugins");
+    let parent = crate::storage::data_dir(&root).join("plugins");
     fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
     let target = parent.join(&plugin.manifest.id);
     let replacing = target.exists();

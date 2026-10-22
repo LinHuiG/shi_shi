@@ -239,6 +239,89 @@ mod tests {
         fs::write(dir.join("plugin.json"),json!({"id":"fixture","name":"Fixture","version":"1","api_version":1,"entrypoint":"fixture.dll","files":["fixture.dll"],"capabilities":["discover","validate","fetch_incremental","fetch_range","lookup_messages"],"config_fields":[]}).to_string()).unwrap();
     }
     #[test]
+    fn scan_counts_unique_persisted_changes_and_preserves_failure_boundaries() {
+        let app = fixture();
+        let source = source("Fixture");
+        let mut first = row(&source);
+        app.state.lock().unwrap().chat_sources.push(source.clone());
+        let commit =
+            |rows| app.commit_scan(vec![(source.clone(), Ok((rows, json!(1), now())))], now());
+        let (counts, _, _) = commit(vec![first.clone(); 3]).unwrap();
+        assert_eq!(
+            (
+                counts.received,
+                counts.added,
+                counts.updated,
+                counts.duplicates
+            ),
+            (3, 1, 0, 2)
+        );
+        first.source_name = "Renamed".into();
+        first.reply = "Changed metadata".into();
+        let mut second = first.clone();
+        second.id = "second".into();
+        let mut expired = first.clone();
+        expired.id = "expired".into();
+        expired.time = now() - 400 * 86_400_000i64;
+        let mut deleted = first.clone();
+        deleted.id = "deleted".into();
+        app.state
+            .lock()
+            .unwrap()
+            .deleted_messages
+            .insert(deleted.id.clone(), now());
+        let (counts, _, _) = commit(vec![
+            first.clone(),
+            second.clone(),
+            second.clone(),
+            expired,
+            deleted,
+        ])
+        .unwrap();
+        assert_eq!(
+            (
+                counts.received,
+                counts.added,
+                counts.updated,
+                counts.unchanged,
+                counts.duplicates,
+                counts.ignored
+            ),
+            (5, 1, 0, 1, 1, 2)
+        );
+        first.text = "Actual edit".into();
+        second.withdrawn = true;
+        second.text.clear();
+        let (counts, _, _) = commit(vec![first.clone(), first.clone(), second]).unwrap();
+        assert_eq!((counts.added, counts.updated, counts.duplicates), (0, 2, 1));
+        let mut stale = source.clone();
+        stale.updated += 1;
+        let (counts, errors, sources) = app
+            .commit_scan(
+                vec![
+                    (stale, Ok((vec![first.clone()], json!(2), now()))),
+                    (source.clone(), Err("Synthetic failure".into())),
+                ],
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                counts.received,
+                counts.ignored,
+                counts.added,
+                sources,
+                errors.len()
+            ),
+            (1, 1, 0, 0, 2)
+        );
+        let previous = app.state.lock().unwrap().messages[&first.id].text.clone();
+        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        first.text = "Uncommitted".into();
+        assert!(commit(vec![first.clone()]).is_err());
+        assert_eq!(app.state.lock().unwrap().messages[&first.id].text, previous);
+    }
+    #[test]
     fn scan_update_cursor_ignores_renames_replies_and_failed_saves() {
         let app = fixture();
         let source = source("Fixture");
@@ -614,7 +697,9 @@ fn fetch(
     until: i64,
 ) -> Result<(Vec<Message>, Value, i64), String> {
     let plugin = plugins::find(root, &source.plugin_id)?;
-    let work = root.join("data/tmp/plugins").join(&source.id);
+    let work = crate::storage::data_dir(&root)
+        .join("tmp/plugins")
+        .join(&source.id);
     validate(&plugin, source, &work)?;
     let since = if source.last_scan == 0 {
         until - 86_400_000
@@ -648,6 +733,15 @@ fn fetch(
     Ok((messages, value["cursor"].clone(), checkpoint))
 }
 struct ScanGuard<'a>(&'a std::sync::atomic::AtomicBool);
+#[derive(Default, Debug, serde::Serialize)]
+struct ScanCounts {
+    received: usize,
+    added: usize,
+    updated: usize,
+    unchanged: usize,
+    duplicates: usize,
+    ignored: usize,
+}
 impl Drop for ScanGuard<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::SeqCst);
@@ -704,16 +798,15 @@ impl App {
             .map_err(|_| "插件正在读取或配置，请稍后重试")?;
         let pid = v["id"].as_str().ok_or("缺少插件编号")?;
         let plugin = plugins::find(&self.root, pid)?;
-        let parent = self
-            .root
-            .join("data/plugins")
+        let parent = crate::storage::data_dir(&self.root)
+            .join("plugins")
             .canonicalize()
             .map_err(|e| e.to_string())?;
         if plugin.dir.parent() != Some(parent.as_path()) {
             return Err("插件目录不属于安装目录，未卸载".into());
         }
         // Move out of the discoverable directory first; a failed state save restores it.
-        let storage = self.root.join("data/tmp/removed-plugins");
+        let storage = crate::storage::data_dir(&self.root).join("tmp/removed-plugins");
         fs::create_dir_all(&storage).map_err(|e| e.to_string())?;
         let retired = storage.join(id());
         let mut lock = self.state.lock().unwrap();
@@ -842,7 +935,7 @@ impl App {
             return Err("插件包不是有效的 ZIP 文件".into());
         }
         // Browser drops expose file contents, never a trusted filesystem path.
-        let parent = self.root.join("data/tmp/plugin-uploads");
+        let parent = crate::storage::data_dir(&self.root).join("tmp/plugin-uploads");
         fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
         let path = parent.join(format!("{}.zip", id()));
         let result = (|| {
@@ -856,7 +949,9 @@ impl App {
         let _guard = self.plugin_access.read().map_err(|_| "插件状态不可用")?;
         self.require_plugin_enabled(v["plugin_id"].as_str().unwrap_or(""))?;
         let plugin = plugins::find(&self.root, v["plugin_id"].as_str().ok_or("请选择插件")?)?;
-        let work = self.root.join("data/tmp/discovery").join(id());
+        let work = crate::storage::data_dir(&self.root)
+            .join("tmp/discovery")
+            .join(id());
         plugin.call("discover", &v["config"], json!({}), &work)
     }
     pub fn source_save(&self, v: &Value) -> Result<Value, String> {
@@ -877,7 +972,9 @@ impl App {
                     account_key: String::new(),
                     ..source.clone()
                 },
-                &self.root.join("data/tmp/validate").join(id()),
+                &crate::storage::data_dir(&self.root)
+                    .join("tmp/validate")
+                    .join(id()),
             )?)
         } else {
             None
@@ -961,6 +1058,9 @@ impl App {
         Ok(json!(true))
     }
     pub fn scan(&self, mode: AiMode) -> Result<Value, String> {
+        if mode == AiMode::Automatic && !self.state.lock().unwrap().config.enabled {
+            return Ok(json!({"skipped":"增量消息扫描已关闭"}));
+        }
         self.scan_with_analysis(mode == AiMode::Manual)
     }
     pub fn refresh_messages(&self) -> Result<Value, String> {
@@ -973,9 +1073,10 @@ impl App {
         }
         self.last_attempt.store(now(), Ordering::SeqCst);
         {
-            let mut s = self.state.lock().unwrap();
-            s.last_scan_finished_at = now();
-            self.save(&s)?;
+            self.commit_state(|s| {
+                s.last_scan_finished_at = now();
+                Ok(())
+            })?;
         }
         let mut result = result?;
         result["analysis"] = if analyze {
@@ -995,7 +1096,8 @@ impl App {
         let start = now();
         self.last_attempt.store(start, Ordering::SeqCst);
         let jobs = {
-            let mut s = self.state.lock().unwrap();
+            let mut state_lock = self.state.lock().unwrap();
+            let mut s = state_lock.clone();
             let sources = s
                 .chat_sources
                 .iter()
@@ -1007,6 +1109,8 @@ impl App {
             }
             s.pending_scan = true;
             self.save(&s)?;
+            *state_lock = s;
+            let s = &*state_lock;
             let tracked = s
                 .tasks
                 .iter()
@@ -1059,42 +1163,55 @@ impl App {
                     .collect::<Vec<_>>()
             }));
         }
-        let (count, errors, successful) = self.commit_scan(results, start)?;
+        let (counts, errors, successful) = self.commit_scan(results, start)?;
         drop(plugin_guard);
         self.log(
             "scan",
-            json!({"rows":count,"sources":successful,"errors":errors,"elapsed_ms":now()-start}),
+            json!({"rows":counts.received,"added":counts.added,"updated":counts.updated,"scan_counts":counts,"sources":successful,"errors":errors,"elapsed_ms":now()-start}),
         );
         if successful == 0 && !errors.is_empty() {
             return Err(errors.join("；"));
         }
-        Ok(json!({"rows":count,"sources":successful,"warnings":errors}))
+        Ok(
+            json!({"rows":counts.received,"added":counts.added,"updated":counts.updated,"sources":successful,"warnings":errors}),
+        )
     }
     fn commit_scan(
         &self,
         results: Vec<(ChatSource, Result<(Vec<Message>, Value, i64), String>)>,
         start: i64,
-    ) -> Result<(usize, Vec<String>, usize), String> {
+    ) -> Result<(ScanCounts, Vec<String>, usize), String> {
         let mut lock = self.state.lock().unwrap();
         let mut s = lock.clone();
         let keep = crate::messages::protected(&s);
-        let mut count = 0;
+        let mut counts = ScanCounts::default();
+        let mut seen = BTreeSet::new();
+        let mut accepted = BTreeSet::new();
         let mut errors = vec![];
         let mut successful = 0;
         for (source, result) in results {
+            if let Ok((rows, _, _)) = &result {
+                counts.received += rows.len();
+            }
             let Some(index) = s
                 .chat_sources
                 .iter()
                 .position(|x| x.id == source.id && x.updated == source.updated && x.enabled)
             else {
+                if let Ok((rows, _, _)) = &result {
+                    counts.ignored += rows.len();
+                }
                 errors.push(format!("{}配置已变化，本次结果已忽略", source.name));
                 continue;
             };
             match result {
                 Ok((rows, cursor, checkpoint)) => {
-                    count += rows.len();
                     for m in rows {
+                        if !seen.insert(m.id.clone()) {
+                            counts.duplicates += 1;
+                        }
                         if crate::messages::allowed_with(&s, &m, &keep) {
+                            accepted.insert(m.id.clone());
                             if s.messages
                                 .get(&m.id)
                                 .is_none_or(|old| fingerprint(old) != fingerprint(&m))
@@ -1103,6 +1220,8 @@ impl App {
                                 s.analysis_retry_counts.remove(&m.id);
                             }
                             crate::message_progress::insert(&mut s, m);
+                        } else {
+                            counts.ignored += 1;
                         }
                     }
                     s.chat_sources[index].cursor = cursor;
@@ -1142,9 +1261,20 @@ impl App {
         crate::context_budget::mark_pending(&mut s, pending, now());
         s.pending_scan = false;
         s.last_error = errors.join("；");
+        // Count persisted net changes once per identity, without changing the
+        // established merge order or treating display metadata as message edits.
+        for id in accepted {
+            if let Some(message) = s.messages.get(&id) {
+                match lock.messages.get(&id) {
+                    None => counts.added += 1,
+                    Some(old) if fingerprint(old) != fingerprint(message) => counts.updated += 1,
+                    Some(_) => counts.unchanged += 1,
+                }
+            }
+        }
         self.save(&s)?;
         *lock = s;
-        Ok((count, errors, successful))
+        Ok((counts, errors, successful))
     }
     pub fn source_range(&self, v: &Value) -> Result<Value, String> {
         let plugin_guard = self.plugin_access.read().map_err(|_| "插件状态不可用")?;
@@ -1168,7 +1298,9 @@ impl App {
             .ok_or("来源不存在")?;
         let plugin = plugins::find(&self.root, &source.plugin_id)?;
         self.require_plugin_enabled(&source.plugin_id)?;
-        let work = self.root.join("data/tmp/range").join(id());
+        let work = crate::storage::data_dir(&self.root)
+            .join("tmp/range")
+            .join(id());
         validate(&plugin, &source, &work)?;
         let value = plugin.call(
             "fetch_range",
@@ -1209,10 +1341,11 @@ impl App {
         }
         drop(plugin_guard);
         {
-            let mut s = self.state.lock().unwrap();
-            s.revision += 1;
-            s.last_scan_finished_at = now();
-            self.save(&s)?;
+            self.commit_state(|s| {
+                s.revision += 1;
+                s.last_scan_finished_at = now();
+                Ok(())
+            })?;
         }
         let analysis = self.analyze_after_scan(AiMode::Manual)?;
         Ok(json!({"rows":count,"analysis":analysis}))

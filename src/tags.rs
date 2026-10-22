@@ -346,21 +346,6 @@ pub fn snapshot(s: &State) -> Value {
     json!({"unified":true,"priority_kind":priority_kind(s),"groups":groups(s),"versions":s.tag_state.versions,"proposals":s.tag_state.proposals,"filters":s.tag_state.filters,"priorities":s.tag_state.priorities,"category_aliases":category_aliases(s)})
 }
 
-/// Archive-generated tag maintenance. Changes are validated against the
-/// current catalog and recorded as one new tag version, not as a silent diff.
-pub fn apply_archive_changes(
-    s: &mut State,
-    changes: &[Value],
-    _evidence: &BTreeSet<String>,
-    at: i64,
-) -> Result<usize, String> {
-    // Transactional even when called directly: a bad later operation cannot
-    // leave earlier catalog or assignment edits half applied.
-    let mut next = s.clone();
-    let count = apply_catalog(&mut next, changes, at)?;
-    *s = next;
-    Ok(count)
-}
 fn prune_filters(s: &mut State, catalog: &[Group]) {
     s.tag_state.filters.retain(|kind, values| {
         values.retain(|value| {
@@ -375,189 +360,6 @@ fn prune_filters(s: &mut State, catalog: &[Group]) {
         !values.is_empty()
     });
     s.tag_state.priorities.clear();
-}
-fn apply_catalog(s: &mut State, changes: &[Value], at: i64) -> Result<usize, String> {
-    if changes.len() > 40 {
-        return Err("标签变更最多40项".into());
-    }
-    let mut catalog = groups(s);
-    let original = catalog.clone();
-    let mut priority = priority_kind(s);
-    let before = assignment_snapshot(s);
-    for change in changes {
-        let action = change["action"].as_str().unwrap_or("");
-        let tag: Tag =
-            serde_json::from_value(change["tag"].clone()).map_err(|_| "标签变更格式无效")?;
-        let group_action = ["rename_group", "remove_group", "reorder"].contains(&action);
-        if !valid(&Tag {
-            kind: tag.kind.clone(),
-            value: if group_action {
-                "group".into()
-            } else {
-                tag.value.clone()
-            },
-        }) {
-            return Err("标签名称无效".into());
-        }
-        let replacement = change
-            .get("replacement")
-            .filter(|v| !v.is_null())
-            .map(|v| serde_json::from_value::<Tag>(v.clone()).map_err(|_| "标签替换格式无效"))
-            .transpose()?;
-        if action == "add" {
-            if let Some(g) = catalog.iter_mut().find(|g| g.name == tag.kind) {
-                if !g.values.contains(&tag.value) {
-                    g.values.push(tag.value.clone());
-                }
-            } else {
-                catalog.push(Group {
-                    display_priority: None,
-                    name: tag.kind.clone(),
-                    values: vec![tag.value.clone()],
-                });
-            }
-        } else if action == "reorder" {
-            let order: Vec<String> =
-                serde_json::from_value(change["order"].clone()).map_err(|_| "标签顺序无效")?;
-            let g = catalog
-                .iter_mut()
-                .find(|g| g.name == tag.kind)
-                .ok_or("标签类型不存在")?;
-            if order.len() != g.values.len()
-                || order.iter().collect::<BTreeSet<_>>() != g.values.iter().collect::<BTreeSet<_>>()
-            {
-                return Err("重排必须恰好包含全部现有标签值".into());
-            }
-            g.values = order;
-        } else if [
-            "remove",
-            "soft_delete",
-            "rename",
-            "rename_group",
-            "remove_group",
-        ]
-        .contains(&action)
-        {
-            let Some(index) = catalog.iter().position(|g| g.name == tag.kind) else {
-                continue;
-            };
-            let group_action = ["rename_group", "remove_group"].contains(&action);
-            if !group_action && !catalog[index].values.contains(&tag.value) {
-                continue;
-            }
-            if ["rename", "rename_group"].contains(&action) {
-                let target = replacement.as_ref().ok_or("重命名需要新标签")?;
-                if !valid(target) {
-                    return Err("新标签名称无效".into());
-                }
-                if action == "rename_group" {
-                    if catalog
-                        .iter()
-                        .any(|g| g.name == target.kind && g.name != tag.kind)
-                    {
-                        return Err("目标标签类型已存在".into());
-                    }
-                    catalog[index].name = target.kind.clone();
-                    if priority == tag.kind {
-                        priority = target.kind.clone();
-                    }
-                } else {
-                    if target.kind != tag.kind {
-                        return Err("改名不能改变标签类型；请使用类型改名".into());
-                    }
-                    if catalog[index].values.contains(&target.value) && target.value != tag.value {
-                        return Err("目标标签值已存在".into());
-                    }
-                    for value in &mut catalog[index].values {
-                        if *value == tag.value {
-                            *value = target.value.clone();
-                        }
-                    }
-                }
-            } else if group_action {
-                catalog.remove(index);
-                if priority == tag.kind {
-                    priority.clear();
-                }
-            } else {
-                catalog[index].values.retain(|v| v != &tag.value);
-                if catalog[index].values.is_empty() {
-                    catalog.remove(index);
-                    if priority == tag.kind {
-                        priority.clear();
-                    }
-                }
-            }
-            if action == "rename_group" {
-                if let Some(values) = s.tag_state.filters.remove(&tag.kind) {
-                    s.tag_state
-                        .filters
-                        .insert(replacement.as_ref().unwrap().kind.clone(), values);
-                }
-            } else if action == "rename" {
-                if let Some(values) = s.tag_state.filters.get_mut(&tag.kind) {
-                    for value in values {
-                        if *value == tag.value {
-                            *value = replacement.as_ref().unwrap().value.clone();
-                        }
-                    }
-                }
-            }
-            let transform = |tags: &mut Vec<Tag>| {
-                tags.retain_mut(|current| {
-                    if current.kind != tag.kind || !group_action && current.value != tag.value {
-                        return true;
-                    }
-                    if action == "rename_group" {
-                        current.kind = replacement.as_ref().unwrap().kind.clone();
-                        true
-                    } else if action == "rename" {
-                        *current = replacement.as_ref().unwrap().clone();
-                        true
-                    } else {
-                        false
-                    }
-                });
-                tags.sort();
-                tags.dedup();
-            };
-            for t in &mut s.tasks {
-                transform(&mut t.tags);
-            }
-            for t in &mut s.schedules {
-                transform(&mut t.tags);
-            }
-        } else {
-            return Err("标签变更动作无效".into());
-        }
-        if catalog.len() > 32 || catalog.iter().any(|g| g.values.len() > 200) {
-            return Err("标签目录超出32类／每类200值限制".into());
-        }
-    }
-    let assignments = assignment_diff(s, before);
-    if catalog == original && assignments.is_empty() {
-        return Ok(0);
-    }
-    for row in &assignments {
-        if row.schedule {
-            if let Some(t) = s.schedules.iter_mut().find(|t| t.id == row.id) {
-                t.updated = at.max(t.updated + 1);
-            }
-        } else if let Some(t) = s.tasks.iter_mut().find(|t| t.id == row.id) {
-            t.updated = at.max(t.updated + 1);
-        }
-    }
-    prune_filters(s, &catalog);
-    s.tag_state.versions.push(Version {
-        id: id(),
-        created: at,
-        action: "archive".into(),
-        reason: format!("AI 维护标签（{} 项）", changes.len()),
-        groups: catalog,
-        priority_kind: priority,
-        assignments,
-    });
-    Ok(changes.len())
 }
 
 // The model only proposes additions. Evidence must come from this invocation, and
@@ -929,69 +731,34 @@ mod tests {
     #[test]
     fn unified_catalog_has_no_environment_defaults_and_empty_tags_stay_empty() {
         let app = fixture();
-        let mut s = app.state.lock().unwrap();
-        assert!(s.tag_state.unified);
-        assert!(!groups(&s).iter().any(|g| g.name == "适用环境"));
-        let mut task = Task {
-            environment: "未指定".into(),
-            ..Default::default()
-        };
-        normalize_task(&mut task);
-        sanitize(&mut task, None, &groups(&s));
-        assert!(task.tags.is_empty());
-        assert!(task.environment.is_empty());
-        let changes = json!([{"action":"remove_group","tag":{"kind":"事项类型","value":""}},{"action":"remove_group","tag":{"kind":"事项等级","value":""}}]);
-        apply_archive_changes(&mut s, changes.as_array().unwrap(), &BTreeSet::new(), now())
-            .unwrap();
-        assert!(groups(&s).is_empty());
-        app.save(&s).unwrap();
-        drop(s);
+        app.commit_state(|s| {
+            assert!(s.tag_state.unified);
+            assert!(!groups(s).iter().any(|g| g.name == "适用环境"));
+            let mut task = Task {
+                environment: "未指定".into(),
+                ..Default::default()
+            };
+            normalize_task(&mut task);
+            sanitize(&mut task, None, &groups(s));
+            assert!(task.tags.is_empty() && task.environment.is_empty());
+            // A saved empty current catalog must stay empty on restart.
+            s.tag_state.versions.last_mut().unwrap().groups.clear();
+            s.tag_state
+                .versions
+                .last_mut()
+                .unwrap()
+                .priority_kind
+                .clear();
+            Ok(())
+        })
+        .unwrap();
         let reloaded = App::load(app.root.clone()).unwrap();
         assert!(groups(&reloaded.state.lock().unwrap()).is_empty());
     }
     #[test]
-    fn rename_reorder_delete_and_rollback_preserve_dynamic_ranking_and_assignment_history() {
+    fn historical_catalog_assignments_still_rollback_and_dynamic_ranking_uses_current_order() {
         let app = fixture();
-        let original;
-        {
-            let mut s = app.state.lock().unwrap();
-            original = s.tag_state.versions.last().unwrap().id.clone();
-            s.tasks.push(Task {
-                id: "fixture-task".into(),
-                tags: vec![
-                    Tag {
-                        kind: "事项等级".into(),
-                        value: "低".into(),
-                    },
-                    Tag {
-                        kind: "事项类型".into(),
-                        value: "日常事务".into(),
-                    },
-                ],
-                status: "待处理".into(),
-                due: "2026-10-19T12:00:00+08:00".into(),
-                follow_deadline: true,
-                ..Default::default()
-            });
-            let changes = json!([{"action":"rename","tag":{"kind":"事项等级","value":"高"},"replacement":{"kind":"事项等级","value":"优先"}},{"action":"rename_group","tag":{"kind":"事项等级","value":""},"replacement":{"kind":"处理顺序","value":"组"}},{"action":"remove_group","tag":{"kind":"事项类型","value":""}}]);
-            apply_archive_changes(&mut s, changes.as_array().unwrap(), &BTreeSet::new(), now())
-                .unwrap();
-            assert_eq!(priority_kind(&s), "处理顺序");
-            assert_eq!(s.tasks[0].tags.len(), 1);
-            assert_eq!(s.tasks[0].tags[0].kind, "处理顺序");
-            let effective = effective_tags(
-                &s.tasks[0],
-                &groups(&s),
-                &priority_kind(&s),
-                deadline_ms("2026-10-19T11:30:00+08:00").unwrap(),
-            );
-            assert_eq!(effective[0].value, "优先");
-            assert_eq!(s.tasks[0].tags[0].value, "低");
-            apply_archive_changes(&mut s,json!([{"action":"reorder","tag":{"kind":"处理顺序","value":""},"order":["低","普通","优先","紧急"]}]).as_array().unwrap(),&BTreeSet::new(),now()).unwrap();
-            assert_eq!(priority_rank(&s.tasks[0].tags, &groups(&s), "处理顺序"), 0);
-            app.save(&s).unwrap();
-        }
-        let latest = app
+        let original = app
             .state
             .lock()
             .unwrap()
@@ -1001,23 +768,57 @@ mod tests {
             .unwrap()
             .id
             .clone();
-        app.tag_decide(&json!({"action":"rollback","id":original,"expected":latest}))
+        let before = vec![
+            Tag {
+                kind: "事项等级".into(),
+                value: "低".into(),
+            },
+            Tag {
+                kind: "事项类型".into(),
+                value: "日常事务".into(),
+            },
+        ];
+        let after = vec![Tag {
+            kind: "处理顺序".into(),
+            value: "低".into(),
+        }];
+        app.commit_state(|s| {
+            s.tasks.push(Task {
+                id: "fixture-task".into(),
+                tags: after.clone(),
+                status: "待处理".into(),
+                ..Default::default()
+            });
+            s.tag_state.versions.push(Version {
+                id: "historical-version".into(),
+                priority_kind: "处理顺序".into(),
+                groups: vec![Group {
+                    name: "处理顺序".into(),
+                    values: vec!["低".into(), "普通".into(), "优先".into(), "紧急".into()],
+                    ..Default::default()
+                }],
+                assignments: vec![Assignment {
+                    id: "fixture-task".into(),
+                    before: before.clone(),
+                    after: after.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            assert_eq!(priority_rank(&after, &groups(s), "处理顺序"), 0);
+            Ok(())
+        })
+        .unwrap();
+        app.tag_decide(&json!({"action":"rollback","id":original,"expected":"historical-version"}))
             .unwrap();
-        let s = app.state.lock().unwrap();
-        assert_eq!(priority_kind(&s), "事项等级");
-        assert!(s.tasks[0].tags.iter().any(|t| t.kind == "事项类型"));
-        assert!(s.tasks[0]
-            .tags
-            .iter()
-            .any(|t| t.kind == "事项等级" && t.value == "低"));
+        let state = app.state.lock().unwrap();
+        assert_eq!(priority_kind(&state), "事项等级");
+        assert_eq!(state.tasks[0].tags, before);
     }
     #[test]
-    fn invalid_catalog_batch_is_atomic_and_legacy_conversion_keeps_real_labels_once() {
+    fn legacy_conversion_keeps_real_labels_once_without_restoring_removed_values() {
         let app = fixture();
         let mut s = app.state.lock().unwrap();
-        let before = json!(*s);
-        assert!(apply_archive_changes(&mut s,json!([{"action":"add","tag":{"kind":"范围","value":"示例"}},{"action":"reorder","tag":{"kind":"事项等级","value":""},"order":["高"]}]).as_array().unwrap(),&BTreeSet::new(),now()).is_err());
-        assert_eq!(json!(*s), before);
         s.tag_state.unified = false;
         s.tasks.push(Task {
             id: "legacy".into(),
@@ -1032,20 +833,20 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.kind == "适用环境" && t.value == "示例环境"));
-        let len = s.tag_state.versions.len();
+        let count = s.tag_state.versions.len();
         initialize(&mut s);
-        assert_eq!(s.tag_state.versions.len(), len);
-        apply_archive_changes(
-            &mut s,
-            json!([{"action":"remove","tag":{"kind":"事项等级","value":"高"}}])
-                .as_array()
-                .unwrap(),
-            &BTreeSet::new(),
-            now(),
-        )
-        .unwrap();
+        assert_eq!(s.tag_state.versions.len(), count);
+        s.tag_state
+            .versions
+            .last_mut()
+            .unwrap()
+            .groups
+            .iter_mut()
+            .filter(|g| g.name == "事项等级")
+            .for_each(|g| g.values.retain(|v| v != "高"));
+        s.tasks[0].tags.retain(|tag| tag.value != "高");
         normalize_task(&mut s.tasks[0]);
-        assert!(!s.tasks[0].tags.iter().any(|t| t.value == "高"));
+        assert!(!s.tasks[0].tags.iter().any(|tag| tag.value == "高"));
     }
     #[test]
     fn user_categories_are_preserved_when_initializing_again() {

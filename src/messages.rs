@@ -26,12 +26,12 @@ pub fn protected(s: &State) -> BTreeSet<String> {
     }
     protected
 }
-pub fn allowed(s: &State, m: &Message) -> bool {
-    allowed_with(s, m, &protected(s))
-}
 pub fn allowed_with(s: &State, m: &Message, keep: &BTreeSet<String>) -> bool {
+    allowed_at(s, m, keep, now())
+}
+fn allowed_at(s: &State, m: &Message, keep: &BTreeSet<String>, at: i64) -> bool {
     !s.deleted_messages.contains_key(&m.id)
-        && (m.time >= now() - i64::from(s.config.message_retention_days.max(1)) * 86_400_000
+        && (m.time >= at - i64::from(s.config.message_retention_days.max(1)) * 86_400_000
             || keep.contains(&m.id))
 }
 pub fn prune(s: &mut State) {
@@ -125,13 +125,21 @@ impl App {
         }
         let mut lock = self.state.lock().unwrap();
         let days = lock.config.message_retention_days.max(1);
-        let marker_path = self.root.join("data/retention-pruned.txt");
+        let marker_path = crate::storage::data_dir(&self.root).join("retention-pruned.txt");
         let marker = format!("{}:{}", date(), days);
         let due = std::fs::read_to_string(&marker_path)
             .map(|v| v != marker)
             .unwrap_or(true);
-        if !due && !lock.messages.values().any(|m| !allowed(&lock, m)) {
-            return Ok(());
+        if !due {
+            let at = now();
+            let keep = protected(&lock);
+            if !lock
+                .messages
+                .values()
+                .any(|m| !allowed_at(&lock, m, &keep, at))
+            {
+                return Ok(());
+            }
         }
         let mut s = lock.clone();
         if due {

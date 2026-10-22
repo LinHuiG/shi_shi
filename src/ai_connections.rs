@@ -78,7 +78,7 @@ impl App {
         let mut locked = self.state.lock().unwrap();
         let mut next = locked.clone();
         let previous = if c.id.is_empty() {
-            Some(crate::ai_backend::connection(&next.config)?)
+            Some(crate::ai_backend::default_codex_connection(&next.config))
         } else {
             next.config
                 .ai_connections
@@ -86,9 +86,12 @@ impl App {
                 .find(|v| v.id == c.id)
                 .cloned()
         };
-        if p.get("expected").is_some() && serde_json::to_value(&previous).unwrap() != p["expected"]
-        {
-            return Err("连接已被修改，请重新打开编辑".into());
+        if let Some(expected) = p.get("expected") {
+            let expected: Option<Connection> = serde_json::from_value(expected.clone())
+                .map_err(|_| "连接编辑快照无效，请重新打开编辑")?;
+            if previous != expected {
+                return Err("连接已被修改，请重新打开编辑".into());
+            }
         }
         if previous.is_none() && c.driver == "dsh" {
             if let Some(existing) = next.config.ai_connections.iter().find(|old| {
@@ -109,7 +112,7 @@ impl App {
         }
         // A caller cannot replace a reference with another connection's secret.
         c.credential_id = previous.as_ref().and_then(|v| v.credential_id.clone());
-        let store = CredentialStore::new(self.root.join("data/credentials"));
+        let store = CredentialStore::new(crate::storage::data_dir(&self.root).join("credentials"));
         let key = p["key"].as_str().filter(|s| !s.is_empty());
         if c.driver == "api"
             && key.is_none()
@@ -161,10 +164,8 @@ impl App {
     pub fn delete_connection(&self, p: &Value) -> Result<Value, String> {
         let id = p["id"].as_str().ok_or("缺少连接编号")?;
         let mut locked = self.state.lock().unwrap();
-        if referenced(&locked.config, id) {
-            return Err("此连接仍被用途引用，请先更换并保存用途设置".into());
-        }
         let mut next = locked.clone();
+        next.config.clear_connection_routes(id);
         let removed = next
             .config
             .ai_connections
@@ -180,7 +181,7 @@ impl App {
         self.save(&next)?;
         *locked = next;
         if let Some(old) = removed {
-            let _ = CredentialStore::new(self.root.join("data/credentials"))
+            let _ = CredentialStore::new(crate::storage::data_dir(&self.root).join("credentials"))
                 .delete(old.credential_id.as_deref().unwrap_or(&old.id));
         }
         Ok(json!({"config":locked.config}))
@@ -325,6 +326,43 @@ ConvertTo-Json -InputObject $rows -Compress"#;
 mod tests {
     use super::*;
     #[test]
+    fn default_codex_edit_uses_its_own_snapshot_and_normalizes_default_fields() {
+        let root = std::env::temp_dir().join(format!("shishi-default-edit-{}", id()));
+        let app = App::load(root.clone()).unwrap();
+        {
+            let mut state = app.state.lock().unwrap();
+            state.config.codex = "synthetic-original.exe".into();
+            state.config.codex_models = vec![json!({"model":"synthetic"})];
+            state.config.ai_connections.push(Connection {
+                id: "api".into(),
+                name: "Synthetic API".into(),
+                driver: "api".into(),
+                base_url: "https://example.com/v1".into(),
+                ..Default::default()
+            });
+            state.config.selected_connection = "api".into();
+        }
+        let original =
+            crate::ai_backend::default_codex_connection(&app.state.lock().unwrap().config);
+        let mut expected = json!(original);
+        expected.as_object_mut().unwrap().remove("stream"); // Older/default UI descriptor.
+        let mut edited = original.clone();
+        edited.name = "Renamed Codex".into();
+        app.save_connection(&json!({"connection":edited,"expected":expected}))
+            .unwrap();
+        assert_eq!(app.state.lock().unwrap().config.codex_name, "Renamed Codex");
+        assert!(app
+            .save_connection(&json!({"connection":original,"expected":expected}))
+            .unwrap_err()
+            .contains("连接已被修改"));
+        assert_eq!(
+            app.state.lock().unwrap().config.ai_connections[0].name,
+            "Synthetic API"
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
     fn desktop_detection_excludes_legacy_and_deduplicates() {
         let root = std::env::temp_dir().join(format!("shishi-discovery-{}", id()));
         let launcher = root.join("resources/runtime/cli/bin/dsh.cmd");
@@ -337,7 +375,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn connection_save_requires_models_and_keeps_referenced_connection() {
+    fn connection_save_requires_models_and_deletion_allows_empty_routes() {
         let root = std::env::temp_dir().join(format!("shishi-connections-{}", id()));
         let app = App::load(root.clone()).unwrap();
         let mut c = json!({"id":"fixture","name":"Fixture","driver":"api","base_url":"https://example.com/v1"});
@@ -348,7 +386,7 @@ mod tests {
         assert!(app
             .save_connection(&json!({"connection":c,"expected":null}))
             .is_err());
-        assert!(app.delete_connection(&json!({"id":""})).is_err());
+        app.delete_connection(&json!({"id":""})).unwrap();
         app.delete_connection(&json!({"id":"fixture"})).unwrap();
         assert!(App::load(root.clone())
             .unwrap()

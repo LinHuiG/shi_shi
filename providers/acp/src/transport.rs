@@ -327,19 +327,10 @@ impl Drop for Transport {
 
 fn send_event(tx: &SyncSender<ReadEvent>, event: ReadEvent, closed: &AtomicBool) -> Result<(), ()> {
     let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match tx.try_send(event) {
-            Ok(()) => return Ok(()),
-            Err(TrySendError::Full(event)) if !closed.load(Ordering::SeqCst) => {
-                if Instant::now() >= deadline {
-                    return Err(());
-                }
-                thread::sleep(Duration::from_millis(2));
-                // Keep ownership so the next attempt can retry.
-                return send_event_retry(tx, event, closed, deadline);
-            }
-            Err(_) => return Err(()),
-        }
+    match tx.try_send(event) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(event)) => send_event_retry(tx, event, closed, deadline),
+        Err(_) => Err(()),
     }
 }
 

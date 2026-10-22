@@ -34,6 +34,8 @@ class ReleasePrivacyTests(unittest.TestCase):
 
     def test_default_rules_work_without_private_vocabulary(self):
         self.assertIsNone(release.load_private_terms())
+        for name, text in [('.gitattributes', '* text=auto eol=lf'), ('rustfmt.toml', 'newline_style = "Unix"')]:
+            self.assertEqual(release.check([self.write(name, text)]), [])
         path = self.write('docs/example.md', 'Generic public documentation.')
         self.assertEqual(release.check([path]), [])
         self.write(path, ' '.join(('ghp_' + 'a' * 36, '.'.join(('10', '20', '30', '40')))))

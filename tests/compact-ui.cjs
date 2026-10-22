@@ -9,8 +9,8 @@ await page.evaluate(()=>{page='settings';render();});assert((await page.locator(
 assert.equal(await page.locator('#settings-retention,[data-settings-target="retention"]').count(),0);
 assert.equal(await page.locator('[data-settings-target="storage"]').innerText(),'数据设置');
 assert.equal(await page.locator('#settings-storage #cfg-retention').count(),1);
-assert((await page.locator('#cfg-analysis-workdir').boundingBox()).width<=330);
-assert((await page.locator('.settings-path').boundingBox()).width<=300);await page.locator('#settings-storage').screenshot({path:path.join(out,'data-settings.png')});
+assert.equal(await page.locator('#cfg-analysis-workdir,[data-pick="analysis-workdir"]').count(),0);assert(await page.locator('[data-storage-change]').isVisible());
+assert((await page.locator('.settings-path').boundingBox()).width>300);assert(await page.locator('#settings-storage').evaluate(el=>el.scrollWidth<=el.clientWidth));await page.locator('#settings-storage').screenshot({path:path.join(out,'data-settings.png')});
 const tagsBox=await page.locator('#settings-tags').boundingBox(),rulesBox=await page.locator('#settings-prompts').boundingBox();assert(Math.abs(tagsBox.y-rulesBox.y)<1&&rulesBox.x>tagsBox.x,'short settings share two columns');
 await page.locator('.settings-pair').screenshot({path:path.join(out,'tags-and-rules.png')});
 await page.emulateMedia({reducedMotion:'reduce'});

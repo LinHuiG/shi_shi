@@ -41,7 +41,7 @@ pub struct SnapshotSet {
 }
 
 pub fn dir(root: &Path) -> PathBuf {
-    root.join(DIR)
+    crate::storage::data_dir(root).join(DIR.strip_prefix("data/").unwrap())
 }
 
 pub fn path(root: &Path, kind: &str) -> PathBuf {
@@ -192,18 +192,6 @@ fn referenced_messages(s: &State) -> BTreeSet<String> {
 /// - messages: recent (24h), referenced by an unarchived task, or not yet analyzed.
 /// - tasks: every unarchived task, including old completed tasks.
 /// - updates: recent records and every record after the shared archive cursor.
-pub fn freeze(s: &State) -> State {
-    State {
-        messages: s.messages.clone(),
-        tasks: s.tasks.iter().filter(|t| !t.archived).cloned().collect(),
-        analyzed: s.analyzed.clone(),
-        audit: s.audit.clone(),
-        archive_ai_cursor: s.archive_ai_cursor,
-        last_scan: s.last_scan,
-        revision: s.revision,
-        ..State::default()
-    }
-}
 pub fn build(s: &State, at: i64) -> (Vec<Value>, Vec<Value>, Vec<Value>) {
     let cutoff = at - RETENTION_MS;
     let referenced = referenced_messages(s);

@@ -1,4 +1,4 @@
-拾事 ShiShi 1.2.0
+拾事 ShiShi 1.2.1
 
 拾事是 Windows 桌面 AI 事项助手：把聊天消息整理成可跟进的事项，
 保留消息依据和处理经验，由你选择事项交给 AI 调查、处置并查看结果。
@@ -12,10 +12,11 @@
 
 开始使用
 1. 准备 Windows x64 和 Microsoft Edge WebView2 Runtime。
-2. 在设置中配置 AI 连接与可用模型。Codex CLI、DeepSeek Harness（ACP）
-   支持分析和一键处置；OpenAI Chat Completions 兼容 HTTPS API 支持分析。
+2. 在设置中配置 AI 连接与用途模型。Codex CLI 支持分析，Codex 桌面端执行处置；
+   DeepSeek Harness（ACP）支持分析和处置，兼容 HTTPS API 支持分析。
 3. 可先手动创建事项。需要消息时，在“消息来源”安装可信插件，配置并验证
-   数据位置，再启用扫描与分析。首次启动默认关闭扫描、过滤及完整 AI 跟踪。
+   数据位置。首次启动开启扫描、过滤与自动分析，用途模型留空，配置完成前
+   不调用模型；完整 AI 跟踪默认关闭。
 
 插件接入
 插件由 Windows x64 DLL、plugin.json 和声明的依赖组成，打包为 ZIP，
@@ -36,3 +37,5 @@ API 密钥使用 Windows DPAPI 保存，或从指定环境变量读取。
 许可证全文见随附 LICENSE，对应源码见同版本 Release 中的源码包。
 第三方组件保留各自许可证，见 THIRD_PARTY_NOTICES.md。
 Copyright (c) 2026 ShiShi contributors. 软件按现状提供，不附带担保。
+
+1.2.1：Codex 桌面处置、数据迁移、固定事项编号、变更记录、系统日志搜索和流式进度。默认开启自动更新，09:00 提醒已校验新包，04:00 安装并重启，错过不补执行。升级保留数据、个人配置与目录设置。

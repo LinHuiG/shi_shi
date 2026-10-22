@@ -83,6 +83,7 @@ mod tests {
     fn active_batch_is_separate_and_skip_only_affects_waiting_revisions() {
         let root = std::env::temp_dir().join(format!("shishi-queue-{}", id()));
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
             for key in ["a", "b", "waiting"] {
@@ -167,6 +168,7 @@ mod tests {
     fn rejected_analysis_releases_message_claim_without_consuming_a_call() {
         let root = std::env::temp_dir().join(format!("shishi-rejected-queue-{}", id()));
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         {
             let mut s = app.state.lock().unwrap();
@@ -197,6 +199,7 @@ mod tests {
     fn window_and_one_time_skip_keep_raw_messages_and_new_arrivals() {
         let root = std::env::temp_dir().join(format!("shishi-backlog-{}", id()));
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
             for (id, hours) in [("old", 30), ("recent", 2)] {

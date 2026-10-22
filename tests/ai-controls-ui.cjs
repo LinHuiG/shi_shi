@@ -1,7 +1,7 @@
 const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
 const root=path.resolve(__dirname,'..'),now=Date.now(),out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-ai-controls-'));
 const fixture={tasks:[],schedules:[],messages:[],handling:[],chat_sources:[],audit:[],reports:[],suggestions:[],activity:[],
-  config:{codex:'fixture',enabled:false,auto_ai:true,leaders:[],interval_minutes:5,daily_calls:40,max_input_chars:60000,work_start:'09:00',work_end:'18:00',archive_time:'21:00',morning_time:'08:30',evening_time:'17:30',model:'test',reasoning_effort:'low'},
+  config:{codex:'fixture',analysis_workdir:'D:/fixture/kept-workdir',enabled:false,auto_ai:true,leaders:[],interval_minutes:5,daily_calls:40,max_input_chars:60000,work_start:'09:00',work_end:'18:00',archive_time:'21:00',morning_time:'08:30',evening_time:'17:30',model:'test',reasoning_effort:'low'},
   tag_state:{groups:[],proposals:[],versions:[],filters:{}},evolution:{prompts:[],handling:[]},
   usage:{day:'2026-10-16',calls:1,input_tokens:29208,output_tokens:839,cached_reports:0,unreported_calls:0},
   pending:3,in_work_hours:true,ai_busy:false,ai_interrupted_at:0,ai_request_id:'',ai_cancelling:false};
@@ -133,7 +133,7 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     await page.locator('#cfg-analysis-lookback').waitFor({state:'visible'});
     assert.equal(await page.locator('#cfg-analysis-lookback').inputValue(),'48');
     assert.equal(await page.locator('#settings-guide').count(),0);
-    assert.equal(await page.locator('#cfg-analysis-workdir').inputValue(),'ShiShi');
+    assert.equal(await page.locator('#cfg-analysis-workdir,[data-pick="analysis-workdir"]').count(),0);
     assert((await page.locator('#settings-models').innerText()).includes('事项更新'));
     assert((await page.locator('#settings-models').innerText()).includes('AI一键处置'));
     assert((await page.locator('#settings-models').innerText()).includes('归档分析'));
@@ -141,17 +141,16 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     assert.equal(await page.locator('#settings-models .model-profile .help-dot').count(),4);
     await page.locator('#settings-models .help-dot').first().focus();
     assert(await page.locator('.help-popover').isVisible());
-    await page.locator('#cfg-analysis-workdir').fill('D:/fixture/ShiShi');
     assert.equal(await page.locator('#cfg-analysis-interval').inputValue(),'30');
     await page.locator('#cfg-analysis-interval').fill('20');
     await page.locator('#page-title').click();await page.evaluate(()=>flushSettings());await page.waitForFunction(()=>fixture.config.max_input_chars===50000);
     assert.deepEqual(await page.evaluate(()=>[fixture.config.interval_minutes,fixture.config.analysis_interval_minutes,fixture.config.max_input_chars]),[5,20,50000]);
-    assert.equal(await page.evaluate(()=>fixture.config.analysis_workdir),'D:/fixture/ShiShi');
+    assert.equal(await page.evaluate(()=>fixture.config.analysis_workdir),'D:/fixture/kept-workdir');
     assert.equal(await page.evaluate(()=>fixture.config.analysis_lookback_hours),48);
     await page.screenshot({path:path.join(out,'settings.png')});
     await page.evaluate(async()=>{fixture.activity.push({kind:'ai_success',time:Date.now()+1,detail:{request_id:'call-2',elapsed_ms:1000,usage:{input_tokens:29208,output_tokens:839,reasoning_output_tokens:817,cached_input_tokens:0}}},{kind:'ai_rejected',time:Date.now()+2,detail:{request_id:'call-3',error:'AI 输入超限：197600 字符，超过上限 60000。本次未调用 Codex。'}});page='logs';await refreshState(true);});
     assert((await page.locator('#view').innerText()).includes('其中推理 817'));
-    assert((await page.locator('#view').innerText()).includes('AI 输入超限 · 未调用'));
+    await page.getByText('AI 输入超限 · 未调用',{exact:true}).waitFor();
     assert((await page.locator('#view').innerText()).includes('AI 分析已中断'));
     assert.equal(await page.locator('[data-trace="call-3"]').count(),0);
     await page.locator('[data-trace="call-2"]').click();
@@ -163,9 +162,12 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     await page.locator('[data-trace="call-2"]').click();
     await page.locator('#overlay').waitFor({state:'visible'});
     await page.evaluate(()=>window.dispatchEvent(new Event('blur')));
+    assert(await page.locator('#overlay').isVisible(),'external blur keeps trace open');
+    await page.locator('#overlay').click({position:{x:5,y:5}});
     await page.locator('#overlay').waitFor({state:'hidden'});
     await page.screenshot({path:path.join(out,'logs.png')});
     await page.locator('[data-log-filter="errors"]').click();await page.waitForFunction(()=>document.querySelector('[data-log-filter="errors"]')?.classList.contains('active'));
+    await page.getByText('AI 输入超限 · 未调用',{exact:true}).waitFor();
     assert(!(await page.locator('#view').innerText()).includes('AI 分析已中断'));
     assert((await page.locator('#view').innerText()).includes('AI 输入超限 · 未调用'));
     await page.locator('[data-page="inbox"]').first().click();

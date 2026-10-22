@@ -2,6 +2,7 @@ use crate::{engine::App, model::*, work_hours::AiMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::atomic::Ordering};
+pub(crate) const AUTOMATION_DISABLED: &str = "AI_AUTOMATION_DISABLED";
 
 /// The filter is a fourth, independent AI purpose. It only decides whether the
 /// next full analysis should run early; it never marks a message analyzed,
@@ -93,7 +94,7 @@ impl App {
         let at = now();
         let (batch, fingerprints) = {
             let mut locked = self.state.lock().unwrap();
-            if !locked.config.message_filter_enabled || !locked.config.auto_ai {
+            if !locked.config.early_analysis_enabled() {
                 return Ok(());
             }
             // A full analysis already due must not wait for another filter.
@@ -140,9 +141,16 @@ impl App {
             &json!({"changes":batch,"_trigger":"scan_batch"}),
             AiMode::Automatic,
         );
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.starts_with("AI_UNCONFIGURED:") || e == AUTOMATION_DISABLED)
+        {
+            return Ok(());
+        }
         let mut locked = self.state.lock().unwrap();
         let mut next = locked.clone();
-        if !next.config.message_filter_enabled || !next.config.auto_ai {
+        if !next.config.early_analysis_enabled() {
             return Ok(());
         }
         if result

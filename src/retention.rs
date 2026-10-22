@@ -5,13 +5,14 @@ use crate::model::{Audit, Message, State, Task};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-const ACTIVE_RUN: [&str; 6] = [
+const ACTIVE_RUN: [&str; 7] = [
     "starting",
     "submitting",
     "inProgress",
     "waiting",
     "uncertain",
     "disconnected",
+    "stopping",
 ];
 
 /// Expired records are replaced by a compact statistical digest. The cap keeps

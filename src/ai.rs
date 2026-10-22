@@ -530,7 +530,7 @@ pub fn prepare(config: &Config, kind: &str, payload: &Value) -> Prepared {
     let prompt_chars = prompt.chars().count();
     let mut schema = schema(kind);
     if kind == "archive" {
-        let sources = payload["archive_note_sources"]
+        let sources = payload["archive_memory_sources"]
             .as_array()
             .into_iter()
             .flatten()
@@ -706,7 +706,7 @@ pub fn analysis_workdir(root: &Path, config: &Config) -> Result<std::path::PathB
     {
         return Err("分析工作目录应填写普通目录名或完整绝对路径，不能使用 ..".into());
     }
-    Ok(root.join("data/ai-work").join(path))
+    Ok(crate::storage::data_dir(&root).join("ai-work").join(path))
 }
 
 pub fn input_sizes(config: &Config, kind: &str, payload: &Value) -> Value {
@@ -768,7 +768,9 @@ pub fn invoke_prepared(
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(crate::ai_control::CANCELLED.into());
     }
-    let trace = root.join("data/ai-traces").join(request_id);
+    let trace = crate::storage::data_dir(&root)
+        .join("ai-traces")
+        .join(request_id);
     if config.retain_ai_traces {
         fs::create_dir_all(&trace).map_err(|e| e.to_string())?;
         fs::write(trace.join("input.txt"), &prepared.prompt).map_err(|e| e.to_string())?;
@@ -807,7 +809,9 @@ pub fn record_error(root: &Path, request_id: &str, error: &str, retain: bool) {
     if !retain {
         return;
     }
-    let dir = root.join("data/ai-traces").join(request_id);
+    let dir = crate::storage::data_dir(&root)
+        .join("ai-traces")
+        .join(request_id);
     if fs::create_dir_all(&dir).is_ok() {
         let _ = fs::write(dir.join("error.txt"), error);
     }
@@ -816,7 +820,7 @@ pub fn record_error(root: &Path, request_id: &str, error: &str, retain: bool) {
 /// Trace directories follow the message retention period. The marker keeps the
 /// directory scan to once per day and per configured retention value.
 pub fn prune_traces(root: &Path, days: u32) {
-    let dir = root.join("data/ai-traces");
+    let dir = crate::storage::data_dir(&root).join("ai-traces");
     if !dir.is_dir() {
         return;
     }
@@ -842,10 +846,6 @@ pub fn prune_traces(root: &Path, days: u32) {
     let _ = fs::write(marker, today);
 }
 
-pub fn validate_selection(config: &Config) -> Result<(), String> {
-    let connection = crate::ai_backend::connection(config)?;
-    crate::ai_backend::backend(&connection)?.validate(&connection, config)
-}
 pub fn list_models(path: &str) -> Result<Value, String> {
     let connection = crate::ai_backend::Connection {
         executable: path.into(),
@@ -910,7 +910,7 @@ mod prompt_tests {
             serde_json::from_str::<super::Config>("{}")
                 .unwrap()
                 .max_input_chars,
-            60_000
+            80_000
         );
     }
     use super::*;

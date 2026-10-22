@@ -29,12 +29,13 @@ Var DesktopCheck
 Var DesktopChoice
 Var TestMode
 Var Params
+Var UpdateMode
 Var ProcessShell
 !define MUI_ICON "${SOURCE}\assets\shishi.ico"
 !define MUI_UNICON "${SOURCE}\assets\shishi.ico"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\shishi.exe"
-!define MUI_WELCOMEPAGE_TEXT "此向导将引导您安装拾事。$\r$\n$\r$\n程序与运行数据保存在所选目录，覆盖安装保留已有数据。$\r$\n$\r$\n检测到该目录的拾事正在运行时，会询问是否强制退出并继续安装。"
+!define MUI_WELCOMEPAGE_TEXT "此向导将引导您安装拾事。$\r$\n$\r$\n运行数据默认保存在程序目录，可在设置中更改。覆盖安装保留已有数据与目录设置。$\r$\n$\r$\n检测到该目录的拾事正在运行时，会询问是否强制退出并继续安装。"
 !insertmacro MUI_PAGE_WELCOME
 Page custom Maintenance MaintenanceLeave
 !insertmacro MUI_PAGE_DIRECTORY
@@ -49,6 +50,13 @@ Function .onInit
  SetRegView 64
  StrCpy $DesktopChoice ${BST_CHECKED}
  ${GetParameters} $Params
+ ClearErrors
+ ${GetOptions} $Params "/UPDATE" $UpdateMode
+ ${IfNot} ${Errors}
+  StrCpy $UpdateMode "1"
+ ${Else}
+  StrCpy $UpdateMode "0"
+ ${EndIf}
  ClearErrors
  ${GetOptions} $Params "/TEST" $TestMode
  ${IfNot} ${Errors}
@@ -79,7 +87,7 @@ Function Maintenance
  ${NSD_CreateRadioButton} 0 48u 100% 18u "覆盖安装（保留事项、配置、报表和日志）"
  Pop $UpgradeRadio
  ${NSD_Check} $UpgradeRadio
- ${NSD_CreateRadioButton} 0 78u 100% 18u "卸载拾事（保留 data 数据文件夹）"
+ ${NSD_CreateRadioButton} 0 78u 100% 18u "卸载拾事（保留数据与目录设置）"
  Pop $RemoveRadio
  nsDialogs::Show
 FunctionEnd
@@ -109,7 +117,7 @@ Function Options
  ${NSD_CreateCheckbox} 0 6u 100% 18u "创建桌面快捷方式"
  Pop $DesktopCheck
  ${NSD_SetState} $DesktopCheck $DesktopChoice
- ${NSD_CreateLabel} 0 40u 100% 65u "安装后可在“消息来源”中安装插件并配置所需文件和目录。支持插件自动查找。$\r$\n$\r$\n运行数据保存在：$INSTDIR\data$\r$\n覆盖安装与卸载均保留此文件夹。"
+ ${NSD_CreateLabel} 0 40u 100% 65u "安装后可在“消息来源”中安装插件并配置所需文件和目录。支持插件自动查找。$\r$\n$\r$\n默认数据目录：$INSTDIR\data$\r$\n若已更改目录，继续使用原设置。覆盖安装与卸载保留数据。"
  Pop $0
  nsDialogs::Show
 FunctionEnd
@@ -122,6 +130,8 @@ Section "拾事" SEC_MAIN
  IfFileExists "$INSTDIR\shishi.exe" 0 copy_app
  InitPluginsDir
  File /oname=$PLUGINSDIR\shishi-install-process.ps1 "${SOURCE}\installer\process.ps1"
+ File /oname=$PLUGINSDIR\shishi-prompt.exe "${SOURCE}\target\release\shishi.exe"
+ File /oname=$PLUGINSDIR\WebView2Loader.dll "${LOADER}"
  StrCpy $ProcessShell "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
  ${If} ${RunningX64}
   StrCpy $ProcessShell "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
@@ -130,7 +140,16 @@ Section "拾事" SEC_MAIN
  Pop $0
  Pop $1
  ${If} $0 == 10
-  MessageBox MB_YESNO|MB_ICONQUESTION "拾事正在运行，是否强制退出并继续安装？$\r$\n$\r$\n正在进行的 AI 任务会中断，未保存的编辑可能丢失。已保存的事项、配置和日志会保留。" /SD IDNO IDYES stop_for_upgrade
+  IfSilent cancel_running_upgrade
+  nsExec::ExecToStack '"$PLUGINSDIR\shishi-prompt.exe" --installer-confirm $HWNDPARENT'
+  Pop $0
+  Pop $1
+  ${If} $0 == 6
+   Goto stop_for_upgrade
+  ${ElseIf} $0 != 7
+   MessageBox MB_ICONEXCLAMATION "无法打开运行中程序的确认窗口。请退出拾事后重试。" /SD IDOK
+  ${EndIf}
+  cancel_running_upgrade:
   Abort
   stop_for_upgrade:
   nsExec::ExecToStack '"$ProcessShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\shishi-install-process.ps1" -InstallDir "$INSTDIR" -Action Stop'
@@ -172,9 +191,12 @@ Section "拾事" SEC_MAIN
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Shishi" "NoModify" 1
   WriteRegDWORD HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\Shishi" "NoRepair" 1
   ${If} $DesktopChoice == ${BST_CHECKED}
+  ${AndIf} $UpdateMode != "1"
    CreateShortCut "$DESKTOP\拾事.lnk" "$INSTDIR\shishi.exe"
   ${EndIf}
-  CreateShortCut "$SMPROGRAMS\拾事.lnk" "$INSTDIR\shishi.exe"
+  ${If} $UpdateMode != "1"
+   CreateShortCut "$SMPROGRAMS\拾事.lnk" "$INSTDIR\shishi.exe"
+  ${EndIf}
  ${EndIf}
 SectionEnd
 Function un.onInit
@@ -220,7 +242,7 @@ Section "Uninstall"
    Delete "$SMPROGRAMS\拾事.lnk"
   ${EndIf}
  ${EndIf}
- DetailPrint "已保留 $INSTDIR\data 中的全部运行数据。"
+ DetailPrint "已保留运行数据与数据目录设置；配置过的外部数据目录也不会删除。"
  Goto uninstall_done
  uninstall_abort:
  MessageBox MB_ICONEXCLAMATION "该目录没有安装标识，未删除任何文件。" /SD IDOK

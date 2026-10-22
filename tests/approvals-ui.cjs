@@ -83,12 +83,11 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
   assert(!(await page.evaluate(()=>window.leaked)));
   await page.screenshot({path:path.join(deliverables,'handling-markdown.png')});
   await page.evaluate(async()=>{fixture.handling[0].desktop_control=true;fixture.handling[0].status='inProgress';await refreshState(true);closeModal();});
-  assert.equal(await page.locator('[data-handle="followup"],[data-handle="requests"],[data-handle="interrupt"],[data-handle="handoff"]').count(),0);
+  assert.equal(await page.locator('[data-handle="requests"],[data-handle="interrupt"],[data-handle="handoff"],[data-handle="copy-cli"],[data-handle="detach"]').count(),0);
   assert(await page.locator('[data-handle="open"]').isVisible());
-  await page.evaluate(async()=>{fixture.handling[0].desktop_control=false;await refreshState(true);});
-  await page.locator('[data-handle="handoff"]').click();assert((await page.locator('#dialog').innerText()).includes('手动恢复'));
-  await page.locator('[data-handle="handoff-confirm"]').click();await page.waitForFunction(()=>document.querySelector('#overlay').hidden);
-  assert(await page.evaluate(()=>requests.some(r=>r.method==='handling_handoff')));
+  assert(await page.locator('[data-handle="followup"]').isVisible());
+  await page.locator('[data-handle="followup"]').click();assert(await page.locator('#handling-question').isVisible());
+  assert.equal(await page.locator('[data-handle="terminate"]').innerText(),'结束本次处置');
   assert.deepEqual(errors,[]);console.log('PASS readable command/file/permission cards; exact turn scope; unsupported scopes cannot be approved; choice and free text; XSS escaping; narrow layout; stale request refusal.');
  }finally{await browser.close();}
 })().catch(error=>{console.error(error);process.exitCode=1});

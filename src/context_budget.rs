@@ -122,6 +122,9 @@ pub fn pending_all(s: &State) -> Vec<Message> {
         .collect()
 }
 pub fn automatic_due(s: &State, pending: &[Message], at: i64, last_attempt: i64) -> bool {
+    if !s.config.automatic_analysis_enabled() {
+        return false;
+    }
     if pending.is_empty() {
         return false;
     }

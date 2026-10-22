@@ -1,7 +1,80 @@
-function reportCard(r){const ai=r.ai_summary;return `<div class="report-body">${r.remaining_events?`<p class="helper archive-coverage">本批已提交，仍有 ${r.remaining_events} 条变更待处理；请以最近一次归档状态为准。</p>`:''}<p class="helper">本批归档 ${r.archived_tasks||0} 个事项${r.skipped_tasks?` · ${r.skipped_tasks} 个事项处理期间发生变化，保留到下次归档`:''}</p><div class="report-counts"><span><b>${r.status_counts?.['待处理']??r.tasks.filter(t=>t.status==='待处理').length}</b> 待处理</span><span><b>${r.status_counts?.['已完成']??r.tasks.filter(t=>t.status==='已完成').length}</b> 已完成</span><span>${(r.delta||[]).length} 条新增变更</span></div><section class="report-summary"><div class="row"><h3>AI 汇总</h3><span class="tiny">${r.summary_status==='reused'?'无新增变化 · 沿用上次汇总':''}</span></div>${ai?`<p class="summary-lead">${esc(ai.summary)}</p><div class="report-columns">${[['completed','已完成','green'],['attention','需要关注','high'],['next_steps','下一步','blue']].filter(([k])=>ai[k]?.length).map(([k,label,color])=>`<div><h3><span class="badge ${color}">${label}</span></h3><ul>${ai[k].map(x=>`<li>${esc(x)}</li>`).join('')}</ul></div>`).join('')}</div>`:`<p class="muted">${r.summary_status==='interrupted'?'本次归档分析已中断，可点击“手动归档”重新执行。':r.summary_status==='pending'?'尚未完成，可手动归档重新生成。':esc(r.summary_error||'该历史报表没有 AI 汇总，可生成新报表。')}</p>`}</section>${(r.batch_summaries||[]).length>1?`<details class="report-disclosure"><summary>本次前面批次的汇总 <span>${r.batch_summaries.length-1} 批</span></summary>${r.batch_summaries.slice(0,-1).map((s,i)=>`<div class="source"><b>第 ${i+1} 批</b><p>${esc(s.summary||'')}</p>${['completed','attention','next_steps'].map(k=>(s[k]||[]).map(v=>`<p>${esc(v)}</p>`).join('')).join('')}</div>`).join('')}</details>`:''}<details class="report-disclosure"><summary>事项明细 <span>${r.tasks.length} 项</span></summary>${r.tasks.map(t=>`<div class="source"><div class="row">${historicalTagBadges(t)}<span>${esc(t.title)}</span>${statusBadge(t)}</div>${t.waiting_for?`<p>等待 ${esc(t.waiting_for)}</p>`:''}${t.archive_note?`<div class="archive-note"><span class="helper">归档备注</span><p>${esc(t.archive_note)}</p></div>`:''}</div>`).join('')}</details><details class="report-disclosure"><summary>持续跟踪的优化建议 <span>${(r.suggestions||[]).length} 条</span></summary><div class="row" style="margin:12px 0"><button data-prompt-section="advice">前往系统提示词 · 查看与处理建议</button></div><p class="helper">${esc(r.learning?.message||r.learning?.skipped||'既有建议继续保留')}</p>${(r.suggestions||[]).map(x=>`<div class="source"><div class="row">${esc(x.title)}<span class="badge ${x.active?'green':''}">${x.active?'已启用':'待处理 · 持续保留'}</span></div><p>${esc(x.rule)}</p></div>`).join('')||'<p class="helper">暂无需要提出的建议。</p>'}</details><details class="report-disclosure"><summary>本次增量记录 <span>${(r.delta||[]).length} 条</span></summary>${(r.delta||[]).map(a=>`<div class="source"><span class="tiny">${esc(date(a.time))}</span><p>${esc(a.detail)}</p></div>`).join('')}</details><div class="helper">消息扫描至 ${r.data_until?esc(date(r.data_until)):'尚未扫描'} · 待分析 ${r.pending_analysis} 条${r.previous_report?` · 接续 ${esc(date(r.previous_report.time))} 的汇总`:''}</div></div>`}
-let archiveBannerTimer=null;
-function visibleArchiveAttempt(attempt,at=Date.now()){if(!attempt)return false;if(attempt.status!=='succeeded')return true;const finished=Number(attempt.finished);const day=t=>new Date(t).toLocaleDateString('en-CA',{timeZone:'Asia/Shanghai'});return finished>0&&at>=finished&&at-finished<300000&&day(finished)===day(at);}
-function renderReports(){clearTimeout(archiveBannerTimer);const reports=state.reports;const attempt=state.archive_attempt;const visible=visibleArchiveAttempt(attempt);if(visible&&attempt.status==='succeeded'){const midnight=(Math.floor((Date.now()+28800000)/86400000)+1)*86400000-28800000;archiveBannerTimer=setTimeout(()=>{if(page==='reports')renderReports();},Math.max(1,Math.min(attempt.finished+300000,midnight)-Date.now()));}const attemptBanner=visible?`<div class="box ${attempt.status==='failed'?'error-box':''}"><b>${attempt.status==='failed'?(attempt.batches?'归档部分已提交，后续未完成':'最近一次归档失败，本次未提交'):attempt.status==='succeeded'?'归档完成':'归档处理中'}</b>${attempt.error?`<p>${esc(attempt.error)}</p>`:''}<p class="tiny">${esc(date(attempt.finished||attempt.started||attempt.created))}</p><p class="helper">已处理 ${attempt.processed||0} 条变更 · 已归档 ${attempt.archived_tasks||0} 个事项 · 剩余 ${attempt.remaining||0} 条${attempt.status==='failed'?'；已提交批次保留，未处理材料和游标保留；不会自动重试，请手动继续归档。':''}</p></div>`:'' ;setHtml('#view',`<div class="page report-page">${attemptBanner}${reports.length?reports.map((r,i)=>i===0?`<article class="report-card" data-report-key="${esc(r.id||String(r.time))}"><header><div class="tiny">最新汇总</div><h2>${esc(r.label)} <span>${esc(r.date)}</span></h2><time>${esc(date(r.time))}</time></header>${reportCard(r)}</article>`:`<details class="report-card report-history" data-report-key="${esc(r.id||String(r.time))}"><summary><span>${esc(r.label)}</span><time>${esc(date(r.time))}</time></summary>${reportCard(r)}</details>`).join(''):empty('暂无归档汇总','点击“手动归档”保存已结束事项并调用 AI 分析；自动执行时间可在设置中调整。')}</div>`);}
+function reportCard(r) {
+  const ai = r.ai_summary;
+  return `<div class="report-body">${r.remaining_events ? `<p class="helper archive-coverage">本批已提交，仍有 ${r.remaining_events} 条变更待处理；请以最近一次归档状态为准。</p>` : ''}<p class="helper">本批归档 ${r.archived_tasks || 0} 个事项${r.skipped_tasks ? ` · ${r.skipped_tasks} 个事项处理期间发生变化，保留到下次归档` : ''}</p><div class="report-counts"><span><b>${r.status_counts?.['待处理'] ?? r.tasks.filter((t) => t.status === '待处理').length}</b> 待处理</span><span><b>${r.status_counts?.['已完成'] ?? r.tasks.filter((t) => t.status === '已完成').length}</b> 已完成</span><span>${(r.delta || []).length} 条新增变更</span></div><section class="report-summary"><div class="row"><h3>AI 汇总</h3><span class="tiny">${r.summary_status === 'reused' ? '无新增变化 · 沿用上次汇总' : ''}</span></div>${
+    ai
+      ? `<p class="summary-lead">${esc(ai.summary)}</p><div class="report-columns">${[
+          ['completed', '已完成', 'green'],
+          ['attention', '需要关注', 'high'],
+          ['next_steps', '下一步', 'blue'],
+        ]
+          .filter(([k]) => ai[k]?.length)
+          .map(
+            ([k, label, color]) =>
+              `<div><h3><span class="badge ${color}">${label}</span></h3><ul>${ai[k].map((x) => `<li>${esc(x)}</li>`).join('')}</ul></div>`,
+          )
+          .join('')}</div>`
+      : `<p class="muted">${r.summary_status === 'interrupted' ? '本次归档分析已中断，可点击“手动归档”重新执行。' : r.summary_status === 'pending' ? '尚未完成，可手动归档重新生成。' : esc(r.summary_error || '该历史报表没有 AI 汇总，可生成新报表。')}</p>`
+  }</section>${
+    (r.batch_summaries || []).length > 1
+      ? `<details class="report-disclosure"><summary>本次前面批次的汇总 <span>${r.batch_summaries.length - 1} 批</span></summary>${r.batch_summaries
+          .slice(0, -1)
+          .map(
+            (s, i) =>
+              `<div class="source"><b>第 ${i + 1} 批</b><p>${esc(s.summary || '')}</p>${['completed', 'attention', 'next_steps'].map((k) => (s[k] || []).map((v) => `<p>${esc(v)}</p>`).join('')).join('')}</div>`,
+          )
+          .join('')}</details>`
+      : ''
+  }<details class="report-disclosure"><summary>事项明细 <span>${r.tasks.length} 项</span></summary>${r.tasks.map((t) => `<div class="source"><div class="row">${historicalTagBadges(t)}<span>${esc(t.title)}</span>${statusBadge(t)}</div>${t.waiting_for ? `<p>等待 ${esc(t.waiting_for)}</p>` : ''}${t.archive_note ? `<div class="archive-note"><span class="helper">归档备注</span><p>${esc(t.archive_note)}</p></div>` : ''}</div>`).join('')}</details><details class="report-disclosure"><summary>持续跟踪的优化建议 <span>${(r.suggestions || []).length} 条</span></summary><div class="row" style="margin:12px 0"><button data-prompt-section="advice">前往系统提示词 · 查看与处理建议</button></div><p class="helper">${esc(r.learning?.message || r.learning?.skipped || '既有建议继续保留')}</p>${(r.suggestions || []).map((x) => `<div class="source"><div class="row">${esc(x.title)}<span class="badge ${x.active ? 'green' : ''}">${x.active ? '已启用' : '待处理 · 持续保留'}</span></div><p>${esc(x.rule)}</p></div>`).join('') || '<p class="helper">暂无需要提出的建议。</p>'}</details><details class="report-disclosure"><summary>本次增量记录 <span>${(r.delta || []).length} 条</span></summary>${(r.delta || []).map((a) => `<div class="source"><span class="tiny">${esc(date(a.time))}</span><p>${esc(a.detail)}</p></div>`).join('')}</details><div class="helper">消息扫描至 ${r.data_until ? esc(date(r.data_until)) : '尚未扫描'} · 待分析 ${r.pending_analysis} 条${r.previous_report ? ` · 接续 ${esc(date(r.previous_report.time))} 的汇总` : ''}</div></div>`;
+}
+let archiveBannerTimer = null;
+function visibleArchiveAttempt(attempt, at = Date.now()) {
+  if (!attempt) return false;
+  if (attempt.status !== 'succeeded') return true;
+  const finished = Number(attempt.finished);
+  const day = (t) => new Date(t).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+  return finished > 0 && at >= finished && at - finished < 300000 && day(finished) === day(at);
+}
+function renderReports() {
+  clearTimeout(archiveBannerTimer);
+  const reports = state.reports;
+  const attempt = state.archive_attempt;
+  const visible = visibleArchiveAttempt(attempt);
+  if (visible && attempt.status === 'succeeded') {
+    const midnight = (Math.floor((Date.now() + 28800000) / 86400000) + 1) * 86400000 - 28800000;
+    archiveBannerTimer = setTimeout(
+      () => {
+        if (page === 'reports') renderReports();
+      },
+      Math.max(1, Math.min(attempt.finished + 300000, midnight) - Date.now()),
+    );
+  }
+  const attemptBanner = visible
+    ? `<div class="box ${attempt.status === 'failed' ? 'error-box' : ''}"><b>${attempt.status === 'failed' ? (attempt.batches ? '归档部分已提交，后续未完成' : '最近一次归档失败，本次未提交') : attempt.status === 'succeeded' ? '归档完成' : '归档处理中'}</b>${attempt.error ? `<p>${esc(attempt.error)}</p>` : ''}<p class="tiny">${esc(date(attempt.finished || attempt.started || attempt.created))}</p><p class="helper">已处理 ${attempt.processed || 0} 条变更 · 已归档 ${attempt.archived_tasks || 0} 个事项 · 剩余 ${attempt.remaining || 0} 条${attempt.status === 'failed' ? '；已提交批次保留，未处理材料和游标保留；不会自动重试，请手动继续归档。' : ''}</p></div>`
+    : '';
+  setHtml(
+    '#view',
+    `<div class="page report-page">${attemptBanner}${reports.length ? reports.map((r, i) => (i === 0 ? `<article class="report-card" data-report-key="${esc(r.id || String(r.time))}"><header><div class="tiny">最新汇总</div><h2>${esc(r.label)} <span>${esc(r.date)}</span></h2><time>${esc(date(r.time))}</time></header>${reportCard(r)}</article>` : `<details class="report-card report-history" data-report-key="${esc(r.id || String(r.time))}"><summary><span>${esc(r.label)}</span><time>${esc(date(r.time))}</time></summary>${reportCard(r)}</details>`)).join('') : empty('暂无归档汇总', '点击“手动归档”保存已结束事项并调用 AI 分析；自动执行时间可在设置中调整。')}</div>`,
+  );
+}
 
-
-const actionNames={manual_ai_edit:'一句话修改事项',schedule_edit:'保存定时事项',schedule_delete:'删除定时事项',schedule_generate:'定时生成事项',generation_start:'开始创建事项',generation_done:'事项已生成',generation_failed:'事项生成失败',scan_control:'调整自动扫描',settings:'修改设置',manual_edit:'人工编辑 / 补建',manual_status:'人工修改状态',ai_create:'AI 新建事项',ai_update:'AI 更新事项',merge:'合并事项',undo:'撤销修改',deadline_update:'对话更新截止时间',rule_change:'规则变更',archive:'归档',scan_gap:'扫描缺口'};
+const actionNames = {
+  manual_ai_edit: '一句话修改事项',
+  schedule_edit: '保存定时事项',
+  schedule_delete: '删除定时事项',
+  schedule_generate: '定时生成事项',
+  generation_start: '开始创建事项',
+  generation_done: '事项已生成',
+  generation_failed: '事项生成失败',
+  scan_control: '调整自动扫描',
+  settings: '修改设置',
+  manual_edit: '人工编辑 / 补建',
+  manual_status: '人工修改状态',
+  ai_create: 'AI 新建事项',
+  ai_update: 'AI 更新事项',
+  merge: '合并事项',
+  undo: '撤销修改',
+  deadline_update: '对话更新截止时间',
+  rule_change: '规则变更',
+  archive: '归档',
+  scan_gap: '扫描缺口',
+};

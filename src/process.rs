@@ -1,3 +1,5 @@
+#[path = "process_output.rs"]
+mod output;
 use std::os::windows::process::CommandExt;
 use std::{
     fs,
@@ -156,13 +158,14 @@ pub fn run_guarded_polling(
     let nonce = uuid::Uuid::new_v4().to_string();
     let out = dir.join(format!("{nonce}.out"));
     let err = dir.join(format!("{nonce}.err"));
+    let input_file = dir.join(format!("{nonce}.in"));
+    let _files = output::Files(vec![out.clone(), err.clone(), input_file.clone()]);
     cmd.stdout(Stdio::from(
         fs::File::create(&out).map_err(|e| e.to_string())?,
     ))
     .stderr(Stdio::from(
         fs::File::create(&err).map_err(|e| e.to_string())?,
     ));
-    let input_file = dir.join(format!("{nonce}.in"));
     if let Some(text) = input {
         fs::write(&input_file, text).map_err(|e| e.to_string())?;
         cmd.stdin(Stdio::from(
@@ -173,27 +176,13 @@ pub fn run_guarded_polling(
     }
     let mut owned = spawn_owned(&mut cmd)?;
     let child = &mut owned.child;
-    use std::io::BufRead;
-    let mut reader = std::io::BufReader::new(fs::File::open(&out).map_err(|e| e.to_string())?);
-    let mut pending = Vec::new();
+    let mut reader = output::Reader::new(&out, output::LINE_LIMIT)?;
     let start = Instant::now();
     let code = loop {
         progress("");
-        loop {
-            match reader.read_until(b'\n', &mut pending) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if pending.ends_with(b"\n") {
-                        if let Ok(line) = std::str::from_utf8(&pending) {
-                            progress(line.trim());
-                        }
-                        pending.clear();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
+        output::check_size(&out, output::STDOUT_LIMIT)?;
+        output::check_size(&err, output::STDERR_LIMIT)?;
+        let more = reader.poll(progress)?;
 
         match child.try_wait() {
             Ok(Some(code)) => break code,
@@ -207,10 +196,6 @@ pub fn run_guarded_polling(
             }
             let _ = child.kill();
             let _ = child.wait();
-            drop(reader);
-            let _ = fs::remove_file(&input_file);
-            let _ = fs::remove_file(&out);
-            let _ = fs::remove_file(&err);
             if interrupted {
                 return Err(crate::ai_control::CANCELLED.into());
             }
@@ -218,31 +203,31 @@ pub fn run_guarded_polling(
                 "操作超过 {timeout} 秒，已停止本次子进程；下次可重试"
             ));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        if more {
+            std::thread::yield_now();
+        } else {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     };
-    // Capture output written between the last read and observing process exit.
-    while let Ok(n) = reader.read_until(b'\n', &mut pending) {
-        if n == 0 {
-            if !pending.is_empty() {
-                if let Ok(line) = std::str::from_utf8(&pending) {
-                    progress(line.trim());
-                }
-            }
-            break;
+    output::check_size(&out, output::STDOUT_LIMIT)?;
+    output::check_size(&err, output::STDERR_LIMIT)?;
+    reader.finish(progress, || {
+        check_running()?;
+        output::check_size(&out, output::STDOUT_LIMIT)?;
+        output::check_size(&err, output::STDERR_LIMIT)?;
+        if cancelled() {
+            return Err(crate::ai_control::CANCELLED.into());
         }
-        if pending.ends_with(b"\n") {
-            if let Ok(line) = std::str::from_utf8(&pending) {
-                progress(line.trim());
-            }
-            pending.clear();
+        if start.elapsed() > Duration::from_secs(timeout) {
+            return Err(format!(
+                "操作超过 {timeout} 秒，已停止本次子进程；下次可重试"
+            ));
         }
-    }
+        Ok(())
+    })?;
     drop(reader);
-    let _ = fs::remove_file(&input_file);
-    let stdout = fs::read_to_string(&out).unwrap_or_default();
-    let stderr = fs::read_to_string(&err).unwrap_or_default();
-    let _ = fs::remove_file(&out);
-    let _ = fs::remove_file(&err);
+    let stdout = output::read(&out, output::STDOUT_LIMIT)?;
+    let stderr = output::read(&err, output::STDERR_LIMIT)?;
     check_running()?;
     if cancelled() {
         return Err(crate::ai_control::CANCELLED.into());

@@ -16,8 +16,8 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
  await page.locator('.evidence-disclosure summary').click();
  const evidenceText=await page.locator('#evidence').innerText();for(const label of ['直接依据','背景上下文','完成依据'])assert(!evidenceText.includes(label));
  assert.equal(await page.locator('#evidence-list .source').count(),3);
- assert((await page.locator('#evidence-list .source').first().innerText()).includes('背景说明'));
- await page.locator('[data-evidence-sort]').click();assert((await page.locator('#evidence-list .source').first().innerText()).includes('发布完成请核对'));
+ assert((await page.locator('#evidence-list .source').first().innerText()).includes('发布完成请核对'));
+ await page.locator('[data-evidence-sort]').click();assert((await page.locator('#evidence-list .source').first().innerText()).includes('背景说明'));
  await page.locator('#evidence-search').fill('背景');assert.equal(await page.locator('#evidence-list .source').count(),1);assert.equal(await page.locator('#evidence-summary').innerText(),'匹配 1 / 共 3 条');
  await page.locator('#evidence-search').fill('不存在的关键词');assert((await page.locator('#evidence-list').innerText()).includes('没有匹配'));
  await page.locator('#evidence-search').fill('');assert.equal(await page.locator('#evidence-list .source').count(),3);

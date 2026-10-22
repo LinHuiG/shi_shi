@@ -10,6 +10,165 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn factory_defaults_use_general_parameters_without_personal_routes_or_paths() {
+        let c = Config::default();
+        assert!(c.enabled && c.auto_ai && c.message_filter_enabled && c.auto_update);
+        assert_eq!(
+            (
+                c.interval_minutes,
+                c.analysis_interval_minutes,
+                c.analysis_lookback_hours
+            ),
+            (3, 30, 24)
+        );
+        assert_eq!(
+            (c.daily_calls, c.max_input_chars, c.retrieval_budget_chars),
+            (150, 80_000, 80_000)
+        );
+        assert_eq!(
+            (
+                c.work_start.as_str(),
+                c.work_end.as_str(),
+                c.ai_timeout_seconds
+            ),
+            ("08:00", "20:00", 600)
+        );
+        assert_eq!(c.message_retention_days, 90);
+        assert!(!c.retain_ai_traces);
+        assert!(
+            c.codex.is_empty()
+                && c.codex_models.is_empty()
+                && c.ai_connections.is_empty()
+                && c.leaders.is_empty()
+        );
+        assert_eq!(c.analysis_workdir, "ShiShi");
+        for kind in PURPOSES {
+            assert_eq!(
+                c.for_kind(kind).selected_connection,
+                UNCONFIGURED_CONNECTION
+            );
+        }
+        let root = std::env::temp_dir().join(format!("shishi-factory-{}", id()));
+        let app = App::load(root.clone()).unwrap();
+        app.configure_patch(&json!({"daily_calls":149})).unwrap();
+        drop(app);
+        let loaded = App::load(root.clone()).unwrap();
+        assert!(loaded.state.lock().unwrap().config.codex.is_empty());
+        assert_eq!(
+            loaded
+                .state
+                .lock()
+                .unwrap()
+                .config
+                .for_kind("handling")
+                .selected_connection,
+            UNCONFIGURED_CONNECTION
+        );
+        drop(loaded);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explicit_null_is_unconfigured_while_legacy_missing_profiles_keep_their_routes() {
+        let legacy: Config =
+            serde_json::from_value(json!({"codex":"synthetic.exe","model":"old"})).unwrap();
+        assert_eq!(legacy.for_kind("handling").model, "gpt-6-astra");
+        let partial: Config = serde_json::from_value(json!({"codex":"synthetic.exe","model":"old","model_profiles":{"analysis":{"model":"selected"},"handling":null}})).unwrap();
+        assert_eq!(partial.for_kind("classify").model, "selected");
+        assert_eq!(partial.for_kind("archive").model, "old");
+        assert!(crate::ai_backend::connection(&partial.for_kind("handling")).is_err());
+        let restored: Config = serde_json::from_value(json!(partial)).unwrap();
+        assert_eq!(
+            restored.for_kind("handling").selected_connection,
+            UNCONFIGURED_CONNECTION
+        );
+    }
+
+    #[test]
+    fn unconfigured_operations_log_once_without_calls_cursors_drafts_or_runs() {
+        let root = std::env::temp_dir().join(format!("shishi-unconfigured-{}", id()));
+        let app = std::sync::Arc::new(App::load(root.clone()).unwrap());
+        for kind in PURPOSES {
+            app.activity.lock().unwrap().clear();
+            assert!(app
+                .ask_ai(kind, &json!({}))
+                .unwrap_err()
+                .starts_with("AI_UNCONFIGURED:"));
+            let rows = app.activity.lock().unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0]["detail"]["kind"], kind);
+            assert_eq!(rows[0]["detail"]["failure_class"], "unconfigured");
+        }
+        for result in [
+            app.handling_prepare("synthetic"),
+            app.handling_start(&json!({"task_id":"synthetic"})),
+            app.archive(crate::work_hours::AiMode::Manual),
+        ] {
+            assert!(result.unwrap_err().starts_with("AI_UNCONFIGURED:"));
+        }
+        assert!(app.create_generation(&json!({"text":"synthetic"})).is_err());
+        let s = app.state.lock().unwrap();
+        assert_eq!((s.calls, s.message_filter.calls), (0, 0));
+        assert!(s.analyzed.is_empty() && s.message_filter.checked.is_empty());
+        assert!(s.tasks.is_empty() && s.handling.runs.is_empty() && s.archive_attempts.is_empty());
+        drop(s);
+        app.activity.lock().unwrap().clear();
+        let started = crate::ai_jobs::start(
+            &app,
+            &json!({"method":"format","params":{"text":"synthetic"}}),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let result = crate::ai_jobs::result(&started).unwrap();
+            if result["done"] == true {
+                assert_eq!(result["ok"], false);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.activity.lock().unwrap().len(), 1);
+        drop(app);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_sources_clears_only_their_routes_atomically_and_survives_restart() {
+        let root = std::env::temp_dir().join(format!("shishi-clear-routes-{}", id()));
+        let app = App::load(root.clone()).unwrap();
+        {
+            let mut s = app.state.lock().unwrap();
+            s.config = serde_json::from_value(json!({"codex":"synthetic.exe","codex_models":[{"model":"synthetic"}],"ai_connections":[{"id":"api","name":"Synthetic","driver":"api","base_url":"https://example.com/v1","models":[{"model":"synthetic"}]}],"model_profiles":{"filter":null,"analysis":{"connection_id":"api","model":"synthetic"},"handling":{"model":"synthetic"},"review":{"connection_id":"api","model":"synthetic"}}})).unwrap();
+            app.save(&s).unwrap();
+        }
+        let next_path = root.join("data/state.next.json");
+        fs::create_dir(&next_path).unwrap();
+        let before = json!(app.state.lock().unwrap().config);
+        assert!(app.delete_connection(&json!({"id":"api"})).is_err());
+        assert_eq!(json!(app.state.lock().unwrap().config), before);
+        fs::remove_dir(&next_path).unwrap();
+        let result = app.delete_connection(&json!({"id":"api"})).unwrap();
+        assert!(result["config"]["model_profiles"]["analysis"].is_null());
+        assert!(result["config"]["model_profiles"]["review"].is_null());
+        assert!(result["config"]["model_profiles"]["handling"].is_object());
+        app.configure_patch(&json!({"daily_calls":147})).unwrap();
+        app.delete_connection(&json!({"id":""})).unwrap();
+        drop(app);
+        let restored = App::load(root.clone()).unwrap();
+        let c = &restored.state.lock().unwrap().config;
+        assert!(c.codex.is_empty() && c.ai_connections.is_empty());
+        for kind in PURPOSES {
+            assert_eq!(
+                c.for_kind(kind).selected_connection,
+                UNCONFIGURED_CONNECTION
+            );
+        }
+        assert_eq!(c.daily_calls, 147);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn settings_patch_preserves_unsubmitted_data_and_rejects_invalid_edits_atomically() {
         let root = std::env::temp_dir().join(format!("shishi-autosave-{}", id()));
         let app = App::load(root.clone()).unwrap();
@@ -71,7 +230,7 @@ mod tests {
             .unwrap();
         let s = app.state.lock().unwrap();
         assert!(s.analyzed.is_empty());
-        assert!(!s.config.message_filter_enabled);
+        assert!(s.config.message_filter_enabled);
         assert!(s.pending_analysis);
         assert_eq!(s.messages["plain"].text, "普通群消息");
         drop(s);

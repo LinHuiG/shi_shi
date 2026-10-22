@@ -36,7 +36,9 @@ pub fn initialize_acp(c: &Connection, root: &Path, confirmed: bool) -> Result<Va
     if !confirmed || c.driver != "dsh" {
         return Err("请明确确认初始化 DSH 内置 ACP 环境".into());
     }
-    let job = root.join("data/tmp").join(crate::model::id());
+    let job = crate::storage::data_dir(&root)
+        .join("tmp")
+        .join(crate::model::id());
     fs::create_dir_all(&job).map_err(|e| e.to_string())?;
     let _cleanup = JobCleanup(job.clone());
     let profile = connection_profile(&job.join("profile"))?;
@@ -135,7 +137,9 @@ impl Backend for Dsh {
         event: &mut dyn FnMut(AnalysisEvent),
     ) -> Result<(Value, Value), String> {
         self.validate(c, r.config)?;
-        let job = r.root.join("data/ai-work").join(crate::model::id());
+        let job = crate::storage::data_dir(&r.root)
+            .join("ai-work")
+            .join(crate::model::id());
         fs::create_dir_all(&job).map_err(|e| e.to_string())?;
         let _cleanup = JobCleanup(job.clone());
         let workdir = crate::ai::analysis_workdir(r.root, r.config)?;
@@ -321,7 +325,9 @@ impl Backend for Dsh {
                 json!({"ready":false,"status":"未找到 Harness 启动器；请选择新版 dsh.cmd 或 dsh.exe"}),
             );
         }
-        let job = root.join("data/tmp").join(crate::model::id());
+        let job = crate::storage::data_dir(&root)
+            .join("tmp")
+            .join(crate::model::id());
         fs::create_dir_all(&job).map_err(|e| e.to_string())?;
         let _cleanup = JobCleanup(job.clone());
         let profile = connection_profile(&job.join("profile"))?;
@@ -385,9 +391,6 @@ impl AgentSession for DshAgent {
     }
     fn is_alive(&self) -> bool {
         self.client.is_connected()
-    }
-    fn projects(&self) -> Result<Vec<Value>, String> {
-        shishi_acp::workspace::projects(&home()?)
     }
     fn start(
         &self,

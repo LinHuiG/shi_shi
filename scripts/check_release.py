@@ -6,15 +6,15 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
-TOP_FILES = {'.gitignore', 'AGENTS.md', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'build.ps1',
+TOP_FILES = {'.gitignore', '.gitattributes', 'rustfmt.toml', 'AGENTS.md', 'Cargo.toml', 'Cargo.lock', 'build.rs', 'build.ps1',
              'README.md', 'README.txt', 'PLUGIN_API.txt', 'LICENSE', 'SECURITY.md',
              'CONTRIBUTING.md', 'THIRD_PARTY_NOTICES.md', 'AI_BACKENDS.md'}
 TOP_DIRS = {'src', 'assets', 'config', 'docs', 'scripts', 'tests', 'plugin-sdk', 'examples', 'vendor', 'providers', 'ui'}
 ALLOWED_EXT = {'.rs', '.toml', '.lock', '.md', '.txt', '.json', '.js', '.cjs', '.html', '.ps1',
                '.py', '.css', '.nsi', '.rc', '.png', '.ico', '.rgba', '.zip', '.spdx', '.orig', '.kt',
-               '.pro', '.wasm', '.yml', '.yaml'}
+               '.pro', '.wasm', '.yml', '.yaml', '.manifest'}
 TEXT_EXT = {'.rs', '.toml', '.lock', '.md', '.txt', '.json', '.js', '.cjs', '.html', '.ps1',
-            '.py', '.css', '.nsi', '.rc', '.spdx', '.orig', '.kt', '.pro', '.yml', '.yaml'}
+            '.py', '.css', '.nsi', '.rc', '.spdx', '.orig', '.kt', '.pro', '.yml', '.yaml', '.manifest'}
 TOP_DIRS.add('installer')
 SECRET = re.compile(r'-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{24,})')
 PRIVATE_IP = re.compile(r'\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3})\b')

@@ -64,7 +64,7 @@ pub fn issue(root: &Path, state: &State, task: &Task, run: &str) -> Result<PathB
         expires: now() + 30 * 86_400_000,
         scopes,
     };
-    let dir = root.join("data/handling-context");
+    let dir = crate::storage::data_dir(&root).join("handling-context");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{run}.json"));
     if let Ok(bytes) = fs::read(&path) {
@@ -184,18 +184,28 @@ fn call(path: &Path, params: &Value) -> Result<Value, String> {
     let ticket: Ticket = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     uuid::Uuid::parse_str(&ticket.run).map_err(|_| "无效上下文授权")?;
+    let _transition = crate::storage::transition_read(&ticket.root)?;
+    crate::storage::initialize(&ticket.root)?;
     let state: State = serde_json::from_slice(
-        &fs::read(ticket.root.join("data/state.json")).map_err(|e| e.to_string())?,
+        &fs::read(crate::storage::data_dir(&ticket.root).join("state.json"))
+            .map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    let stopped = state
+        .handling
+        .runs
+        .iter()
+        .any(|r| r.id == ticket.run && r.stop_requested);
     let name = params["name"].as_str().unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
-    let result = if name == "read_image" {
+    let result = if stopped {
+        Err("处置已终止，上下文授权已失效".into())
+    } else if name == "read_image" {
         read_image(&ticket, &state, path, &args)
     } else {
         query(&ticket, &state, name, &args)
     };
-    let dir = ticket.root.join("data/handling-context");
+    let dir = crate::storage::data_dir(&ticket.root).join("handling-context");
     // Audit successful and rejected reads without copying message bodies.
     let record = json!({"time":now(),"tool":name,"arguments":args,"ok":result.is_ok(),"message_ids":result.as_ref().ok().and_then(|v|v["messages"].as_array()).map(|v|v.iter().map(|m|m["id"].clone()).collect::<Vec<_>>())});
     let mut f = fs::OpenOptions::new()
@@ -265,12 +275,13 @@ fn read_image(ticket: &Ticket, state: &State, path: &Path, args: &Value) -> Resu
 /// Desktop clients share one stable server. The opaque per-run token is the
 /// only selector; callers cannot supply paths, roots or enumerate other runs.
 fn routed_call(root: &Path, params: &Value) -> Result<Value, String> {
+    crate::storage::initialize(root)?;
     let token = params["arguments"]["context_token"]
         .as_str()
         .ok_or("请提供交接说明中的 context_token；不能推断当前事项")?;
     uuid::Uuid::parse_str(token).map_err(|_| "无效事项凭证")?;
-    let path = root
-        .join("data/handling-context")
+    let path = crate::storage::data_dir(&root)
+        .join("handling-context")
         .join(format!("{token}.json"));
     let ticket: Ticket =
         serde_json::from_slice(&fs::read(&path).map_err(|_| "事项凭证不存在或已失效")?)
@@ -278,6 +289,7 @@ fn routed_call(root: &Path, params: &Value) -> Result<Value, String> {
     if ticket.run != token || ticket.root.canonicalize().ok() != root.canonicalize().ok() {
         return Err("事项凭证与当前数据目录不匹配".into());
     }
+    crate::storage::initialize(&ticket.root)?;
     let mut request = params.clone();
     request["arguments"]
         .as_object_mut()
@@ -309,6 +321,7 @@ pub fn serve(path: &Path) -> Result<(), String> {
     serve_mode(path, false)
 }
 pub fn serve_root(root: &Path) -> Result<(), String> {
+    crate::storage::initialize(root)?;
     root.canonicalize().map_err(|_| "拾事数据目录不可用")?;
     serve_mode(root, true)
 }
@@ -369,6 +382,33 @@ fn serve_mode(path: &Path, routed: bool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stopped_run_revokes_even_an_unexpired_context_ticket() {
+        let (mut ticket, mut state) = fixture();
+        let root =
+            std::env::temp_dir().join(format!("shishi-stopped-ticket-{}", crate::model::id()));
+        std::fs::create_dir_all(root.join("data/handling-context")).unwrap();
+        ticket.root = root.clone();
+        ticket.run = crate::model::id();
+        state.handling.runs.push(crate::handling::Run {
+            id: ticket.run.clone(),
+            stop_requested: true,
+            ..Default::default()
+        });
+        let path = root.join("data/handling-context/ticket.json");
+        std::fs::write(&path, serde_json::to_vec(&ticket).unwrap()).unwrap();
+        std::fs::write(
+            root.join("data/state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            super::call(&path, &serde_json::json!({"name":"get_task_context"}))
+                .unwrap_err()
+                .contains("已终止")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
     use super::*;
     use crate::model::Message;
     #[test]
@@ -432,6 +472,57 @@ mod tests {
                 .unwrap()
                 .contains(&json!("context_token")));
         }
+    }
+    #[test]
+    fn persistent_context_server_reads_the_new_directory_and_blocks_during_transfer() {
+        let base =
+            std::env::temp_dir().join(format!("shishi-context-location-{}", crate::model::id()));
+        let root = base.join("app");
+        let old = root.join("data");
+        let new = base.join("moved");
+        fs::create_dir_all(old.join("handling-context")).unwrap();
+        fs::create_dir_all(new.join("handling-context")).unwrap();
+        let (mut ticket, mut state) = fixture();
+        ticket.root = root.clone();
+        state.tasks[0].title = "Original fixture".into();
+        fs::write(old.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        fs::write(
+            old.join("handling-context")
+                .join(format!("{}.json", ticket.run)),
+            serde_json::to_vec(&ticket).unwrap(),
+        )
+        .unwrap();
+        let request = json!({"name":"get_task_context","arguments":{"context_token":ticket.run}});
+        assert_eq!(
+            routed_call(&root, &request).unwrap()["task"]["title"],
+            "Original fixture"
+        );
+        state.tasks[0].title = "Moved fixture".into();
+        fs::write(new.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        fs::write(
+            new.join("handling-context")
+                .join(format!("{}.json", ticket.run)),
+            serde_json::to_vec(&ticket).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("data-location.json"),
+            json!({"version":1,"directory":new}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            routed_call(&root, &request).unwrap()["task"]["title"],
+            "Moved fixture"
+        );
+        let first = crate::storage::transition_read(&root).unwrap();
+        let second = crate::storage::transition_read(&root).unwrap();
+        assert!(crate::storage::transition_lock(&root).is_err());
+        drop(first);
+        drop(second);
+        let mutation = crate::storage::transition_lock(&root).unwrap();
+        assert!(routed_call(&root, &request).is_err());
+        drop(mutation);
+        fs::remove_dir_all(base).unwrap();
     }
     fn fixture() -> (Ticket, State) {
         let mut s = State::default();

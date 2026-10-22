@@ -12,7 +12,7 @@ use std::time::Duration;
 
 pub struct Api;
 fn key(c: &Connection, root: &Path) -> Result<crate::credentials::ResolvedCredential, String> {
-    CredentialStore::new(root.join("data/credentials"))
+    CredentialStore::new(crate::storage::data_dir(&root).join("credentials"))
         .resolve(
             c.credential_id.as_deref().unwrap_or(&c.id),
             c.key_env.as_deref(),
@@ -94,6 +94,8 @@ impl Backend for Api {
             }, c.stream, &mut |e| match e {
                 ApiEvent::Phase(phase) => event(AnalysisEvent::Stream{kind:"phase".into(),text:phase.into(),append:false}),
                 ApiEvent::Text{kind,text,append} => event(AnalysisEvent::Stream{kind:kind.into(),text,append}),
+                ApiEvent::OutputTokens(count) => event(AnalysisEvent::OutputTokens(count)),
+                ApiEvent::StepFinished{output_tokens,decode_ms} => event(AnalysisEvent::StepFinished{output_tokens,decode_ms}),
                 ApiEvent::Response(value) => record_response(r.trace,value,secret.expose_secret(),r.config.retain_ai_traces,false),
                 ApiEvent::ToolRejected(value) => record_response(r.trace,value,secret.expose_secret(),r.config.retain_ai_traces,true),
             })
@@ -140,7 +142,7 @@ impl Backend for Api {
         Ok(())
     }
     fn status(&self, c: &Connection, root: &Path) -> Result<Value, String> {
-        let status = CredentialStore::new(root.join("data/credentials"))
+        let status = CredentialStore::new(crate::storage::data_dir(&root).join("credentials"))
             .status(
                 c.credential_id.as_deref().unwrap_or(&c.id),
                 c.key_env.as_deref(),

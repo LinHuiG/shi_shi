@@ -57,7 +57,7 @@ pub fn attach(root: &Path, payload: &mut Value) {
     }
     // The private catalog is the only authority for read_image. No arbitrary file names are accepted.
     payload["_local_context"]["images"] = json!(images);
-    payload["_local_context"]["image_cache"] = json!(root.join("data/media"));
+    payload["_local_context"]["image_cache"] = json!(crate::storage::data_dir(&root).join("media"));
     for field in ["changes", "context"] {
         if let Some(rows) = payload[field].as_array_mut() {
             for row in rows {
@@ -67,7 +67,9 @@ pub fn attach(root: &Path, payload: &mut Value) {
                             image["available"] = json!(found["key"].is_string());
                             if let Some(k) = found["key"].as_str() {
                                 if let Ok(text) = fs::read_to_string(
-                                    root.join("data/media").join(format!("{k}.note")),
+                                    crate::storage::data_dir(&root)
+                                        .join("media")
+                                        .join(format!("{k}.note")),
                                 ) {
                                     image["summary"] =
                                         json!(text.chars().take(300).collect::<String>());
@@ -236,7 +238,7 @@ pub fn notes(meter: &Meter, value: &Value) -> Value {
         .collect::<Vec<_>>())
 }
 pub fn commit(root: &Path, notes: &Value) -> Result<(), String> {
-    let dir = root.join("data/media");
+    let dir = crate::storage::data_dir(&root).join("media");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     for note in notes.as_array().into_iter().flatten() {
         let key = note["key"].as_str().unwrap_or("");
@@ -252,7 +254,7 @@ pub fn commit(root: &Path, notes: &Value) -> Result<(), String> {
     Ok(())
 }
 pub fn prune(root: &Path, days: u32) {
-    let dir = root.join("data/media");
+    let dir = crate::storage::data_dir(&root).join("media");
     if !dir.is_dir() {
         return;
     }
@@ -292,7 +294,7 @@ impl App {
             .cloned()
             .ok_or("图片不存在或消息已撤回")?;
         drop(s);
-        let (_, data) = preview(&self.root.join("data/media"), &image)?;
+        let (_, data) = preview(&crate::storage::data_dir(&self.root).join("media"), &image)?;
         Ok(json!({"url":format!("data:image/jpeg;base64,{data}")}))
     }
 }

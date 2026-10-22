@@ -44,8 +44,17 @@ fn merge(base: &mut Catalog, text: &str) -> Result<(), String> {
 }
 
 pub fn initialize(root: &Path) -> Result<(), String> {
+    let catalog = load_directory(&crate::storage::data_dir(root))?;
+    CATALOG
+        .set(catalog)
+        .map_err(|_| "提示词配置已加载".to_string())
+}
+pub(crate) fn validate_directory(directory: &Path) -> Result<(), String> {
+    load_directory(directory).map(|_| ())
+}
+fn load_directory(directory: &Path) -> Result<Catalog, String> {
     let mut catalog = defaults();
-    let path = root.join("data/config/prompts.local.json");
+    let path = directory.join("config/prompts.local.json");
     match std::fs::read_to_string(&path) {
         Ok(text) => {
             if text.len() > 1_000_000 {
@@ -56,9 +65,7 @@ pub fn initialize(root: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(format!("无法读取本地提示词配置：{e}")),
     }
-    CATALOG
-        .set(catalog)
-        .map_err(|_| "提示词配置已加载".to_string())
+    Ok(catalog)
 }
 
 pub fn get(kind: &str) -> &'static str {

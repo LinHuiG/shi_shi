@@ -7,9 +7,19 @@ use std::{
 include!("src/ui_bundle.rs");
 
 fn main() {
+    // Packaging supplies a fresh nonce so even an unchanged source tree gets
+    // a newly compiled timestamp. The timestamp itself always uses this clock.
+    println!("cargo:rerun-if-env-changed=SHISHI_PACKAGE_BUILD_NONCE");
+    println!("cargo:rerun-if-changed=src");
+    let built = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    println!("cargo:rustc-env=SHISHI_BUILD_TIME={built}");
     bundle_ui();
     println!("cargo:rerun-if-changed=assets/shishi.ico");
     println!("cargo:rerun-if-changed=assets/shishi.rc");
+    println!("cargo:rerun-if-changed=assets/windows.manifest");
     println!("cargo:rerun-if-env-changed=WINDRES");
     println!("cargo:rerun-if-env-changed=RC");
     if env::var("CARGO_CFG_TARGET_OS").unwrap() == "windows" {

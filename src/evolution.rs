@@ -207,26 +207,26 @@ mod tests {
         };
         assert_eq!(c.for_kind("handling").model, "base-model");
         c.model_profiles = Some(ModelProfiles {
-            filter: ModelChoice {
+            filter: Some(ModelChoice {
                 connection_id: String::new(),
                 model: "filter-model".into(),
                 reasoning_effort: "low".into(),
-            },
-            analysis: ModelChoice {
+            }),
+            analysis: Some(ModelChoice {
                 connection_id: String::new(),
                 model: "analysis-model".into(),
                 reasoning_effort: "medium".into(),
-            },
-            handling: ModelChoice {
+            }),
+            handling: Some(ModelChoice {
                 connection_id: String::new(),
                 model: "handling-model".into(),
                 reasoning_effort: "high".into(),
-            },
-            review: ModelChoice {
+            }),
+            review: Some(ModelChoice {
                 connection_id: String::new(),
                 model: "review-model".into(),
                 reasoning_effort: "low".into(),
-            },
+            }),
         });
         for kind in ["classify", "format", "edit", "schedule"] {
             assert_eq!(c.for_kind(kind).model, "analysis-model");

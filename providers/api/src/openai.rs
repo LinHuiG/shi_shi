@@ -792,7 +792,12 @@ impl<'a> ChatCompletionsClient<'a> {
                 Some(&body_bytes),
                 self.max_response_bytes,
             );
-            let mut collector = StreamCollector::default();
+            let output_base = if usage.responses == 0 {
+                Some(0)
+            } else {
+                usage.clone().finish().completion_tokens
+            };
+            let mut collector = StreamCollector::with_output_base(output_base);
             let mut stream_invalid = false;
             let response = if stream {
                 self.transport.send_stream(

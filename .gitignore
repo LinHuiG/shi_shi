@@ -1,6 +1,10 @@
 /target/
 /build/
 /data/
+/data-location.json
+/.data-location.lock
+/.data-location-*.next
+/.data-transfer-*
 /.tmp/
 /.codex/
 /.agents/

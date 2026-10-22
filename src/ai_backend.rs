@@ -7,9 +7,9 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
+pub mod agent_approval;
 pub mod api;
 pub mod codex;
-pub mod codex_agent;
 pub mod dsh;
 
 /// No credentials belong in this serializable descriptor. Future API adapters
@@ -58,14 +58,11 @@ impl Connection {
 }
 
 pub fn connection(config: &Config) -> Result<Connection, String> {
+    if config.selected_connection == crate::model::UNCONFIGURED_CONNECTION {
+        return Err("AI_UNCONFIGURED:未配置此用途的 AI 接入或模型".into());
+    }
     if config.selected_connection.is_empty() {
-        return Ok(Connection {
-            id: String::new(),
-            name: config.codex_name.clone(),
-            executable: config.codex.clone(),
-            models: config.codex_models.clone(),
-            ..Connection::default()
-        });
+        return Ok(default_codex_connection(config));
     }
     config
         .ai_connections
@@ -73,6 +70,23 @@ pub fn connection(config: &Config) -> Result<Connection, String> {
         .find(|c| c.id == config.selected_connection)
         .cloned()
         .ok_or_else(|| "所选 AI 连接不存在，请重新选择接入".into())
+}
+
+pub fn default_codex_connection(config: &Config) -> Connection {
+    Connection {
+        id: String::new(),
+        name: config.codex_name.clone(),
+        executable: config.codex.clone(),
+        models: config.codex_models.clone(),
+        ..Connection::default()
+    }
+}
+
+pub fn handling_available(config: &Config) -> bool {
+    !config.codex.trim().is_empty()
+        || config.ai_connections.iter().any(|c| {
+            matches!(c.driver.as_str(), "codex" | "dsh") && !c.executable.trim().is_empty()
+        })
 }
 
 /// Public request identity only: never include an endpoint, path or credential.
@@ -137,6 +151,12 @@ pub fn validate_connections(config: &Config) -> Result<(), String> {
         }
     }
     for kind in crate::model::PURPOSES {
+        if config.for_kind(kind).selected_connection == crate::model::UNCONFIGURED_CONNECTION {
+            continue;
+        }
+        if kind == "handling" && !handling_available(config) {
+            continue;
+        }
         let c = connection(&config.for_kind(kind))?;
         backend(&c)?.validate(&c, &config.for_kind(kind))?;
         if kind == "handling" && c.driver == "api" {
@@ -167,8 +187,13 @@ pub const NOT_SUBMITTED: &str = "处置未提交：";
 pub enum AnalysisEvent {
     SessionStarted(String),
     Usage(Value),
+    /// Live cumulative output only; never used for persisted billing totals.
+    OutputTokens(Option<u64>),
+    StepFinished {
+        output_tokens: Option<u64>,
+        decode_ms: Option<u64>,
+    },
     CacheDiagnostics(Value),
-    Progress(String),
     Stream {
         kind: String,
         text: String,
@@ -215,7 +240,6 @@ pub fn backend(connection: &Connection) -> Result<&'static dyn Backend, String> 
 pub trait AgentSession: Send + Sync {
     fn close(&self) -> Result<(), String>;
     fn is_alive(&self) -> bool;
-    fn projects(&self) -> Result<Vec<Value>, String>;
     fn start(
         &self,
         cwd: &str,
@@ -235,14 +259,6 @@ pub trait AgentSession: Send + Sync {
     fn read(&self, thread: &str) -> Result<Value, String>;
     fn history(&self, thread: &str) -> Result<Value, String>;
     fn resume(&self, thread: &str, context: &ContextTool) -> Result<Value, String>;
-    fn prepare_handoff(
-        &self,
-        _thread: &str,
-        _context: &ContextTool,
-        _note: &str,
-    ) -> Result<(), String> {
-        Err("当前接入不支持 Codex 上下文交接".into())
-    }
     fn unsubscribe(&self, thread: &str) -> Result<(), String>;
     fn interrupt(&self, thread: &str, turn: &str) -> Result<(), String>;
     fn events(&self) -> Vec<UsageEvent>;
@@ -311,6 +327,52 @@ mod tests {
         assert!(serialized.get("selected_connection").is_none());
         let restored: Config = serde_json::from_value(serialized).unwrap();
         assert_eq!(connection(&restored).unwrap(), connection(&config).unwrap());
+    }
+
+    #[test]
+    fn api_only_configuration_routes_all_analysis_purposes_without_enabling_handling() {
+        let mut config: Config = serde_json::from_value(json!({
+            "ai_connections":[{"id":"api","name":"Synthetic API","driver":"api","base_url":"https://example.com/v1","models":[{"model":"synthetic"}]}],
+            "model_profiles":{
+                "filter":{"connection_id":"api","model":"synthetic"},
+                "analysis":{"connection_id":"api","model":"synthetic"},
+                "review":{"connection_id":"api","model":"synthetic"},
+                "handling":{"connection_id":"api","model":"synthetic"}
+            }
+        })).unwrap();
+        assert!(!handling_available(&config));
+        validate_connections(&config).unwrap();
+        for purpose in crate::model::PURPOSES
+            .into_iter()
+            .filter(|p| *p != "handling")
+        {
+            assert_eq!(connection(&config.for_kind(purpose)).unwrap().driver, "api");
+        }
+        let root = std::env::temp_dir().join(format!("shishi-api-only-{}", crate::model::id()));
+        let app = crate::engine::App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config = config.clone();
+        assert!(app
+            .handling_start(&json!({"task_id":"synthetic"}))
+            .unwrap_err()
+            .contains("不能执行一键处置"));
+        assert_eq!(app.state.lock().unwrap().calls, 0);
+        assert!(app.state.lock().unwrap().handling.runs.is_empty());
+        // Inactive handling profiles are retained; re-enabling agents validates them again.
+        config.codex = "synthetic.exe".into();
+        assert!(handling_available(&config));
+        assert!(validate_connections(&config)
+            .unwrap_err()
+            .contains("不能用于一键处置"));
+        config.codex.clear();
+        config.ai_connections.push(Connection {
+            id: "dsh".into(),
+            driver: "dsh".into(),
+            executable: "synthetic.cmd".into(),
+            ..Default::default()
+        });
+        assert!(handling_available(&config));
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

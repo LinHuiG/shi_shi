@@ -5,19 +5,18 @@ const fixture={config:{enabled:false,auto_ai:false,interval_minutes:5,leaders:[]
 const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.failSend=false;window.ipc={postMessage(raw){const r=JSON.parse(raw);requests.push(r);setTimeout(()=>{let data=true,error='';if(r.method==='state')data=fixture;if(r.method==='evidence')data=[];if(r.method==='handling_followup'&&failSend)error='合成发送失败';if(r.method==='activity_query')data={rows:[{kind:'ai_failed',time:${now},detail:{kind:'classify',response_received:true,error:'合成编号校验失败',request_id:'fixture'}}],total:1,pages:1,page:1};receive({id:r.id,ok:!error,data,error});},2)}};`;
 (async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{
  const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));await page.locator('[data-handling-stream]').waitFor();
- const height=await page.locator('[data-handling-stream]').evaluate(el=>el.clientHeight);
  await page.locator('[data-handle="followup"]').click();await page.locator('#handling-question').fill('保留我的草稿');
  await page.evaluate(()=>{window.streamNode=document.querySelector('[data-handling-stream]');window.rowNode=document.querySelector('[data-task="task"]');window.fieldNode=document.querySelector('#handling-question');fieldNode.setSelectionRange(2,2);});
  const text=Array.from({length:70},(_,i)=>`第 ${i} 行：中文路径 D:/合成资料/文件.txt 与 emoji 🚀🙂。`).join('\n');
  await page.evaluate(async text=>{fixture.handling[0].rounds[0].steps=[{id:'answer',kind:'agentMessage',text}];fixture.handling[0].progress=text;await refreshState(false);},text);
  await page.waitForTimeout(220);
- assert.equal(await page.locator('.handling-stream-text').innerText(),text);assert.equal(await page.locator('[data-handling-stream]').evaluate(el=>el.clientHeight),height);
+ assert.equal(await page.locator('.handling-stream-text').innerText(),text);assert(await page.locator('[data-handling-stream]').evaluate(el=>el.clientHeight<=120));
  assert(await page.evaluate(()=>streamNode===document.querySelector('[data-handling-stream]')&&rowNode===document.querySelector('[data-task="task"]')&&fieldNode===document.querySelector('#handling-question')&&document.activeElement===fieldNode&&fieldNode.selectionStart===2));
  assert.equal(await page.locator('#handling-question').inputValue(),'保留我的草稿');
- await page.locator('[data-handling-stream]').evaluate(el=>el.scrollTop=0);await page.waitForTimeout(40);
+ await page.locator('.handling-stream [data-handling-reading-toggle]').click();await page.waitForTimeout(180);await page.locator('.detail').evaluate(el=>el.scrollTop=500);await page.waitForTimeout(60);
  await page.evaluate(async()=>{fixture.handling[0].rounds[0].steps[0].text+='\n新增内容 🚀';await refreshState(false);});await page.waitForTimeout(220);
- assert.equal(await page.locator('[data-handling-stream]').evaluate(el=>el.scrollTop),0);assert(await page.locator('[data-handling-latest]').isVisible());
- await page.locator('[data-handling-latest]').click();await page.waitForTimeout(220);assert(await page.locator('[data-handling-stream]').evaluate(el=>el.scrollHeight-el.clientHeight-el.scrollTop<2));
+ assert.equal(await page.locator('.detail').evaluate(el=>el.scrollTop),500);assert.equal(await page.locator('[data-handling-stream]').evaluate(el=>el.scrollTop),0);assert(await page.locator('[data-handling-latest]').isVisible());
+ await page.locator('[data-handling-latest]').click();await page.waitForTimeout(220);assert(await page.locator('[data-handling-stream]').evaluate(el=>el.getBoundingClientRect().bottom<=el.closest('.detail').getBoundingClientRect().bottom));
  await page.evaluate(async()=>{const row=fixture.handling[0].rounds[0].steps[0];window.fullProgress=row.text;row.text=row.text.slice(0,40);await refreshState(false);});await page.waitForTimeout(180);assert.equal(await page.locator('.handling-stream-text').innerText(),await page.evaluate(()=>fullProgress));
  await page.locator('#handling-question').focus();await page.locator('#handling-question').press('Control+Enter');assert.equal(await page.locator('#handling-question').inputValue(),'保留\n我的草稿');
  await page.evaluate(()=>document.querySelector('#handling-question').dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',isComposing:true,bubbles:true})));assert.equal(await page.evaluate(()=>requests.filter(r=>r.method==='handling_followup').length),0);

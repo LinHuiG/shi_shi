@@ -6,13 +6,48 @@ if(!$version){throw 'Missing package version'}
 if($CargoHome){$env:CARGO_HOME=$CargoHome}
 if(!$NsisPath){$NsisPath=(Get-Command makensis.exe -ErrorAction SilentlyContinue).Source}
 if(!$NsisPath){throw 'Provide -NsisPath pointing to NSIS 3 makensis.exe'}
-& cargo build --package shishi --release --locked --manifest-path "$PSScriptRoot\Cargo.toml"
-if($LASTEXITCODE -ne 0){throw 'Rust build failed'}
-$cache=if($CargoHome){$CargoHome}else{Join-Path $env:USERPROFILE '.cargo'}
-$loader=Get-ChildItem -LiteralPath "$cache\registry\src" -Filter WebView2Loader.dll -Recurse | Where-Object {$_.FullName -match 'webview2-com-sys-[^\\]+\\x64\\'} | Select-Object -First 1
-if(!$loader){throw 'x64 WebView2Loader.dll not found'}
-Copy-Item -LiteralPath $loader.FullName -Destination "$PSScriptRoot\target\release\WebView2Loader.dll" -Force
+$previousBuildNonce=$env:SHISHI_PACKAGE_BUILD_NONCE
+try {
+ $env:SHISHI_PACKAGE_BUILD_NONCE=[guid]::NewGuid().ToString('N')
+ & cargo build --package shishi --release --locked --manifest-path "$PSScriptRoot\Cargo.toml"
+ if($LASTEXITCODE -ne 0){throw 'Rust build failed'}
+} finally {
+ if($null -eq $previousBuildNonce){Remove-Item Env:SHISHI_PACKAGE_BUILD_NONCE -ErrorAction SilentlyContinue}
+ else{$env:SHISHI_PACKAGE_BUILD_NONCE=$previousBuildNonce}
+}
+$metadataText=& cargo metadata --locked --offline --format-version 1 --manifest-path "$PSScriptRoot\Cargo.toml"
+if($LASTEXITCODE -ne 0){throw 'Cannot resolve locked build dependencies'}
+$metadata=$metadataText | ConvertFrom-Json
+$loaders=@($metadata.packages | Where-Object { $_.name -eq 'webview2-com-sys' })
+if($loaders.Count -ne 1){throw 'Expected one resolved webview2-com-sys dependency'}
+$loaderPackage=$loaders[0]
+$loaderPath=Join-Path (Split-Path -LiteralPath $loaderPackage.manifest_path) 'x64/WebView2Loader.dll'
+if(!(Test-Path -LiteralPath $loaderPath -PathType Leaf)){throw 'Resolved x64 WebView2Loader.dll not found'}
+Copy-Item -LiteralPath $loaderPath -Destination "$PSScriptRoot\target\release\WebView2Loader.dll" -Force
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
-& $NsisPath /V2 /INPUTCHARSET UTF8 "/DVERSION=$version" "/DSOURCE=$PSScriptRoot" "/DOUTPUT=$OutputDirectory" "/DLOADER=$($loader.FullName)" "$PSScriptRoot\installer\setup.nsi"
+& $NsisPath /V2 /INPUTCHARSET UTF8 "/DVERSION=$version" "/DSOURCE=$PSScriptRoot" "/DOUTPUT=$OutputDirectory" "/DLOADER=$loaderPath" "$PSScriptRoot\installer\setup.nsi"
 if($LASTEXITCODE -ne 0){throw 'NSIS build failed'}
-Get-FileHash -LiteralPath (Join-Path $OutputDirectory "Shishi-Setup-$version.exe") -Algorithm SHA256
+$installer=Join-Path $OutputDirectory "Shishi-Setup-$version.exe"
+$installerHash=Get-FileHash -LiteralPath $installer -Algorithm SHA256
+$uiRoot=Join-Path $PSScriptRoot 'assets/ui'
+$styles=[Text.StringBuilder]::new();$scripts=[Text.StringBuilder]::new()
+foreach($line in Get-Content -LiteralPath (Join-Path $uiRoot 'manifest.txt')) {
+ $line=$line.Trim()
+ if(!$line -or $line.StartsWith('#')){continue}
+ $kind,$relative=$line -split ' ',2
+ $content=[IO.File]::ReadAllText((Join-Path $uiRoot $relative.Trim())).Replace("`r`n","`n")
+ $builder=if($kind -eq 'style'){$styles}elseif($kind -eq 'script'){$scripts}else{throw 'Unknown UI manifest kind'}
+ [void]$builder.Append($content)
+ if(!$content.EndsWith("`n")){[void]$builder.Append("`n")}
+}
+$ui=[IO.File]::ReadAllText((Join-Path $uiRoot 'index.html')).Replace("`r`n","`n").Replace('<!--STYLES-->',"<style>`n$styles</style>").Replace('/*SCRIPTS*/',$scripts.ToString().TrimEnd())
+[ordered]@{
+ version=$version
+ installer_bytes=(Get-Item -LiteralPath $installer).Length
+ executable_bytes=(Get-Item -LiteralPath "$PSScriptRoot/target/release/shishi.exe").Length
+ embedded_ui_bytes=[Text.Encoding]::UTF8.GetByteCount($ui)
+ loader_version=$loaderPackage.version
+ loader_sha256=(Get-FileHash -LiteralPath $loaderPath -Algorithm SHA256).Hash
+ installer_sha256=$installerHash.Hash
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $OutputDirectory "Shishi-Build-Metrics-$version.json") -Encoding UTF8
+$installerHash

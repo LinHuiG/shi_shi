@@ -174,6 +174,7 @@ mod tests {
     fn oversized_input_is_rejected_before_cli_start_or_call_reservation() {
         let root = std::env::temp_dir().join(format!("shishi-input-limit-{}", id()));
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
             s.config.max_input_chars = 5_000;
@@ -207,6 +208,7 @@ mod tests {
     fn queued_or_running_archive_reserves_priority_over_new_analysis() {
         let root = std::env::temp_dir().join(format!("shishi-ai-priority-{}", id()));
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         app.state
             .lock()
             .unwrap()
@@ -233,6 +235,7 @@ mod tests {
     fn interruption_only_cancels_current_request_and_preserves_settings() {
         let root = std::env::temp_dir().join(format!("shishi-ai-interrupt-{}", id()));
         let app = App::load(root.clone()).unwrap();
+        app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         {
             let mut s = app.state.lock().unwrap();

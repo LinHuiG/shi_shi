@@ -578,10 +578,14 @@ fn spawn_grandchild() {
     let Ok(path) = std::env::var("MOCK_CHILD_PID_FILE") else {
         return;
     };
-    let mut child = match Command::new("cmd.exe")
-        .args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 >NUL"])
-        .spawn()
+    let mut command = Command::new("cmd.exe");
+    command.args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 >NUL"]);
+    #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => return,
     };

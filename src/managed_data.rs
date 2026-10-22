@@ -93,7 +93,7 @@ impl Inspection {
 }
 
 fn state_dir(root: &Path) -> PathBuf {
-    root.join("data")
+    crate::storage::data_dir(&root)
 }
 
 /// Struct deserialization would accept a JSON array for an object field (all
@@ -238,8 +238,11 @@ fn legacy_memory_files(root: &Path) -> Vec<(String, PathBuf)> {
             continue;
         };
         if metadata.is_file() && !metadata.file_type().is_symlink() {
-            if let Ok(relative) = path.strip_prefix(root) {
-                result.push((relative.to_string_lossy().replace('\\', "/"), path));
+            if let Ok(relative) = path.strip_prefix(state_dir(root)) {
+                result.push((
+                    format!("data/{}", relative.to_string_lossy().replace('\\', "/")),
+                    path,
+                ));
             }
         }
     }
@@ -304,10 +307,10 @@ pub fn inspect(root: &Path) -> Inspection {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             continue;
         }
-        let Ok(relative) = path.strip_prefix(root) else {
+        let Ok(relative) = path.strip_prefix(state_dir(root)) else {
             continue;
         };
-        let relative = relative.to_string_lossy().replace('\\', "/");
+        let relative = format!("data/{}", relative.to_string_lossy().replace('\\', "/"));
         if relative.ends_with("/memory.md")
             && relative.starts_with("data/")
             && listed.insert(relative.clone())
@@ -326,7 +329,10 @@ pub fn inspect(root: &Path) -> Inspection {
 /// Load the authoritative state with explicit schema gating. No `serde(default)`
 /// layer can turn an old or malformed file into a fresh default state here.
 pub fn load_state(root: &Path) -> Result<State, String> {
-    let path = state_dir(root).join("state.json");
+    load_from_directory(&state_dir(root))
+}
+pub(crate) fn load_from_directory(directory: &Path) -> Result<State, String> {
+    let path = directory.join("state.json");
     if !path.exists() {
         return Ok(State::default());
     }
@@ -384,11 +390,7 @@ fn resolve_managed(root: &Path, relative: &str) -> Result<PathBuf, String> {
     }
     let data = fs::canonicalize(state_dir(root))
         .map_err(|e| format!("应用数据目录不可用，未删除任何文件：{e}"))?;
-    let canonical_root =
-        fs::canonicalize(root).map_err(|e| format!("应用目录不可用，未删除任何文件：{e}"))?;
-    if !data.starts_with(&canonical_root) {
-        return Err("拒绝清理：应用数据目录是指向应用目录之外的链接/junction".into());
-    }
+    crate::storage::plain_directory(&state_dir(root))?;
     let path = state_dir(root).join(name);
     let metadata = fs::symlink_metadata(&path)
         .map_err(|e| format!("无法检查 {relative}，未删除任何文件：{e}"))?;
@@ -804,7 +806,7 @@ mod tests {
         let inspection = inspect(&root);
         let error = cleanup(&root, &inspection).unwrap_err();
         assert!(
-            error.contains("链接/junction") || error.contains("目录之外"),
+            error.contains("junction") || error.contains("目录之外"),
             "{error}"
         );
         assert!(outside.join("state.json").exists());

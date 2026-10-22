@@ -2,7 +2,7 @@
 use crate::process;
 use serde_json::{json, Value};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     io::{BufRead, BufReader, Read, Write},
     process::{ChildStdin, Command, Stdio},
     sync::{
@@ -33,9 +33,6 @@ pub struct Client {
     child: Mutex<Option<process::OwnedChild>>,
     input: Mutex<ChildStdin>,
     pending: Mutex<BTreeMap<u64, mpsc::Sender<Result<Value, String>>>>,
-    events: Mutex<VecDeque<Value>>,
-    requests: Mutex<BTreeMap<String, Value>>,
-    approval_items: Mutex<BTreeMap<String, Value>>,
     diagnostic: Mutex<String>,
     next: AtomicU64,
     pub alive: AtomicBool,
@@ -99,8 +96,13 @@ impl Client {
             .map(String::from)
             .ok_or("Codex 未返回项目编号".into())
     }
-    pub fn connect(executable: &str) -> Result<Arc<Self>, String> {
-        Self::connect_guarded(executable, None)
+    pub fn connect_metadata(executable: &str) -> Result<Arc<Self>, String> {
+        let mut command = Command::new(crate::ai_backend::codex::resolve_cli(executable)?);
+        command
+            .args(["app-server"])
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("CODEX_APP_TOOLS_PIPE_PATH");
+        Self::connect_command_guarded(command, None)
     }
     pub fn connect_guarded(
         executable: &str,
@@ -112,10 +114,6 @@ impl Client {
         let mut command = Command::new(crate::ai_backend::codex::resolve_cli(executable)?);
         command.args(["app-server"]);
         Self::connect_command_guarded(command, cancel)
-    }
-    #[cfg(test)]
-    pub(crate) fn connect_command(command: Command) -> Result<Arc<Self>, String> {
-        Self::connect_command_guarded(command, None)
     }
     fn connect_command_guarded(
         mut command: Command,
@@ -133,9 +131,6 @@ impl Client {
             child: Mutex::new(Some(child)),
             input: Mutex::new(input),
             pending: Mutex::new(BTreeMap::new()),
-            events: Mutex::new(VecDeque::new()),
-            requests: Mutex::new(BTreeMap::new()),
-            approval_items: Mutex::new(BTreeMap::new()),
             diagnostic: Mutex::new(String::new()),
             next: AtomicU64::new(1),
             alive: AtomicBool::new(true),
@@ -184,7 +179,7 @@ impl Client {
         client.write(json!({"method":"initialized"}))?;
         Ok(client)
     }
-    fn receive(&self, mut value: Value) {
+    fn receive(&self, value: Value) {
         if value.get("method").is_none() {
             if let Some(id) = value["id"].as_u64() {
                 if let Some(tx) = self.pending.lock().unwrap().remove(&id) {
@@ -209,58 +204,11 @@ impl Client {
                 let _=self.write(json!({"id":value["id"],"result":{"currentTimeAt":chrono::Utc::now().timestamp()}}));
                 return;
             }
-            if value["params"]["threadId"].as_str().is_none() {
-                // Authentication/client-level requests cannot be approved as a task action.
-                let _=self.write(json!({"id":value["id"],"error":{"code":-32601,"message":"拾事不支持此客户端级请求。请在 Codex 完成登录或相关配置后重试。"}}));
-                return;
-            }
-            let p = &mut value["params"];
-            let item_key = json!([p["threadId"], p["turnId"], p["itemId"]]).to_string();
-            if let Some(item) = self.approval_items.lock().unwrap().get(&item_key) {
-                for key in ["command", "cwd", "changes"] {
-                    if p[key].is_null() && !item[key].is_null() {
-                        p[key] = item[key].clone();
-                    }
-                }
-            }
-            self.requests
-                .lock()
-                .unwrap()
-                .insert(value["id"].to_string(), value.clone());
+            // This transport now handles metadata only. Execution requests
+            // belong to the desktop or the separate retained ACP adapter.
+            let _=self.write(json!({"id":value["id"],"error":{"code":-32601,"message":"拾事元数据连接不处理执行审批，请在 Codex 桌面处理。"}}));
+            return;
         }
-        if value["method"] == "serverRequest/resolved" {
-            self.requests
-                .lock()
-                .unwrap()
-                .remove(&value["params"]["requestId"].to_string());
-        }
-        if ["item/started", "item/completed"]
-            .iter()
-            .any(|m| value["method"] == *m)
-        {
-            let p = &value["params"];
-            let item = &p["item"];
-            if ["commandExecution", "fileChange"]
-                .iter()
-                .any(|kind| item["type"] == *kind)
-            {
-                let key = json!([p["threadId"], p["turnId"], item["id"]]).to_string();
-                let mut items = self.approval_items.lock().unwrap();
-                items.insert(
-                    key,
-                    json!({"command":item["command"],"cwd":item["cwd"],"changes":item["changes"]}),
-                );
-                while items.len() > 2000 {
-                    items.pop_first();
-                }
-            }
-        }
-        let mut events = self.events.lock().unwrap();
-        events.push_back(value);
-        while events.len() > 2000 {
-            events.pop_front();
-        }
-        drop(events);
         signal_activity();
     }
     fn write(&self, value: Value) -> Result<(), String> {
@@ -313,29 +261,8 @@ impl Client {
             )
         })?
     }
-    pub fn events(&self) -> Vec<Value> {
-        self.events.lock().unwrap().drain(..).collect()
-    }
-    pub fn requests(&self, thread: &str) -> Vec<Value> {
-        self.requests
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|r| r["params"]["threadId"] == thread)
-            .cloned()
-            .collect()
-    }
-    pub fn reply(&self, key: &str, thread: &str, result: Value) -> Result<(), String> {
-        let mut requests = self.requests.lock().unwrap();
-        let request = requests.get(key).ok_or("该请求已失效，请同步状态")?;
-        if request["params"]["threadId"] != thread {
-            return Err("请求不属于当前事项会话".into());
-        }
-        self.write(json!({"id":request["id"],"result":result}))?;
-        requests.remove(key);
-        Ok(())
-    }
 }
+
 pub fn open_thread(thread: &str) -> Result<(), String> {
     uuid::Uuid::parse_str(thread).map_err(|_| "无效会话编号")?;
     #[cfg(not(test))]
