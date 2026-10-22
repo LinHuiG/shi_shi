@@ -31,6 +31,7 @@ Var TestMode
 Var Params
 Var UpdateMode
 Var ProcessShell
+Var ProcessAction
 !define MUI_ICON "${SOURCE}\assets\shishi.ico"
 !define MUI_UNICON "${SOURCE}\assets\shishi.ico"
 !define MUI_ABORTWARNING
@@ -136,7 +137,11 @@ Section "拾事" SEC_MAIN
  ${If} ${RunningX64}
   StrCpy $ProcessShell "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
  ${EndIf}
- nsExec::ExecToStack '"$ProcessShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\shishi-install-process.ps1" -InstallDir "$INSTDIR" -Action Probe'
+ StrCpy $ProcessAction "Probe"
+ ${If} $UpdateMode == "1"
+  StrCpy $ProcessAction "ReleaseHelpers"
+ ${EndIf}
+ nsExec::ExecToStack '"$ProcessShell" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\shishi-install-process.ps1" -InstallDir "$INSTDIR" -Action $ProcessAction'
  Pop $0
  Pop $1
  ${If} $0 == 10

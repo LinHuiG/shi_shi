@@ -1,4 +1,4 @@
-param([string]$OutputDirectory="$PSScriptRoot\build",[string]$CargoHome=$env:CARGO_HOME,[string]$NsisPath)
+param([string]$OutputDirectory="$PSScriptRoot\build",[string]$CargoHome=$env:CARGO_HOME,[string]$NsisPath,[string]$PublishedAt)
 $ErrorActionPreference='Stop'
 $manifest=Get-Content -LiteralPath "$PSScriptRoot\Cargo.toml" -Raw
 $version=[regex]::Match($manifest, '(?m)^version\s*=\s*"(\d+\.\d+\.\d+)"').Groups[1].Value
@@ -7,13 +7,18 @@ if($CargoHome){$env:CARGO_HOME=$CargoHome}
 if(!$NsisPath){$NsisPath=(Get-Command makensis.exe -ErrorAction SilentlyContinue).Source}
 if(!$NsisPath){throw 'Provide -NsisPath pointing to NSIS 3 makensis.exe'}
 $previousBuildNonce=$env:SHISHI_PACKAGE_BUILD_NONCE
+$previousPublishedAt=$env:SHISHI_PACKAGE_PUBLISHED_AT
 try {
  $env:SHISHI_PACKAGE_BUILD_NONCE=[guid]::NewGuid().ToString('N')
+ if($PublishedAt){$env:SHISHI_PACKAGE_PUBLISHED_AT=([DateTimeOffset]::ParseExact($PublishedAt,"yyyy-MM-dd'T'HH:mm:sszzz",[Globalization.CultureInfo]::InvariantCulture).ToUnixTimeSeconds()).ToString()}
+ else{Remove-Item Env:SHISHI_PACKAGE_PUBLISHED_AT -ErrorAction SilentlyContinue}
  & cargo build --package shishi --release --locked --manifest-path "$PSScriptRoot\Cargo.toml"
  if($LASTEXITCODE -ne 0){throw 'Rust build failed'}
 } finally {
  if($null -eq $previousBuildNonce){Remove-Item Env:SHISHI_PACKAGE_BUILD_NONCE -ErrorAction SilentlyContinue}
  else{$env:SHISHI_PACKAGE_BUILD_NONCE=$previousBuildNonce}
+ if($null -eq $previousPublishedAt){Remove-Item Env:SHISHI_PACKAGE_PUBLISHED_AT -ErrorAction SilentlyContinue}
+ else{$env:SHISHI_PACKAGE_PUBLISHED_AT=$previousPublishedAt}
 }
 $metadataText=& cargo metadata --locked --offline --format-version 1 --manifest-path "$PSScriptRoot\Cargo.toml"
 if($LASTEXITCODE -ne 0){throw 'Cannot resolve locked build dependencies'}
@@ -43,6 +48,7 @@ foreach($line in Get-Content -LiteralPath (Join-Path $uiRoot 'manifest.txt')) {
 $ui=[IO.File]::ReadAllText((Join-Path $uiRoot 'index.html')).Replace("`r`n","`n").Replace('<!--STYLES-->',"<style>`n$styles</style>").Replace('/*SCRIPTS*/',$scripts.ToString().TrimEnd())
 [ordered]@{
  version=$version
+ published_at=$PublishedAt
  installer_bytes=(Get-Item -LiteralPath $installer).Length
  executable_bytes=(Get-Item -LiteralPath "$PSScriptRoot/target/release/shishi.exe").Length
  embedded_ui_bytes=[Text.Encoding]::UTF8.GetByteCount($ui)

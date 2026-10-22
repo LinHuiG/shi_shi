@@ -80,6 +80,7 @@ fn prune_helper(parent: &Path, directory: &Path) -> io::Result<()> {
         .map(|entry| entry.map(|e| e.path()))
         .collect::<io::Result<Vec<PathBuf>>>()?;
     const OWNED: &[&str] = &[
+        "release-helpers.ps1",
         "shishi-update.exe",
         "WebView2Loader.dll",
         "plan.json",

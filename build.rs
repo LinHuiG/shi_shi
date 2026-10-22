@@ -8,13 +8,22 @@ include!("src/ui_bundle.rs");
 
 fn main() {
     // Packaging supplies a fresh nonce so even an unchanged source tree gets
-    // a newly compiled timestamp. The timestamp itself always uses this clock.
+    // a newly compiled timestamp. An explicit packaging override supports a
+    // requested publication time without changing ordinary build timestamps.
     println!("cargo:rerun-if-env-changed=SHISHI_PACKAGE_BUILD_NONCE");
+    println!("cargo:rerun-if-env-changed=SHISHI_PACKAGE_PUBLISHED_AT");
     println!("cargo:rerun-if-changed=src");
-    let built = std::time::SystemTime::now()
+    let clock = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let built = env::var("SHISHI_PACKAGE_PUBLISHED_AT")
+        .map(|text| {
+            text.parse::<u64>()
+                .expect("SHISHI_PACKAGE_PUBLISHED_AT must be Unix seconds")
+        })
+        .unwrap_or(clock);
+    assert!(built > 0, "publication time must be positive");
     println!("cargo:rustc-env=SHISHI_BUILD_TIME={built}");
     bundle_ui();
     println!("cargo:rerun-if-changed=assets/shishi.ico");

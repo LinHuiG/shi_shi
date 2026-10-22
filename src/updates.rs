@@ -753,6 +753,7 @@ pub fn helper(path: &Path) -> Result<(), String> {
     let install_dir = p.executable.parent().ok_or("安装目录无效")?;
     let result = (|| {
         verify(&p.installer, &p.package)?;
+        release_helpers(install_dir, path.parent().ok_or("更新助手目录无效")?)?;
         let mut command = Command::new(&p.installer);
         command.args(["/S", "/UPDATE"]);
         // Existing native smoke mode is always isolated and must never touch
@@ -777,29 +778,62 @@ pub fn helper(path: &Path) -> Result<(), String> {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        if !status.success()
-            || !fs::read_to_string(install_dir.join("install-info.txt"))
-                .unwrap_or_default()
-                .starts_with(&format!("Shishi {}\n", p.package.version))
-                && !fs::read_to_string(install_dir.join("install-info.txt"))
-                    .unwrap_or_default()
-                    .starts_with(&format!("Shishi {}\r\n", p.package.version))
-        {
-            return Err("安装未成功完成，保留原数据，请手动重试安装包".into());
+        let installed =
+            fs::read_to_string(install_dir.join("install-info.txt")).unwrap_or_default();
+        let expected = format!("Shishi {}", p.package.version);
+        if !status.success() || installed.lines().next() != Some(expected.as_str()) {
+            return Err(format!("安装未成功完成：安装器退出码 {}，目标版本 {}，当前安装标记 {}。保留原数据，请手动重试安装包。",
+                status.code().map_or_else(||"未知".into(),|n|n.to_string()), p.package.version,
+                installed.lines().next().unwrap_or("未找到")));
         }
         atomic_json(
             &p.data.join("updates/history.json"),
             &json!({"version":p.package.version,"time":now()}),
         )?;
         let _ = fs::remove_file(p.data.join("updates/ready.json"));
+        let _ = fs::remove_file(p.data.join("updates/last-error.json"));
         Ok(())
     })();
+    if let Err(error) = &result {
+        let _ = atomic_json(
+            &p.data.join("updates/last-error.json"),
+            &json!({"time":now(),"version":p.package.version,"error":error}),
+        );
+    }
     Command::new(&p.executable)
         .args(&p.args)
         .creation_flags(0x08000000)
         .spawn()
         .map_err(|e| format!("自动启动失败，请重新打开拾事：{e}"))?;
     result
+}
+
+/// The desktop parent has already exited. Release only its installation's MCP
+/// servers, including those held by an external client; never stop that client.
+fn release_helpers(install_dir: &Path, work: &Path) -> Result<(), String> {
+    let system = std::env::var_os("SystemRoot").ok_or("系统目录不可用")?;
+    let script = work.join("release-helpers.ps1");
+    fs::write(&script, include_str!("../installer/process.ps1")).map_err(|e| e.to_string())?;
+    let mut command =
+        Command::new(PathBuf::from(system).join("System32/WindowsPowerShell/v1.0/powershell.exe"));
+    command
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
+        .arg(&script)
+        .arg("-InstallDir")
+        .arg(install_dir)
+        .args(["-Action", "ReleaseHelpers"]);
+    let result = crate::process::run(command, None, 30, work);
+    let _ = fs::remove_file(script);
+    result.map(|_| ()).map_err(|error| {
+        format!("无法释放升级所需的程序文件。请从托盘退出拾事后重试；不会关闭外部 Codex 或其他安装。详情：{error}")
+    })
 }
 
 #[cfg(test)]
