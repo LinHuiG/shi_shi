@@ -9,7 +9,7 @@ use std::{
 };
 
 fn runtime(kind: &str) -> bool {
-    kind.starts_with("handling_")
+    (kind.starts_with("handling_") || kind.starts_with("tool_call_"))
         || matches!(
             kind,
             "scan"
@@ -44,17 +44,26 @@ fn matches_filter(row: &Value, filter: &str) -> bool {
                     | "ai_rejected"
                     | "generation_failed"
                     | "archive_failed"
-            ) || (kind.starts_with("handling_")
+            ) || ((kind.starts_with("handling_") || kind.starts_with("tool_call_"))
                 && (row["detail"]["error"]
                     .as_str()
                     .is_some_and(|s| !s.is_empty())
                     || matches!(
                         row["detail"]["status"].as_str(),
-                        Some("failed" | "uncertain" | "disconnected")
+                        Some(
+                            "failed"
+                                | "uncertain"
+                                | "disconnected"
+                                | "rejected"
+                                | "nonzero_exit"
+                                | "start_failed"
+                                | "output_error"
+                                | "timed_out"
+                        )
                     )))
         }
         _ => {
-            kind.starts_with("handling_")
+            (kind.starts_with("handling_") || kind.starts_with("tool_call_"))
                 || matches!(
                     kind,
                     "advice_auto_decision"
@@ -79,6 +88,13 @@ fn matches_purpose(row: &Value, purpose: &str) -> bool {
         "analysis" => {
             kind == "classify"
                 || (kind.is_empty() && row["kind"].as_str().is_some_and(|s| s.starts_with("ai_")))
+        }
+        "tool_call" => {
+            kind == "tool_call"
+                || kind == "tool_test"
+                || row["kind"]
+                    .as_str()
+                    .is_some_and(|k| k.starts_with("tool_call_"))
         }
         _ => kind == purpose,
     }
@@ -125,7 +141,19 @@ impl App {
             return Err("日志筛选无效".into());
         }
         let purpose = p["purpose"].as_str().unwrap_or("all");
-        if !["all", "analysis", "message_filter", "report", "archive"].contains(&purpose) {
+        if ![
+            "all",
+            "analysis",
+            "message_filter",
+            "report",
+            "archive",
+            "tool_call",
+            "format",
+            "edit",
+            "tool_test",
+        ]
+        .contains(&purpose)
+        {
             return Err("AI 用途筛选无效".into());
         }
         let page = p["page"].as_u64().unwrap_or(1).clamp(1, 1000) as usize;
@@ -323,6 +351,7 @@ mod tests {
         for day in ["2026-99-01", "2026/10/01", "../state"] {
             assert!(app.activity_query(&json!({"day":day})).is_err());
         }
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
@@ -413,6 +442,7 @@ mod tests {
             kind: "manual_edit".into(),
             task_id: "synthetic-task".into(),
             detail: "合成事项变更".into(),
+            change_summary: String::new(),
             before: json!({"title":"原值"}),
             after: json!({"title":"新值"}),
         });
@@ -477,6 +507,7 @@ mod tests {
             fs::read_to_string(root.join(format!("data/logs/{}.jsonl", date()))).unwrap(),
             lines.join("\n")
         );
+        drop(app);
         fs::remove_dir_all(root).unwrap();
     }
 }

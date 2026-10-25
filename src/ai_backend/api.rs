@@ -5,13 +5,19 @@ use crate::{
 };
 use serde_json::json;
 use shishi_api::{
-    AnalyzeRequest, ApiEvent, ChatCompletionsClient, FnToolHandler, ToolFailure, ToolFailureKind,
+    AnalyzeRequest, ApiEvent, ChatCompletionsClient, ToolFailure, ToolFailureKind, ToolHandler,
     ToolInvocation, ToolResult,
 };
 use std::time::Duration;
 
 pub struct Api;
-fn key(c: &Connection, root: &Path) -> Result<crate::credentials::ResolvedCredential, String> {
+#[cfg(test)]
+#[path = "workflow_tool_tests.rs"]
+mod workflow_tool_tests;
+pub(crate) fn key(
+    c: &Connection,
+    root: &Path,
+) -> Result<crate::credentials::ResolvedCredential, String> {
     CredentialStore::new(crate::storage::data_dir(&root).join("credentials"))
         .resolve(
             c.credential_id.as_deref().unwrap_or(&c.id),
@@ -37,67 +43,114 @@ pub(crate) fn attach_result(value: &mut Value, snapshot: &Value, meter: &Meter) 
     }
 }
 
-impl Backend for Api {
-    fn analyze(
-        &self,
-        c: &Connection,
-        r: AnalysisRequest<'_>,
-        event: &mut dyn FnMut(AnalysisEvent),
-    ) -> Result<(Value, Value), String> {
-        if r.kind == "handling" {
-            return Err("API 不支持处置会话".into());
+struct ApiTools<'a, 'r> {
+    request: &'a AnalysisRequest<'r>,
+    meter: &'a mut Meter,
+}
+impl ToolHandler for ApiTools<'_, '_> {
+    fn invoke(&mut self, call: &ToolInvocation<'_>) -> Result<ToolResult, ToolFailure> {
+        let r = self.request;
+        if r.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(ToolFailure::new(ToolFailureKind::Failed));
         }
-        let client =
-            ChatCompletionsClient::from_base_url(&c.base_url).map_err(|e| e.to_string())?;
-        let secret = key(c, r.root)?;
         let snapshot = &r.payload["_local_context"];
-        // Use the exact declarations that were measured by the application.
-        // Never rebuild a different tool list here.
-        let tools = match r.tools {
-            Some(tools) => {
-                shishi_api::tool_definitions_from_mcp(tools).map_err(|e| e.to_string())?
-            }
-            None => vec![],
+        let result = match call.name() {
+            "read_context" => analysis_context::query(snapshot, self.meter, call.arguments())
+                .map(|text| json!({"content":[{"type":"text","text":text}]})),
+            "read_image" => crate::images::read(snapshot, self.meter, call.arguments()),
+            _ => return Err(ToolFailure::new(ToolFailureKind::Denied)),
         };
-        let mut meter = Meter::default();
-        let mut handler = FnToolHandler(
-            |call: &ToolInvocation<'_>| -> Result<ToolResult, ToolFailure> {
-                if r.cancel.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Err(ToolFailure::new(ToolFailureKind::Failed));
-                }
-                let result = match call.name() {
-                    "read_context" => {
-                        analysis_context::query(snapshot, &mut meter, call.arguments())
-                            .map(|text| json!({"content":[{"type":"text","text":text}]}))
-                    }
-                    "read_image" => crate::images::read(snapshot, &mut meter, call.arguments()),
-                    _ => return Err(ToolFailure::new(ToolFailureKind::Denied)),
-                };
-                // Unavailable records are explicit tool data, not empty success.
-                ToolResult::from_mcp(&result.unwrap_or_else(
-                    |error| json!({"isError":true,"content":[{"type":"text","text":error}]}),
-                ))
-            },
-        );
-        let output = client
+        ToolResult::from_mcp(&result.unwrap_or_else(
+            |error| json!({"isError":true,"content":[{"type":"text","text":error}]}),
+        ))
+    }
+    fn allows_repeated_arguments(&self) -> bool {
+        self.request.registered_tools.is_some()
+    }
+    fn input_char_limit(&self) -> Option<usize> {
+        Some(self.request.config.max_input_chars)
+    }
+    fn validate_batch(&mut self, calls: &[ToolInvocation<'_>]) -> Result<(), ToolFailure> {
+        if let Some(session) = self.request.registered_tools {
+            let registered = calls
+                .iter()
+                .filter(|call| session.contains(call.name()))
+                .copied()
+                .collect::<Vec<_>>();
+            session.check_batch(&registered)?;
+        }
+        Ok(())
+    }
+    fn invoke_guarded(
+        &mut self,
+        call: &ToolInvocation<'_>,
+        cancel: &std::sync::atomic::AtomicBool,
+        deadline: std::time::Instant,
+    ) -> Result<ToolResult, ToolFailure> {
+        if let Some(session) = self
+            .request
+            .registered_tools
+            .filter(|session| session.contains(call.name()))
+        {
+            session.execute(
+                call.name(),
+                call.call_id(),
+                call.arguments(),
+                cancel,
+                deadline,
+            )
+        } else {
+            self.invoke(call)
+        }
+    }
+}
+
+/// Shared SS tool loop for HTTP APIs and plain model adapters.
+pub(crate) fn analyze_client(
+    r: &AnalysisRequest<'_>,
+    event: &mut dyn FnMut(AnalysisEvent),
+    client: &ChatCompletionsClient<'_>,
+    secret: &str,
+    stream: bool,
+    native_stream_events: bool,
+) -> Result<(Value, Value), String> {
+    let snapshot = &r.payload["_local_context"];
+    // Use the exact declarations that were measured by the application.
+    // Never rebuild a different tool list here.
+    let tools = match r.tools {
+        Some(tools) => shishi_api::tool_definitions_from_mcp(tools).map_err(|e| e.to_string())?,
+        None => vec![],
+    };
+    let mut meter = Meter::default();
+    let mut handler = ApiTools {
+        request: r,
+        meter: &mut meter,
+    };
+    let output = client
             .analyze_with_events(AnalyzeRequest {
                 model: &r.config.model,
                 reasoning_effort: (!r.config.reasoning_effort.is_empty())
                     .then_some(r.config.reasoning_effort.as_str()),
                 prompt: r.prompt,
                 schema: r.schema,
-                credential: secret.expose_secret(),
+                credential: secret,
                 cancel: r.cancel,
                 timeout: Duration::from_secs(r.config.ai_timeout_seconds),
                 tools: &tools,
                 tool_handler: Some(&mut handler),
-            }, c.stream, &mut |e| match e {
+            }, stream, &mut |e| match e {
                 ApiEvent::Phase(phase) => event(AnalysisEvent::Stream{kind:"phase".into(),text:phase.into(),append:false}),
-                ApiEvent::Text{kind,text,append} => event(AnalysisEvent::Stream{kind:kind.into(),text,append}),
-                ApiEvent::OutputTokens(count) => event(AnalysisEvent::OutputTokens(count)),
-                ApiEvent::StepFinished{output_tokens,decode_ms} => event(AnalysisEvent::StepFinished{output_tokens,decode_ms}),
-                ApiEvent::Response(value) => record_response(r.trace,value,secret.expose_secret(),r.config.retain_ai_traces,false),
-                ApiEvent::ToolRejected(value) => record_response(r.trace,value,secret.expose_secret(),r.config.retain_ai_traces,true),
+                ApiEvent::Text{kind,text,append} if native_stream_events => event(AnalysisEvent::Stream{kind:kind.into(),text,append}),
+                ApiEvent::OutputTokens(count) if native_stream_events => event(AnalysisEvent::OutputTokens(count)),
+                ApiEvent::StepFinished{output_tokens,decode_ms} if native_stream_events => event(AnalysisEvent::StepFinished{output_tokens,decode_ms}),
+                ApiEvent::Response(value) => record_response(r.trace,value,secret,r.config.retain_ai_traces,false),
+                ApiEvent::ToolRejected(value) => {
+                    if let Some(session) = r.registered_tools {
+                        if let Err(error) = session.record_rejection(&value) { event(AnalysisEvent::Stream{kind:"diagnostic".into(),text:error,append:false}); }
+                    }
+                    record_response(r.trace,value,secret,r.config.retain_ai_traces,true);
+                },
+                _ => {},
             })
             .map_err(|e| {
                 if let Some(u) = e.usage() {
@@ -105,6 +158,8 @@ impl Backend for Api {
                 }
                 if e.kind() == shishi_api::ApiErrorKind::Cancelled {
                     crate::ai_control::CANCELLED.into()
+                } else if e.kind() == shishi_api::ApiErrorKind::InputLimit {
+                    format!("{}：工具续轮超过全局输入预算，已停止；已执行的工具不会重放", crate::ai::INPUT_LIMIT_ERROR)
                 } else {
                     let guidance = match e.kind() {
                         shishi_api::ApiErrorKind::HttpStatus if matches!(e.status(),Some(400|422)) => "；供应商拒绝请求参数，请核对模型、推理强度、工具及结构化输出支持。未自动丢弃参数，未应用本次结果",
@@ -119,16 +174,32 @@ impl Backend for Api {
                     format!("API 分析失败：{e}{parameter}{guidance}")
                 }
             })?;
-        let usage = json!({"input_tokens":output.usage.prompt_tokens,"output_tokens":output.usage.completion_tokens,
+    let usage = json!({"input_tokens":output.usage.prompt_tokens,"output_tokens":output.usage.completion_tokens,
             "cached_input_tokens":output.usage.cached_tokens,"total_tokens":output.usage.total_tokens});
-        event(AnalysisEvent::Usage(usage.clone()));
-        let mut value = output.value;
-        if r.config.retain_ai_traces {
-            std::fs::write(r.trace.join("output.txt"), value.to_string())
-                .map_err(|e| format!("分析结果跟踪保存失败：{e}"))?;
+    event(AnalysisEvent::Usage(usage.clone()));
+    let mut value = output.value;
+    if r.config.retain_ai_traces {
+        std::fs::write(r.trace.join("output.txt"), value.to_string())
+            .map_err(|e| format!("分析结果跟踪保存失败：{e}"))?;
+    }
+    attach_result(&mut value, snapshot, &meter);
+    Ok((value, usage))
+}
+
+impl Backend for Api {
+    fn analyze(
+        &self,
+        c: &Connection,
+        r: AnalysisRequest<'_>,
+        event: &mut dyn FnMut(AnalysisEvent),
+    ) -> Result<(Value, Value), String> {
+        if r.kind == "handling" {
+            return Err("API 不支持处置会话".into());
         }
-        attach_result(&mut value, snapshot, &meter);
-        Ok((value, usage))
+        let client =
+            ChatCompletionsClient::from_base_url(&c.base_url).map_err(|e| e.to_string())?;
+        let secret = key(c, r.root)?;
+        analyze_client(&r, event, &client, secret.expose_secret(), c.stream, true)
     }
     fn models(&self, c: &Connection, root: &Path) -> Result<Value, String> {
         models_with_key(c, root, None)
@@ -178,7 +249,13 @@ pub fn models_with_key(c: &Connection, root: &Path, draft: Option<&str>) -> Resu
     )
 }
 
-fn record_response(trace: &Path, mut value: Value, secret: &str, retain: bool, failed: bool) {
+pub(crate) fn record_response(
+    trace: &Path,
+    mut value: Value,
+    secret: &str,
+    retain: bool,
+    failed: bool,
+) {
     if !retain {
         return;
     }

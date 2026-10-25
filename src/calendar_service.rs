@@ -110,6 +110,7 @@ impl App {
         let purpose = match kind {
             "archive" => AiPurpose::Archive,
             "handling" => AiPurpose::Handling,
+            "tool_call" => AiPurpose::ToolCall,
             "format" => AiPurpose::Format,
             "edit" => AiPurpose::Edit,
             "schedule" => AiPurpose::Schedule,

@@ -39,6 +39,13 @@ pub struct OwnedChild {
     pub child: std::process::Child,
     job: usize,
 }
+impl OwnedChild {
+    pub fn terminate(&self) {
+        unsafe {
+            TerminateJobObject(self.job as _, 1);
+        }
+    }
+}
 impl Drop for OwnedChild {
     fn drop(&mut self) {
         let mut jobs = JOBS.lock().unwrap();
@@ -289,7 +296,10 @@ mod cancellation_tests {
         let flag = AtomicBool::new(false);
         let mut cmd = Command::new("powershell.exe");
         cmd.args(["-NoProfile", "-NonInteractive", "-Command",
-            "$p=Start-Process powershell.exe -WindowStyle Hidden -PassThru -ArgumentList '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30'; Write-Output $p.Id; Start-Sleep -Seconds 30"]);
+            // ShellExecute/Start-Process can block in desktop shell integrations
+            // before emitting the PID. Launch the synthetic child directly so
+            // this fixture measures our owned job and cancellation deadline.
+            "$p=[Diagnostics.Process]::new(); $p.StartInfo.FileName='powershell.exe'; $p.StartInfo.Arguments='-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30'; $p.StartInfo.UseShellExecute=$false; $p.StartInfo.CreateNoWindow=$true; [void]$p.Start(); [Console]::WriteLine($p.Id); Start-Sleep -Seconds 30"]);
         let mut descendant = std::ptr::null_mut();
         let start = Instant::now();
         let result = run_cancellable(

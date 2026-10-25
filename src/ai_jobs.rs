@@ -14,6 +14,7 @@ pub fn allowed(method: &str) -> bool {
     matches!(
         method,
         "scan"
+            | "tool_test"
             | "analyze"
             | "format"
             | "schedule_format"

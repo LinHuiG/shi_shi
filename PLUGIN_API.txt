@@ -3,13 +3,26 @@
 目录与依赖
 插件是独立的动态库项目。主程序只认识本协议和统一消息模型；适配某软件的名称、路径规则、数据库结构、解码代码、依赖资源和迁移逻辑都属于插件。
 安装包至少包含 plugin.json 和一个 DLL。可以压成 ZIP，用户在界面直接安装；plugin.json 可位于 ZIP 根目录或第一层包目录内，但 ZIP 只能含一个插件描述。只复制 manifest.files 中声明的资源，不允许绝对路径、上级目录、重解析点或链接。宿主不预装或自动加载任何插件。只加载用户在界面安装到 data/plugins/<id> 的包，旧版可执行文件旁的 plugins 目录不再自动加载。
-消息来源页面的安装区域同时支持点击选择和拖入 ZIP。每个插件可开启、停用或卸载；停用不调用插件接口，卸载会保留来源配置、消息和事项，并停用关联来源。重新安装后需按需启用来源。安装阶段仅校验描述与文件，不加载 DLL。打开配置页面自动调用 discover，单一候选自动填入全部配置；保存配置时调用 validate，启用来源后调用读取接口。插件的静态初始化不得读取数据、创建线程或要求完整配置。
+消息来源页面的安装区域同时支持点击选择和拖入 ZIP。插件只管理安装与卸载；采集由接入源开关控制，没有启用来源时不运行采集。卸载会保留来源配置、消息和事项，并停用关联来源。重新安装后需按需启用来源。安装阶段仅校验描述与文件，不加载 DLL。普通配置表单自动调用 discover，单一候选自动填入全部配置；自定义配置页面直接加载，由页面决定何时发现账号。启用来源前宿主调用 validate，启用后调用读取接口。插件的静态初始化不得读取数据、创建线程或要求完整配置。
 
 plugin.json
-参见 examples/json-source/plugin.json。必需字段：id、name、version、api_version=1、entrypoint（相对DLL路径）、files、capabilities、config_fields。
+参见 examples/json-source/plugin.json。必需字段：id、name、version、api_version=1、entrypoint（相对DLL路径）、files、capabilities。config_fields 可省略，默认空列表。
 id及配置字段key只允许字母、数字、短横线和下划线，1–64字符。
 配置字段：key、label、type（file/directory/text/password）、required、description。宿主据此生成表单，支持文件和目录选择。password只遮挡UI显示，配置保存在用户的本地data中，插件不要返回不必要的凭据。
 插件必须提供 discover、validate、fetch_incremental、fetch_range、lookup_messages；可选 import_legacy。
+
+页面内配置（主程序1.2.2起，可选）
+settings={"api_version":1,"entrypoint":"settings.html","methods":["ui_load","ui_validate"]}，HTML必须列入files，最多2 MiB，方法名最多32个且不重复。
+声明settings时直接在同一来源编辑页加载HTML，不先调用discover、不打开独立窗口。页面自行加载当前配置（新来源可能为空）、发现账号和展示错误；宿主管理来源名称，在标题右侧提供来源开关，不再展示名称输入框。
+window.shishiPlugin.call(method,params={})返回Promise；只允许声明的方法。complete(config)完成字段检查、来源校验和持久保存后resolve并关页；失败reject且保留页面可重试，无须再点击第二次保存。cancel()直接离开；已由插件明确保存的文件不会回滚，保存来源期间不能取消。
+主程序1.2.2起可选调用await shishiPlugin.suggestSourceName?.(name)，建议1–100字的来源名称。仅填入默认或空白名称草稿，同一编辑期间可更新前次建议；已有自定义名称不覆盖。返回true表示已填入，false表示保留现值；只有complete时才保存。
+可选setDirty(boolean)报告实际配置草稿是否变化，搜索/筛选/滚动不算修改；返回Promise<boolean>表示是否接收。宿主只在启用及插件配置均未修改时允许点击应用内配置页外关闭，保存或选择路径期间不关闭；旧插件的输入事件保守标记修改。complete失败应维持修改状态，取消不提交。
+主程序1.2.2起可选pickPath({kind:'file'|'directory',title,defaultPath,filters:[{name,extensions:['exe']}]})，通过宿主原生对话框选择路径，返回Promise<string|null>；取消返回null，不改变草稿、不保存。仅当前页面会话可调用。
+可选setContentHeight(number|null)返回Promise<boolean>，传入自然内容高度（含内边距和底部操作），宿主按可用窗口限制配置页高度；null恢复填满可用空间。不得把iframe当前视口高度作为内容高度上报；重复值应去重，仅在内容或宽度变化时更新。
+页面只支持内联脚本、内联样式及data图片，不能访问宿主DOM、网络或任意文件；本机能力通过call提供。
+DLL另外导出uint8_t *shishi_plugin_settings_call(const uint8_t *input,size_t input_len,size_t *output_len,uint32_t (*cancelled)(uintptr_t),uintptr_t context)。输出仍用shishi_plugin_free释放，仍须shishi_plugin_abi()==1。
+配置请求context含plugin_dir和timeout_ms=90000；config在打开会话时固定。取消回调与context只在调用期间有效。宿主使用无窗口辅助进程，取消或95秒超时后终止；请求最多2 MiB，响应最多32 MiB。普通采集接口的进程内约定保持不变。
+宿主不导出SQLite ABI或共享sqlite3.dll；来源解密与数据库依赖由插件负责。完整教程见docs/PLUGINS.md。
 
 C ABI（禁止跨 DLL 传 Rust String/Vec/trait 对象）
 uint32_t shishi_plugin_abi(void); // 返回1

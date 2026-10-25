@@ -431,7 +431,16 @@ fn stderr_is_bounded_and_not_forwarded() {
     let dir = temp_dir("stderr");
     let client = mock_client("stderr", PermissionPolicy::DenyAll);
     client.initialize(Duration::from_secs(5)).unwrap();
-    let snapshot = client.stderr_snapshot();
+    // The initialize reply arrives on stdout; it is not a barrier for the
+    // independent stderr reader. Wait for that reader before checking bounds.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let snapshot = loop {
+        let snapshot = client.stderr_snapshot();
+        if snapshot.total_lines >= 100 || std::time::Instant::now() >= deadline {
+            break snapshot;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
     assert!(snapshot.total_lines >= 100);
     assert!(snapshot.lines.len() <= 4);
     assert!(snapshot.lines.iter().all(|line| line.len() <= 64));
@@ -537,6 +546,7 @@ fn analysis_accepts_only_submit_mcp_result() {
     let client = AcpClient::spawn(&launch, PermissionPolicy::Surface).unwrap();
     client.initialize(Duration::from_secs(5)).unwrap();
     let spec = AnalysisSpec {
+        images: vec![],
         request_id: "analysis-1".into(),
         kind: "edit".into(),
         schema: json!({
@@ -594,6 +604,7 @@ fn analysis_invalid_submit_is_not_success() {
     let client = AcpClient::spawn(&launch, PermissionPolicy::Surface).unwrap();
     client.initialize(Duration::from_secs(5)).unwrap();
     let spec = AnalysisSpec {
+        images: vec![],
         request_id: "analysis-invalid-1".into(),
         kind: "edit".into(),
         schema: json!({
@@ -634,6 +645,7 @@ fn analysis_cancelled_prompt_is_not_success_even_with_result() {
     let client = mock_client("submit-cancel", PermissionPolicy::Surface);
     client.initialize(Duration::from_secs(5)).unwrap();
     let spec = AnalysisSpec {
+        images: vec![],
         request_id: "analysis-cancel-1".into(),
         kind: "edit".into(),
         schema: json!({
@@ -674,6 +686,7 @@ fn analysis_missing_submit_result_fails() {
     let client = mock_client("missing", PermissionPolicy::Surface);
     client.initialize(Duration::from_secs(5)).unwrap();
     let spec = AnalysisSpec {
+        images: vec![],
         request_id: "analysis-2".into(),
         kind: "edit".into(),
         schema: json!({

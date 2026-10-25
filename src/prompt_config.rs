@@ -20,11 +20,14 @@ fn merge(base: &mut Catalog, text: &str) -> Result<(), String> {
         // must not silently redefine the tools' actual security constraints.
         if [
             "handling_boundary",
+            "tool_call_protocol",
+            "model_api_protocol",
             "tags",
             "context",
             "memory",
             "policy_boundary",
             "memory_io",
+            "notification_summary",
             "archive_permissions",
             "images",
             "concise",
@@ -87,6 +90,10 @@ mod tests {
             "schedule",
             "handling",
             "handling_boundary",
+            "tool_call",
+            "tool_call_protocol",
+            "model_api_protocol",
+            "tool_maker",
             "prompt_review",
             "learning",
             "report",
@@ -97,6 +104,7 @@ mod tests {
             "memory",
             "policy_boundary",
             "memory_io",
+            "notification_summary",
             "archive_permissions",
             "images",
             "concise",
@@ -112,6 +120,8 @@ mod tests {
             r#"{"classify":""}"#,
             r#"{"unknown":"rule"}"#,
             r#"{"handling_boundary":"override"}"#,
+            r#"{"tool_call_protocol":"override"}"#,
+            r#"{"notification_summary":"override"}"#,
             "[]",
         ] {
             assert!(merge(&mut base, invalid).is_err());

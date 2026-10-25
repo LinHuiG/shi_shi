@@ -56,7 +56,7 @@ fn minimal(schema: &Value) -> Value {
         "array" => json!((0..schema["minItems"].as_u64().unwrap_or(0))
             .map(|_| minimal(&schema["items"]))
             .collect::<Vec<_>>()),
-        "string" => json!(""),
+        "string" => json!("x".repeat(schema["minLength"].as_u64().unwrap_or(0).min(1000) as usize)),
         "boolean" => json!(false),
         "integer" | "number" => json!(schema["minimum"].as_i64().unwrap_or(0)),
         _ => Value::Null,
@@ -120,6 +120,19 @@ fn model(config: &Config, c: &ai_backend::Connection) -> Result<(String, String)
 fn save(path: &Path, report: &Value) -> Result<(), String> {
     fs::write(path, serde_json::to_vec_pretty(report).unwrap()).map_err(|e| e.to_string())
 }
+fn configured_connection(
+    connections: &[ai_backend::Connection],
+    driver: &str,
+) -> Result<ai_backend::Connection, String> {
+    connections
+        .iter()
+        .find(|c| {
+            c.driver == driver
+                && (driver != "codex" || (!c.executable.trim().is_empty() && !c.models.is_empty()))
+        })
+        .cloned()
+        .ok_or(format!("Missing configured {driver} source"))
+}
 fn analysis_route(config: &Config) -> Result<(ai_backend::Connection, String, String), String> {
     let configured = config.for_kind("classify");
     let connection = ai_backend::connection(&configured)?;
@@ -172,11 +185,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .replace('\\', "/"),
     );
     crate::storage::initialize(&source)?;
-    let saved: SettingsOnly = serde_json::from_slice(
-        &fs::read(crate::storage::data_dir(&source).join("state.json"))
-            .map_err(|e| e.to_string())?,
-    )
-    .map_err(|_| "Saved connection configuration cannot be read")?;
+    let saved = SettingsOnly {
+        config: crate::managed_data::load_state(&source)?.config,
+    };
     let _credential_cleanup =
         CredentialCleanup(crate::storage::data_dir(&root).join("credentials"));
     let mut connections = saved.config.ai_connections.clone();
@@ -208,6 +219,11 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "--use-analysis-route requires --only-source api --only-scenario classify".into(),
         );
     }
+    if scenario_filter.map(String::as_str) == Some("tool_call")
+        && filter.map(String::as_str) != Some("codex")
+    {
+        return Err("The single tool probe requires --only-source codex".into());
+    }
     for driver in ["codex", "dsh", "api"] {
         if filter.is_some_and(|v| v != driver) {
             continue;
@@ -215,11 +231,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
         let selection = if use_analysis_route {
             analysis_route(&saved.config).map(|route| route.0)
         } else {
-            connections
-                .iter()
-                .find(|c| c.driver == driver)
-                .cloned()
-                .ok_or(format!("Missing configured {driver} source"))
+            configured_connection(&connections, driver)
         };
         let mut c = match selection {
             Ok(c) => c,
@@ -291,7 +303,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "handling_learning",
             "advice_revision",
             "handling",
+            "tool_call",
         ] {
+            // A tool probe is an explicit, single-request diagnostic, not an
+            // addition to the default provider matrix.
+            if kind == "tool_call" && scenario_filter.is_none() {
+                continue;
+            }
             if scenario_filter.is_some_and(|v| v != kind) {
                 continue;
             }
@@ -299,6 +317,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             let trace = root.join(format!("{driver}-{kind}"));
             fs::create_dir_all(&trace).map_err(|e| e.to_string())?;
             let outcome = (|| -> Result<Value, String> {
+                if kind == "tool_call" {
+                    return tool_probe(&root, &c, &config, &trace);
+                }
                 if kind == "handling" {
                     if driver == "api" {
                         let schema = json!({});
@@ -307,6 +328,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                             &c,
                             AnalysisRequest {
                                 show_session: false,
+                                registered_tools: None,
                                 config: &config,
                                 kind,
                                 payload: &json!({}),
@@ -416,6 +438,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     &c,
                     AnalysisRequest {
                         show_session: false,
+                        registered_tools: None,
                         config: &config,
                         kind,
                         payload: &payload,
@@ -485,6 +508,96 @@ pub fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn tool_probe(
+    root: &Path,
+    connection: &ai_backend::Connection,
+    config: &Config,
+    trace: &Path,
+) -> Result<Value, String> {
+    use crate::{
+        engine::App,
+        tool_calling::ToolSession,
+        tool_registry::{Parameter, ToolDefinition},
+    };
+    let app = App::load(root.join("synthetic-tool-state"))?;
+    let tool = ToolDefinition {
+        id: "synthetic-echo".into(),
+        name: "ss_echo".into(),
+        description: "Echo a synthetic string through SS.".into(),
+        command_template: "echo {{text}}".into(),
+        parameters: vec![Parameter {
+            name: "text".into(),
+            description: "String to echo".into(),
+            ..Default::default()
+        }],
+        enabled: true,
+        ..Default::default()
+    };
+    app.state.lock().unwrap().config.tools = vec![tool.clone()];
+    let mut config = config.clone();
+    config.ai_timeout_seconds = 120;
+    let cancel = AtomicBool::new(false);
+    let session = ToolSession::new(
+        &app,
+        "synthetic-tool-probe",
+        "tool_call",
+        "",
+        vec![tool.clone()],
+        &config,
+        0,
+    );
+    let tools = json!({"tools":[{"name":tool.name,"description":tool.description,"inputSchema":tool.schema()}]});
+    let schema = json!({"type":"object","additionalProperties":false,"properties":{"answer":{"type":"string"}},"required":["answer"]});
+    let prompt = format!(
+        "Call ss_echo exactly once with text SS_TOOL_OK. Return {{\"answer\":\"SS_TOOL_OK\"}} from its stdout. No other tools.\n{}",
+        crate::prompt_config::get("tool_call_protocol")
+    );
+    let payload = json!({});
+    let result = ai_backend::backend(connection)?.analyze(
+        connection,
+        AnalysisRequest {
+            show_session: false,
+            registered_tools: Some(&session),
+            config: &config,
+            kind: "tool_call",
+            payload: &payload,
+            root,
+            trace,
+            prompt: &prompt,
+            schema: &schema,
+            tools: Some(&tools),
+            cancel: &cancel,
+        },
+        &mut |_| {},
+    );
+    session.finish(result.as_ref().err().map(String::as_str), &Value::Null)?;
+    let (value, usage) = result?;
+    let raw: Value = serde_json::from_slice(
+        &fs::read(trace.join("output.txt")).map_err(|_| "Tool probe output trace missing")?,
+    )
+    .map_err(|_| "Tool probe output trace invalid")?;
+    shishi_acp::schema_validate::validate(&schema, &raw)
+        .map_err(|_| "Tool probe final result failed its schema")?;
+    let state = app.state.lock().unwrap();
+    let calls = state
+        .tool_runs
+        .iter()
+        .flat_map(|run| &run.calls)
+        .collect::<Vec<_>>();
+    if value["answer"] != "SS_TOOL_OK"
+        || calls.len() != 1
+        || calls[0].arguments != json!({"text":"SS_TOOL_OK"})
+        || calls[0].result.as_ref().is_none_or(|r| {
+            r.status != "completed" || r.exit_code != Some(0) || r.stdout.trim() != "\"SS_TOOL_OK\""
+        })
+    {
+        return Err("The single SS-executed tool call did not match the synthetic result".into());
+    }
+    Ok(
+        json!({"usage":usage,"calls":1,"ss_executed":true,"stdout":calls[0].result.as_ref().unwrap().stdout,"structured_result":true}),
+    )
+}
+
 fn desktop_handling(
     root: &Path,
     connection: &ai_backend::Connection,
@@ -546,6 +659,20 @@ fn desktop_handling(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blank_default_codex_slot_does_not_hide_a_configured_connection() {
+        let configured = ai_backend::Connection {
+            id: "synthetic-codex".into(),
+            executable: "synthetic.exe".into(),
+            models: vec![json!({"model":"configured-model"})],
+            ..Default::default()
+        };
+        assert_eq!(
+            configured_connection(&[Default::default(), configured.clone()], "codex").unwrap(),
+            configured
+        );
+        assert!(configured_connection(&[Default::default()], "codex").is_err());
+    }
     #[test]
     fn analysis_probe_uses_exact_saved_route_and_never_falls_back() {
         let mut config = Config::default();

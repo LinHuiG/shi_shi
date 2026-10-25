@@ -87,7 +87,7 @@ fn complete_copy_preserves_bytes_history_and_paths_and_reports_byte_progress() {
     fs::write(f.source.join("large.bin"), vec![87u8; 3 * 1024 * 1024 + 17]).unwrap();
     fs::write(f.source.join("webview/locked.bin"), b"ephemeral cache").unwrap();
     fs::write(f.source.join("tmp/synthetic.tmp"), b"temporary").unwrap();
-    let before = fs::read(f.source.join("state.json")).unwrap();
+    let before = json!(crate::managed_data::load_from_directory(&f.source).unwrap());
     let plan = f.plan(true);
     let events = Mutex::new(vec![]);
     let _source = lock_source(&plan.source).unwrap();
@@ -96,8 +96,14 @@ fn complete_copy_preserves_bytes_history_and_paths_and_reports_byte_progress() {
         fs::read(f.dest.join("large.bin")).unwrap(),
         fs::read(f.source.join("large.bin")).unwrap()
     );
-    assert_eq!(fs::read(f.dest.join("state.json")).unwrap(), before);
-    assert_eq!(fs::read(f.source.join("state.json")).unwrap(), before);
+    assert_eq!(
+        json!(crate::managed_data::load_from_directory(&f.dest).unwrap()),
+        before
+    );
+    assert_eq!(
+        json!(crate::managed_data::load_from_directory(&f.source).unwrap()),
+        before
+    );
     assert!(f.dest.join("empty-child").is_dir());
     assert!(f.dest.join("plugins/synthetic/payload.dll").is_file());
     assert!(!f.dest.join("webview").exists());
@@ -129,11 +135,14 @@ fn complete_copy_preserves_bytes_history_and_paths_and_reports_byte_progress() {
 #[test]
 fn switch_without_copy_uses_new_or_existing_data_and_atomically_replaces_locator() {
     let mut f = Fixture::new();
-    let before = fs::read(f.source.join("state.json")).unwrap();
+    let before = json!(crate::managed_data::load_from_directory(&f.source).unwrap());
     transfer(&f.plan(false), |_| {}).unwrap();
     let app = App::load(f.root.clone()).unwrap();
     assert!(app.state.lock().unwrap().tasks.is_empty());
-    assert_eq!(fs::read(f.source.join("state.json")).unwrap(), before);
+    assert_eq!(
+        json!(crate::managed_data::load_from_directory(&f.source).unwrap()),
+        before
+    );
     let existing = f.base.join("existing");
     fs::create_dir(&existing).unwrap();
     let state = State {
@@ -141,7 +150,8 @@ fn switch_without_copy_uses_new_or_existing_data_and_atomically_replaces_locator
             id: "existing-synthetic-task".into(),
             title: "Existing retained task".into(),
             ..Default::default()
-        }],
+        }]
+        .into(),
         ..Default::default()
     };
     fs::write(
@@ -156,7 +166,10 @@ fn switch_without_copy_uses_new_or_existing_data_and_atomically_replaces_locator
         reloaded.state.lock().unwrap().tasks[0].title,
         "Existing retained task"
     );
-    assert_eq!(fs::read(f.source.join("state.json")).unwrap(), before);
+    assert_eq!(
+        json!(crate::managed_data::load_from_directory(&f.source).unwrap()),
+        before
+    );
 }
 
 #[test]
@@ -191,7 +204,7 @@ fn source_changes_and_copy_errors_preserve_the_original_locator() {
     .unwrap_err();
     assert!(error.contains("源目录"));
     assert!(!f.root.join(LOCATOR).exists());
-    assert!(f.source.join("state.json").is_file());
+    assert!(f.source.join(crate::state_store::FILE).is_file());
     let other = Fixture::new();
     fs::write(other.source.join("payload.txt"), b"keep source").unwrap();
     let plan = other.plan(true);
@@ -250,7 +263,7 @@ fn external_managed_data_cleanup_is_scoped_to_configured_directory() {
         .any(|e| e.relative == "data/state.json"));
     crate::managed_data::cleanup(&f.root, &inspection).unwrap();
     assert!(f.dest.join("legacy").is_dir());
-    assert!(f.source.join("state.json").is_file());
+    assert!(f.source.join(crate::state_store::FILE).is_file());
     assert_eq!(fs::read(unrelated).unwrap(), b"keep unrelated");
 }
 
@@ -261,11 +274,10 @@ fn only_managed_absolute_ai_workdir_is_rebased_and_no_setting_is_removed() {
     fs::create_dir_all(&old).unwrap();
     let mut state = crate::managed_data::load_state(&f.root).unwrap();
     state.config.analysis_workdir = old.to_string_lossy().into();
-    fs::write(
-        f.source.join("state.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    crate::state_store::Store::open(&f.source)
+        .unwrap()
+        .save(&state)
+        .unwrap();
     transfer(&f.plan(true), |_| {}).unwrap();
     let app = App::load(f.root.clone()).unwrap();
     assert_eq!(
@@ -277,11 +289,10 @@ fn only_managed_absolute_ai_workdir_is_rebased_and_no_setting_is_removed() {
     let external = outside.base.join("external-workspace");
     let mut state = crate::managed_data::load_state(&outside.root).unwrap();
     state.config.analysis_workdir = external.to_string_lossy().into();
-    fs::write(
-        outside.source.join("state.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    crate::state_store::Store::open(&outside.source)
+        .unwrap()
+        .save(&state)
+        .unwrap();
     transfer(&outside.plan(true), |_| {}).unwrap();
     assert_eq!(
         App::load(outside.root.clone())
@@ -310,11 +321,10 @@ fn copied_plugin_paths_are_rebased_by_declared_field_type() {
         config: json!({"file":local,"note":local}),
         ..Default::default()
     });
-    fs::write(
-        f.source.join("state.json"),
-        serde_json::to_vec(&state).unwrap(),
-    )
-    .unwrap();
+    crate::state_store::Store::open(&f.source)
+        .unwrap()
+        .save(&state)
+        .unwrap();
     transfer(&f.plan(true), |_| {}).unwrap();
     let app = App::load(f.root.clone()).unwrap();
     let state = app.state.lock().unwrap();

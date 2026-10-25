@@ -20,6 +20,7 @@ mod context_mcp;
 mod desktop_bridge;
 mod engine;
 mod evolution;
+mod file_picker;
 mod handling;
 mod handling_preview;
 mod holiday;
@@ -31,17 +32,25 @@ mod message_progress;
 mod messages;
 mod model;
 mod native_dialog;
+mod plugin_settings;
 mod plugins;
 mod process;
 mod prompt_config;
 mod prompts;
 mod retention;
 mod schedule;
+mod shared;
 mod snapshots;
 mod sources;
+mod state_store;
 mod storage;
 mod tags;
 mod task_history;
+mod task_notifications;
+mod tool_bridge;
+mod tool_calling;
+mod tool_registry;
+mod tool_runner;
 mod tray;
 mod ui_bundle;
 mod ui_refresh;
@@ -78,6 +87,8 @@ use work_hours::AiMode;
 use wry::{WebContext, WebViewBuilder, WebViewBuilderExtWindows};
 #[derive(Debug)]
 enum UiEvent {
+    NoticeCommand(task_notifications::Command),
+    NoticeOpened(String),
     StorageExit,
     Reply(Value),
     ApprovalCommand(Value),
@@ -100,6 +111,16 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
     }
     let p = &v["params"];
     match v["method"].as_str().unwrap_or("") {
+        "tool_list" => Ok(app.tool_list()),
+        "tool_making_prompt" => app.tool_making_prompt(p),
+        "tool_save" => app.tool_save(p),
+        "tool_toggle" => app.tool_toggle(p),
+        "tool_delete" => app.tool_delete(p),
+        "tool_command_preview" => app.tool_command_preview(p),
+        "tool_test" => app.tool_test(p),
+        "tool_test_cancel" => Ok(app.tool_test_cancel(p)),
+        "tool_run_get" => app.tool_run_get(p),
+        "tool_run_history" => app.tool_run_history(p),
         "state" => Ok(if p.get("sections").is_some() {
             app.snapshot_sections(p.get("sections"))
         } else {
@@ -117,7 +138,7 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         "advice_feedback" => app.advice_feedback(p),
         "messages_delete" => app.delete_messages(p),
         "messages_query" => app.query_messages(p),
-        "plugin_toggle" => app.plugin_toggle(p),
+        "source_toggle" => app.source_toggle(p),
         "plugin_uninstall" => app.plugin_uninstall(p),
         "handling_prepare" => app.handling_prepare(p["task_id"].as_str().unwrap_or("")),
         "handling_projects" => app.handling_projects(),
@@ -129,8 +150,7 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         "handling_reconnect" => app.handling_reconnect(p),
         "handling_reset_setup" => app.handling_reset_setup(p),
         "handling_terminate" => app.handling_terminate(p),
-        "handling_history" => Ok(app.handling_history()),
-        "handling_policy_save" => app.handling_policy_save(p),
+        "handling_adopt" => app.handling_adopt(p),
         "handling_learn" => app.handling_learn(),
         "handling_audit" => app.handling_audit(p["task_id"].as_str().unwrap_or("")),
         "handling_open" => {
@@ -177,6 +197,7 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
                 .ok_or("请选择插件 ZIP 包或 plugin.json")?,
         ),
         "source_discover" => app.source_discover(p),
+        "plugin_settings" => crate::plugin_settings::dispatch(app, p),
         "source_save" => app.source_save(p),
         "source_remove" => app.source_remove(p),
         "source_range" => app.source_range(p),
@@ -193,7 +214,7 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         ),
         "prompt_retry" => app.retry_prompt_review(p["id"].as_str().unwrap_or("")),
         "prompts" => Ok(
-            json!({"classify":ai::default_policy("classify"),"format":ai::default_policy("format"),"learning":ai::default_policy("learning"),"report":ai::default_policy("report"),"handling":ai::default_policy("handling"),"prompt_review":ai::default_policy("prompt_review"),"archive":ai::default_policy("archive")}),
+            json!({"tool_call":ai::default_policy("tool_call"),"classify":ai::default_policy("classify"),"format":ai::default_policy("format"),"learning":ai::default_policy("learning"),"report":ai::default_policy("report"),"handling":ai::default_policy("handling"),"prompt_review":ai::default_policy("prompt_review"),"archive":ai::default_policy("archive")}),
         ),
         "ai_trace" => {
             let id = p["id"].as_str().ok_or("缺少调用编号")?;
@@ -307,19 +328,7 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         "archive_task" => app.archive_task(p),
         "learn" => app.learn(AiMode::Manual),
         "rule" => app.rule_toggle(p["id"].as_str().unwrap_or("")),
-        "pick" => {
-            let title = p["kind"].as_str().unwrap_or("程序");
-            let dialog = rfd::FileDialog::new().set_title(format!("选择{title}"));
-            let selected = match p["type"].as_str().unwrap_or("file") {
-                "directory" => dialog.pick_folder(),
-                "plugin" => dialog
-                    .add_filter("插件包或描述", &["zip", "json"])
-                    .pick_file(),
-                "manifest" => dialog.add_filter("插件描述", &["json"]).pick_file(),
-                _ => dialog.pick_file(),
-            };
-            Ok(json!(selected.map(|p| p.to_string_lossy().to_string())))
-        }
+        "pick" => file_picker::pick(p),
         "open_data" => {
             std::process::Command::new("explorer.exe")
                 .arg(crate::storage::data_dir(&app.root))
@@ -340,6 +349,28 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
 }
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
+    if let Some(i) = args.iter().position(|a| a == "--plugin-settings-call") {
+        if let Err(error) = args
+            .get(i + 1)
+            .ok_or("缺少插件配置参数".to_string())
+            .and_then(|p| plugin_settings::run(std::path::Path::new(p)))
+        {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--migrate-state") {
+        let result = args
+            .get(i + 1)
+            .ok_or("缺少安装目录".to_string())
+            .and_then(|p| state_store::migrate_installation(std::path::Path::new(p)));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--data-transfer") {
         let result = args
             .get(i + 1)
@@ -467,6 +498,7 @@ fn main() {
                     a.as_str(),
                     "--ui-smoke"
                         | "--ui-smoke-approval"
+                        | "--ui-smoke-notification"
                         | "--ui-smoke-mica"
                         | "--ui-smoke-mica-fallback"
                 )
@@ -518,7 +550,11 @@ fn start() -> Result<(), String> {
         .any(|a| matches!(a.as_str(), "--ui-smoke-mica" | "--ui-smoke-mica-fallback"));
     let mica_failure = args.iter().any(|a| a == "--ui-smoke-mica-fallback");
     let approval_smoke = args.iter().any(|a| a == "--ui-smoke-approval");
-    let smoke = mica_smoke || approval_smoke || args.iter().any(|a| a == "--ui-smoke");
+    let notification_smoke = args.iter().any(|a| a == "--ui-smoke-notification");
+    let smoke = mica_smoke
+        || approval_smoke
+        || notification_smoke
+        || args.iter().any(|a| a == "--ui-smoke");
     if smoke && !args.iter().any(|a| a == "--root") {
         return Err("启动自检必须通过 --root 指定隔离测试目录".into());
     }
@@ -553,7 +589,11 @@ fn start() -> Result<(), String> {
     // fail. The dialog lists exact files; cancel stops loading and keeps them.
     let headless = smoke || args.iter().any(|a| a == "--read-once");
     managed_data::startup_with(&root, headless, managed_data::native_choice)?;
+    state_store::migrate(&storage::data_dir(&root))?;
     let app = Arc::new(App::load(root.clone())?);
+    if let Err(error) = state_store::clean_config_generations(&storage::data_dir(&root)) {
+        app.log("configuration_cleanup_deferred", json!({"error":error}));
+    }
     drop(storage_transition);
     if !smoke
         && !args
@@ -574,6 +614,9 @@ fn start() -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
         return Ok(());
+    }
+    if let Err(error) = tool_bridge::start(&app) {
+        app.log("tool_service_failed", json!({"error":error}));
     }
     if approval_smoke {
         let mut state = app.state.lock().unwrap();
@@ -687,6 +730,12 @@ fn start() -> Result<(), String> {
                 ));
                 return;
             }
+            if value["method"] == "notification_opened" {
+                if let Some(id) = value["params"]["id"].as_str().filter(|id| id.len() <= 128) {
+                    let _ = ipc_proxy.send_event(UiEvent::NoticeOpened(id.into()));
+                }
+                return;
+            }
             let app = ipc_app.clone();
             let proxy = ipc_proxy.clone();
             let parent_rect = native_dialog::rect(window_handle);
@@ -736,6 +785,7 @@ fn start() -> Result<(), String> {
         }
     };
     let mut approval_smoke_report = json!({});
+    let mut notifications: Option<task_notifications::Surface> = None;
     let mut approval_smoke_done = false;
     let tray_proxy = proxy.clone();
     let mut tray = Some(
@@ -887,11 +937,48 @@ fn start() -> Result<(), String> {
     }
     let mut push_generation = 0u64;
     let mut announced_update = String::new();
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         // Own all native/UI resources for the entire event loop lifetime.
         let _ = (&lock, &window, &context);
         *control_flow = ControlFlow::Wait;
+        if notifications.as_ref().is_some_and(|surface| surface.visible()) {
+            *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + Duration::from_secs(1));
+        }
         match event {
+            Event::UserEvent(UiEvent::NoticeCommand(command)) => {
+                if let Some(surface) = notifications.as_mut() {
+                    let task = surface.command(&command, &mut app.notifications.lock().unwrap());
+                    if let Some(id) = task {
+                        window.set_minimized(false);
+                        window.set_visible(true);
+                        window.set_focus();
+                        let _ = webview.evaluate_script(&format!("window.openNotifiedTask({id}).then(opened=>{{if(opened)window.ipc.postMessage(JSON.stringify({{method:'notification_opened',params:{{id:{id}}}}}));}}).catch(()=>{{}});", id=json!(id)));
+                    }
+                    surface.refresh(&mut app.notifications.lock().unwrap(), &window);
+                    if notification_smoke && command.action == "presented" && surface.presented() {
+                        let report = surface.smoke(&mut app.notifications.lock().unwrap(), &window);
+                        if let Some(result) = smoke_report.as_mut() {
+                            result["notification"] = report.clone();
+                            result["ok"] = json!(result["ok"] == true && report["ok"] == true);
+                        }
+                        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW(window.hwnd() as _, windows_sys::Win32::UI::WindowsAndMessaging::WM_CLOSE, 0, 0); }
+                    }
+                }
+            }
+            Event::UserEvent(UiEvent::NoticeOpened(id)) => {
+                app.notifications.lock().unwrap().dismiss_task(&id);
+                if let Some(surface) = notifications.as_mut() { surface.refresh(&mut app.notifications.lock().unwrap(), &window); }
+            }
+            Event::WindowEvent {window_id,event:WindowEvent::CloseRequested,..} if notifications.as_ref().is_some_and(|surface|surface.contains(window_id)) => {
+                if let Some(surface) = notifications.as_mut() {
+                    let mut queue = app.notifications.lock().unwrap();
+                    surface.close(window_id, &mut queue);
+                    surface.refresh(&mut queue, &window);
+                }
+            }
+            Event::NewEvents(_) => {
+                if let Some(surface) = notifications.as_mut() {surface.refresh(&mut app.notifications.lock().unwrap(), &window);}
+            }
             Event::UserEvent(UiEvent::StorageExit) => {
                 process::shutdown();
                 let _ = app.log_writer.stop();
@@ -987,6 +1074,23 @@ fn start() -> Result<(), String> {
                         let ok =
                             metrics["rendered"] == true && metrics["tag_catalog_ready"] == true;
                         smoke_report = Some(json!({"ok":ok,"ipc":true,"page":metrics,"mica":mica,"mica_requested":backdrop,"forced_fallback":mica_failure}));
+                        if notification_smoke {
+                            app.notifications.lock().unwrap().push(&[model::Audit {
+                                kind: "ai_update".into(), task_id: "synthetic-notice".into(),
+                                before: json!({"title":"合成事项","status":"待处理"}),
+                                after: json!({"title":"合成事项","status":"已完成"}),
+                                change_summary: "验收已通过，事项完成".into(),
+                                ..Default::default()
+                            }, model::Audit {
+                                kind: "ai_create".into(), task_id: "synthetic-notice-2".into(),
+                                before: Value::Null,
+                                after: json!({"title":"另一合成事项"}),
+                                change_summary: "已收到新需求，待确认范围".into(),
+                                ..Default::default()
+                            }]);
+                            let _ = smoke_proxy.send_event(UiEvent::Refresh);
+                            return;
+                        }
                         if mica_smoke {
                             if mica {
                                 let _ = webview.evaluate_script("document.documentElement.dataset.backdrop='mica'");
@@ -1032,6 +1136,15 @@ fn start() -> Result<(), String> {
                 let _ = webview.evaluate_script(&format!("window.receive({})", v));
             }
             Event::UserEvent(UiEvent::Refresh) => {
+                let notice_count = app.notifications.lock().unwrap().count();
+                if notice_count > 0 {
+                    let surface = notifications.get_or_insert_with(Default::default);
+                    if let Err(error) = surface.prepare(notice_count, target, &mut context, smoke_proxy.clone()) {
+                        app.log("task_notification_unavailable", json!({"error":error}));
+                        app.notifications.lock().unwrap().dismiss();
+                    }
+                }
+                if let Some(surface) = notifications.as_mut() {surface.refresh(&mut app.notifications.lock().unwrap(), &window);}
                 let update=app.updates.snapshot();
                 if app.state.lock().unwrap().config.auto_update && update["status"]=="ready"
                     && update["reminder"]["expires_at"].as_i64().is_some_and(|t|model::now()<t)
@@ -1074,6 +1187,9 @@ fn start() -> Result<(), String> {
                 }
             }
             _ => {}
+        }
+        if notifications.as_ref().is_some_and(|surface| surface.visible()) && !matches!(*control_flow, ControlFlow::ExitWithCode(_)) {
+            *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + Duration::from_secs(1));
         }
     });
 }

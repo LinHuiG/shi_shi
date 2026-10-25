@@ -35,6 +35,7 @@ pub fn reserve(s: &mut State, id: &str) {
 pub fn label(kind: &str) -> &str {
     match kind {
         "manual_edit" => "手动编辑事项",
+        "manual_tools" => "修改事项工具名单",
         "manual_ai_edit" => "AI 辅助编辑事项",
         "manual_status" => "手动修改状态",
         "manual_create" | "manual_new" => "手动创建事项",
@@ -155,26 +156,16 @@ impl App {
         if !s.tasks.iter().any(|t| t.id == id) {
             return Err("事项不存在".into());
         }
-        let mut rows = s
-            .audit
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.task_id == id && !a.kind.starts_with("archive_memory"))
-            .collect::<Vec<_>>();
-        let all = rows.len();
-        if !terms.is_empty() {
-            rows.retain(|(_, a)| matches(&json!(a), &terms));
-        }
-        rows.sort_by_key(|(i, a)| (a.time, *i));
-        if !ascending {
-            rows.reverse();
-        }
-        let total = rows.len();
-        let pages = total.div_ceil(50).max(1);
-        let page = (p["page"].as_u64().unwrap_or(1).max(1) as usize).min(pages);
-        Ok(
-            json!({"rows":rows.into_iter().skip((page-1)*50).take(50).map(|(i,a)|{let mut v=json!(a);v["index"]=json!(i);v["kind_label"]=json!(label(&a.kind));v}).collect::<Vec<_>>(),"total":total,"all":all,"page":page,"pages":pages}),
-        )
+        let mut store = self.store.lock().unwrap();
+        store
+            .as_mut()
+            .ok_or("业务数据库尚未初始化")?
+            .query_task_history(
+                id,
+                terms,
+                ascending,
+                p["page"].as_u64().unwrap_or(1).max(1) as usize,
+            )
     }
 }
 
@@ -186,7 +177,7 @@ mod tests {
     #[test]
     fn numbers_survive_reordering_deletion_and_new_tasks() {
         let mut s = State::default();
-        s.tasks = vec![
+        *s.tasks = vec![
             Task {
                 id: "b".into(),
                 created: 20,
@@ -253,6 +244,7 @@ mod tests {
                 });
             }
         }
+        app.persist().unwrap();
         let rows = app
             .task_changes(&json!({"id":"a","query":"SYNTHETIC","sort":"asc","page":2}))
             .unwrap();

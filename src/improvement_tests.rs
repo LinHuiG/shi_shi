@@ -142,12 +142,11 @@ mod tests {
             s.config = serde_json::from_value(json!({"codex":"synthetic.exe","codex_models":[{"model":"synthetic"}],"ai_connections":[{"id":"api","name":"Synthetic","driver":"api","base_url":"https://example.com/v1","models":[{"model":"synthetic"}]}],"model_profiles":{"filter":null,"analysis":{"connection_id":"api","model":"synthetic"},"handling":{"model":"synthetic"},"review":{"connection_id":"api","model":"synthetic"}}})).unwrap();
             app.save(&s).unwrap();
         }
-        let next_path = root.join("data/state.next.json");
-        fs::create_dir(&next_path).unwrap();
+        crate::test_support::persistence_failure(&root, true).unwrap();
         let before = json!(app.state.lock().unwrap().config);
         assert!(app.delete_connection(&json!({"id":"api"})).is_err());
         assert_eq!(json!(app.state.lock().unwrap().config), before);
-        fs::remove_dir(&next_path).unwrap();
+        crate::test_support::persistence_failure(&root, false).unwrap();
         let result = app.delete_connection(&json!({"id":"api"})).unwrap();
         assert!(result["config"]["model_profiles"]["analysis"].is_null());
         assert!(result["config"]["model_profiles"]["review"].is_null());
@@ -156,7 +155,7 @@ mod tests {
         app.delete_connection(&json!({"id":""})).unwrap();
         drop(app);
         let restored = App::load(root.clone()).unwrap();
-        let c = &restored.state.lock().unwrap().config;
+        let c = restored.state.lock().unwrap().config.clone();
         assert!(c.codex.is_empty() && c.ai_connections.is_empty());
         for kind in PURPOSES {
             assert_eq!(
@@ -165,6 +164,7 @@ mod tests {
             );
         }
         assert_eq!(c.daily_calls, 147);
+        drop(restored);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -273,10 +273,14 @@ mod tests {
     #[test]
     fn valid_primary_ignores_interrupted_temp_and_cleanup_backs_up_before_removal() {
         let root = std::env::temp_dir().join(format!("shishi-recovery-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        fs::create_dir_all(root.join("data")).unwrap();
+        fs::write(
+            root.join("data/state.json"),
+            serde_json::to_vec(&State::default()).unwrap(),
+        )
+        .unwrap();
         fs::write(root.join("data/state.next.json"), b"interrupted write").unwrap();
         assert!(crate::managed_data::inspect(&root).is_empty());
-        drop(app);
         fs::write(root.join("data/state.json"), b"incompatible").unwrap();
         let inspection = crate::managed_data::inspect(&root);
         assert!(inspection
@@ -320,7 +324,7 @@ mod tests {
         let app = App::load(root.clone()).unwrap();
         let enabled = app.state.lock().unwrap().config.enabled;
         let interval = app.state.lock().unwrap().config.interval_minutes;
-        fs::create_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app
             .scan_control(&json!({"enabled":false,"interval_minutes":12}))
             .is_err());
@@ -337,10 +341,10 @@ mod tests {
         let root = std::env::temp_dir().join(format!("shishi-settings-failure-{}", id()));
         let app = App::load(root.clone()).unwrap();
         let before = json!(app.state.lock().unwrap().config);
-        fs::create_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app.configure_patch(&json!({"daily_calls":42})).is_err());
         assert_eq!(json!(app.state.lock().unwrap().config), before);
-        fs::remove_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, false).unwrap();
         assert_eq!(
             app.configure_patch(&json!({"daily_calls":42})).unwrap()["config"]["daily_calls"],
             42
@@ -424,10 +428,10 @@ mod tests {
         app.work_boundary_tick(None, at).unwrap();
         let previous = ts_ms(2025, 1, 2, 17, 59) + 55_000;
         let end = ts_ms(2025, 1, 2, 18, 0) + 1_000;
-        fs::create_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app.work_boundary_tick(Some(previous), end).is_err());
         assert!(app.state.lock().unwrap().archive_attempts.is_empty());
-        fs::remove_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, false).unwrap();
         app.work_boundary_tick(Some(previous), end + 5_000).unwrap();
         assert_eq!(app.state.lock().unwrap().archive_attempts.len(), 1);
         app.work_boundary_tick(Some(end + 5_000), end + 10_000)

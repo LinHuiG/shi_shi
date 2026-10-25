@@ -40,7 +40,7 @@ const modelFields = [
     'cfg-handling-model',
     'cfg-handling-effort',
     'AI一键处置',
-    '自动拉起所选的 Codex 或 DeepSeek Harness 桌面端，结合事项信息和相关上下文开展处置；执行过程遵循已有授权与审批设置。官方 API 仅用于分析，不能执行一键处置。',
+    '自动拉起所选的 Codex 或 DeepSeek Harness 桌面端，结合事项信息和相关上下文开展处置；执行过程遵循已有授权与审批设置。此入口需要外部 agent。事项分析、生成、修改和归档的注册工具调用沿用各自用途的模型。',
   ],
   [
     'review',
@@ -112,7 +112,7 @@ function connectionOptions(selected, connections = draftConnections(), kind = ''
   return (
     `<option value="__unselected__" ${selected === '__unselected__' || !connections.some((c) => c.id === selected) ? 'selected' : ''}>未配置</option>` +
     connections
-      .filter((c) => kind !== 'handling' || c.driver !== 'api')
+      .filter((c) => (kind !== 'handling' || c.driver !== 'api'))
       .map(
         (c) =>
           `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}</option>`,

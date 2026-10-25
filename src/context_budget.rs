@@ -854,8 +854,7 @@ mod tests {
         let dir = std::path::PathBuf::from(
             std::env::var("SHISHI_REPLAY_DATA").expect("read-only data directory"),
         );
-        let s: State =
-            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        let s: State = crate::managed_data::load_from_directory(&dir).unwrap();
         let log = std::fs::read_to_string(dir.join("logs/2026-10-16.jsonl")).unwrap();
         let mut starts = BTreeMap::new();
         for line in log.lines() {
@@ -1092,8 +1091,7 @@ mod tests {
     #[ignore = "Read-only real-message replay; no model call. Set SHISHI_REPLAY_DATA"]
     fn replay_compact_batches_without_model_calls() {
         let dir = std::path::PathBuf::from(std::env::var("SHISHI_REPLAY_DATA").unwrap());
-        let s: State =
-            serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+        let s: State = crate::managed_data::load_from_directory(&dir).unwrap();
         let old_message = |m: &Message| json!({"id":m.id,"source_id":m.source_id,"chat":m.chat,"sender":clip(&m.sender,50),"recipient":clip(&m.recipient,50),"to":clip(&m.to,80),"private":m.private,"mine":m.mine,"relevant":m.relevant(),"reply":m.reply,"time":stamp(m.time),"text":clip(&m.text,550),"truncated":m.text.chars().count()>550});
         let mut pending = pending(&s);
         pending.sort_by_key(|m| (m.time, m.id.clone()));
@@ -1223,6 +1221,7 @@ mod tests {
             sizes["prompt_chars"].as_u64().unwrap()
                 + sizes["schema_chars"].as_u64().unwrap()
                 + sizes["tool_schema_chars"].as_u64().unwrap()
+                + sizes["wire_overhead_chars"].as_u64().unwrap()
         );
         assert!(sizes["tool_schema_chars"].as_u64().unwrap() > 0);
         let c = Config {

@@ -206,9 +206,7 @@ const handlingButton = (id) => {
       ? '重新处置'
       : 'AI一键处置';
 };
-let handlingEditor = null,
-  handlingHistory = null,
-  handlingProjects = [];
+let handlingProposal = null, handlingProjects = [];
 const handlingDrafts = new Map(),
   handlingErrors = new Map(),
   handlingComposers = new Set(),
@@ -251,11 +249,11 @@ async function beginHandling(id, choose = false) {
   }
   const p = await rpc('handling_prepare', { task_id: id });
   handlingProjects = p.projects;
-  const recommended = p.default_project_id || p.suggested?.project_id || p.matched?.project_id;
+  const recommended = p.suggested?.project_id || p.default_project_id;
   const choices = p.projects.filter((x) => x.id === recommended);
 
   setModal(
-    `<h2>AI一键处置</h2><p class="subtitle">选择项目或本地目录，会话按所选执行端保存，可继续追问。首轮调查定位并给出建议，沿用所选项目说明、技能、权限和审批。</p><p class="helper">${p.default_project_id ? '已默认选择配置的 AI 工作目录，可切换项目。' : choices.length ? '已预选匹配项目，可切换。' : '请选择项目目录。'}</p><div class="form-group"><label>项目</label><select id="handling-project"><option value="">请选择项目</option>${p.projects.map((x, i) => `<option value="${i}" ${choices.length === 1 && x === choices[0] ? 'selected' : ''}>${esc(x.name)} · ${esc(x.cwd)}</option>`).join('')}</select><button style="margin-top:8px" data-handle="add-project">＋ 选择本地项目目录</button></div><div class="form-group"><label>本次补充说明（可选）</label><textarea id="handling-instructions" maxlength="2000" placeholder="例如：先核对复现步骤和相关日志。">${esc(p.matched?.instructions || '')}</textarea></div><details style="margin-top:12px"><summary>查看当前通用调查提示词</summary><pre style="white-space:pre-wrap">${esc(p.policy.boundary || '')}\n\n${esc(p.policy.policy.prompt)}</pre></details><p class="helper">${esc(modelChoice('handling').model || '默认模型')} · ${esc(modelChoice('handling').reasoning_effort || '默认推理强度')}。上下文接口只提供此事项相关会话和时间范围内的消息。</p>${taskRuns(id).some((r) => handlingActive(r) && r.thread_id) ? '<label class="check"><input id="handling-stop-previous" type="checkbox">确认停止原处置后开始</label>' : ''}<div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-handle="submit" data-task-id="${esc(id)}">开始调查</button></div>`,
+    `<h2>AI一键处置</h2><p class="subtitle">选择项目或本地目录，会话按所选执行端保存，可继续追问。首轮调查定位并给出建议，沿用所选项目说明、技能、权限和审批。</p><p class="helper">可切换项目，也可选择本地目录。</p><div class="form-group"><label>项目</label><select id="handling-project"><option value="">请选择项目</option>${p.projects.map((x, i) => `<option value="${i}" ${choices.length === 1 && x === choices[0] ? 'selected' : ''}>${esc(x.name)} · ${esc(x.cwd)}</option>`).join('')}</select><button style="margin-top:8px" data-handle="add-project">＋ 选择本地项目目录</button></div><div class="form-group"><label>本次补充说明（可选）</label><textarea id="handling-instructions" maxlength="2000" placeholder="例如：先核对复现步骤和相关日志。"></textarea></div><details style="margin-top:12px"><summary>查看当前通用调查提示词</summary><pre style="white-space:pre-wrap">${esc(p.boundary || '')}\n\n${esc(p.prompt)}</pre></details><p class="helper">${esc(modelChoice('handling').model || '默认模型')} · ${esc(modelChoice('handling').reasoning_effort || '默认推理强度')}。上下文接口只提供此事项相关会话和时间范围内的消息。</p>${taskRuns(id).some((r) => handlingActive(r) && r.thread_id) ? '<label class="check"><input id="handling-stop-previous" type="checkbox">确认停止原处置后开始</label>' : ''}<div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-handle="submit" data-task-id="${esc(id)}">开始调查</button></div>`,
   );
 }
 function handlingBadge(id) {
@@ -450,54 +448,14 @@ document.addEventListener('input', (event) => {
   }
 });
 
-async function renderHandlingRules() {
-  const epoch = renderEpoch;
-  const result = await rpc('handling_history');
-  if (page !== 'handling' || epoch !== renderEpoch) return;
-  handlingHistory = result;
-  setHtml(
-    '#view',
-    `<div class="page"><div class="box"><h2>处置提示词与项目匹配</h2><p>初始模板不预设任何个人信息。关键词全部命中且只有一条规则匹配时，一键交给对应项目；没有匹配或存在歧义时由你选择。</p><div class="row" style="margin-top:12px"><button class="primary" data-handle="policy-edit">编辑当前版本</button><button data-handle="learn">从处置记录生成建议</button></div><p class="helper">建议生成并校验完成后才保存，可预览后手动采用或拒绝；归档不评估或启用建议。每次修改、采用和回滚都保存完整版本。</p></div><div class="box"><h2>待预览建议</h2>${
-      result.proposals
-        .slice()
-        .reverse()
-        .map(
-          (p) =>
-            `<div class="source"><b>${esc(date(p.created))} · ${p.adopted ? '已采用' : p.rejected ? '已拒绝' : p.base !== result.current ? '基准已变化' : '待预览'}</b><p>${esc(p.reason)}</p><button data-handle="policy-proposal" data-id="${esc(p.id)}">预览与编辑</button></div>`,
-        )
-        .join('') || '<p>已有处置和追问记录后，可以生成改进建议。</p>'
-    }</div><div class="box"><h2>全部版本</h2>${result.versions
-      .slice()
-      .reverse()
-      .map(
-        (v) =>
-          `<details class="prompt-editor" data-ui-key="handling-policy-${esc(v.id)}"><summary>${esc(date(v.created))} · ${{ initial: '初始模板', manual: '手动修改', adopt: '采用建议', auto_adopt: '次日 AI 自动采用', rollback: '回滚' }[v.action] || esc(v.action)} ${v.id === result.current ? '· 当前生效' : ''}</summary><p>${esc(v.reason)}</p><pre style="white-space:pre-wrap">${esc(v.boundary || '')}\n\n${esc(v.policy.prompt)}</pre><p class="helper">${v.policy.routes.length} 条项目匹配规则</p>${v.policy.routes.map((r) => `<div class="source"><b>${esc(r.keywords.join(' + '))}</b><div class="helper">${esc(r.project_id)}</div><p>${esc(r.instructions)}</p></div>`).join('')}${v.id !== result.current ? `<button data-handle="rollback" data-id="${esc(v.id)}">一键回滚到此版本</button>` : ''}</details>`,
-      )
-      .join('')}</div></div>`,
-  );
-}
-function readHandlingEditor() {
-  if (!handlingEditor) return;
-  handlingEditor.policy.prompt = $('#handling-policy-prompt').value;
-  handlingEditor.reason = $('#handling-policy-reason').value;
-  handlingEditor.policy.routes = [...document.querySelectorAll('[data-handling-route]')].map(
-    (row) => ({
-      keywords: row
-        .querySelector('[data-keywords]')
-        .value.split(/[,，\n]/)
-        .map((v) => v.trim())
-        .filter(Boolean),
-      project_id: row.querySelector('[data-project]').value,
-      instructions: row.querySelector('[data-instructions]').value,
-    }),
-  );
-}
-function showHandlingEditor() {
-  const d = handlingEditor,
-    stale = d.expected !== handlingHistory.current || d.adopted;
-  setModal(
-    `<h2>${d.proposal ? '预览处置提示词建议' : '配置项目匹配'}</h2>${d.proposal ? `<p class="subtitle">依据记录：${esc(d.evidence.join('、'))}</p>` : ''}<div class="form-group"><label>修改原因</label><textarea id="handling-policy-reason" rows="2">${esc(d.reason)}</textarea></div><details><summary>查看修改前的提示词</summary><pre style="white-space:pre-wrap">${esc(d.before)}</pre></details><div class="form-group"><label>调查提示词（采用后生效）</label><textarea id="handling-policy-prompt" rows="8">${esc(d.policy.prompt)}</textarea></div><details style="margin-top:12px"><summary>固定的调查与上下文边界（随版本保存）</summary><pre style="white-space:pre-wrap">${esc(d.boundary || '')}</pre></details><h3 style="margin-top:20px">项目匹配规则</h3>${d.policy.routes.map((r, i) => `<div class="source" data-handling-route="${i}"><label>全部匹配的关键词（逗号分隔）</label><input data-keywords value="${esc(r.keywords.join('，'))}"><label>项目</label><select data-project><option value="">请选择</option>${[...new Map(handlingProjects.map((p) => [p.id, p])).values()].map((p) => `<option value="${esc(p.id)}" ${r.project_id === p.id ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}${r.project_id && !handlingProjects.some((p) => p.id === r.project_id) ? `<option value="${esc(r.project_id)}" selected>不可用项目 · ${esc(r.project_id)}</option>` : ''}</select><label>此项目的调查说明</label><textarea data-instructions rows="2">${esc(r.instructions)}</textarea><button data-handle="route-remove" data-index="${i}">移除此条</button></div>`).join('')}<button data-handle="route-add">＋ 添加匹配规则</button>${stale ? '<div class="error-box">此建议已采用或生效版本已变化，请重新生成建议。</div>' : ''}<div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">关闭</button><button class="primary" data-handle="policy-save" ${stale ? 'disabled' : ''}>${d.proposal ? '采用此版本' : '保存新版本'}</button></div>`,
-  );
+async function previewHandlingProposal(id) {
+  const result = await rpc('prompt_history');
+  const proposal = state.evolution?.handling?.find(p => p.id === id),
+    current = result.versions.find(v => v.id === result.current.handling);
+  if (!proposal) throw Error('建议不存在，请刷新');
+  handlingProposal = {id, expected:current.id};
+  const stale = proposal.base !== current.id || proposal.adopted || proposal.rejected || !proposal.prompt;
+  setModal(`<h2>预览处置提示词建议</h2><p>${esc(proposal.reason)}</p><details><summary>当前提示词</summary><pre>${esc(current.content)}</pre></details><label>建议提示词<textarea id="handling-proposal-prompt" rows="10" maxlength="20000">${esc(proposal.prompt || proposal.policy?.prompt || '')}</textarea></label>${stale ? '<p class="helper">此建议需要按当前版本重新生成，原历史保留。</p>' : ''}<div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">关闭</button><button class="primary" data-handle="proposal-adopt" ${stale ? 'disabled' : ''}>采用</button></div>`);
 }
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-handle]');
@@ -532,6 +490,7 @@ document.addEventListener('click', async (e) => {
         const params = {
           task_id: id,
           project_id: p.id,
+          ...(p.connection_id ? {connection_id:p.connection_id} : {}),
           cwd: p.cwd,
           instructions: $('#handling-instructions').value,
           stop_previous: !!$('#handling-stop-previous')?.checked,
@@ -671,54 +630,14 @@ document.addEventListener('click', async (e) => {
         toast(r.unchanged ? r.reason : '建议已生成，请预览后采用');
         break;
       }
-      case 'policy-edit':
-      case 'policy-proposal': {
-        if (page === 'settings' && settingsDirty) {
-          toast('请先保存系统提示词，再配置项目匹配');
-          break;
-        }
-        handlingHistory = await rpc('handling_history');
-        handlingProjects = await rpc('handling_projects');
-        const current = handlingHistory.versions.find((v) => v.id === handlingHistory.current),
-          proposal = handlingHistory.proposals.find((v) => v.id === b.dataset.id);
-        handlingEditor = {
-          expected: proposal?.base || current.id,
-          boundary: current.boundary || '',
-          before: handlingHistory.versions.find((v) => v.id === (proposal?.base || current.id))
-            .policy.prompt,
-          policy: structuredClone(proposal?.policy || current.policy),
-          reason: proposal?.reason || '',
-          proposal: proposal?.id,
-          evidence: proposal?.evidence || [],
-          adopted: proposal?.adopted || proposal?.rejected,
-        };
-        showHandlingEditor();
+      case 'policy-proposal':
+        await previewHandlingProposal(b.dataset.id);
         break;
-      }
-      case 'route-add':
-        readHandlingEditor();
-        handlingEditor.policy.routes.push({ keywords: [], project_id: '', instructions: '' });
-        showHandlingEditor();
-        break;
-      case 'route-remove':
-        readHandlingEditor();
-        handlingEditor.policy.routes.splice(Number(b.dataset.index), 1);
-        showHandlingEditor();
-        break;
-      case 'policy-save':
-        readHandlingEditor();
-        await rpc('handling_policy_save', handlingEditor);
+      case 'proposal-adopt':
+        await rpc('handling_adopt',{...handlingProposal,prompt:$('#handling-proposal-prompt').value});
         closeModal();
         await refreshState(true);
-        toast('新版本已生效，旧版本完整保留');
-        break;
-      case 'rollback':
-        await rpc('handling_policy_save', {
-          expected: handlingHistory.current,
-          rollback: b.dataset.id,
-        });
-        await refreshState(true);
-        toast('已回滚并保存新的版本记录');
+        toast('已采用，历史版本保留');
         break;
     }
   } catch (error) {

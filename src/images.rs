@@ -10,6 +10,43 @@ use std::{
 };
 pub const LIMIT: usize = 2;
 
+pub(crate) struct ModelImages(pub Vec<PathBuf>);
+impl Drop for ModelImages {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+/// Only SS-provided image bytes are materialized inside this request's job.
+pub(crate) fn model_files(directory: &Path, content: &Value) -> Result<ModelImages, String> {
+    use base64::Engine;
+    let mut files = ModelImages(vec![]);
+    for image in content.as_array().into_iter().flatten() {
+        if files.0.len() >= 2 {
+            return Err("本次图片数量超过允许范围".into());
+        }
+        let extension = match image["mimeType"].as_str() {
+            Some("image/jpeg") => "jpg",
+            Some("image/png") => "png",
+            Some("image/webp") => "webp",
+            Some("image/gif") => "gif",
+            _ => return Err("模型图片类型无效".into()),
+        };
+        let data = image["data"]
+            .as_str()
+            .filter(|s| s.len() <= 4 * 1024 * 1024)
+            .ok_or("模型图片内容无效")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|_| "模型图片编码无效")?;
+        let path = directory.join(format!("model-image-{}.{extension}", files.0.len()));
+        fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        files.0.push(path);
+    }
+    Ok(files)
+}
+
 pub fn tool() -> Value {
     json!({"name":"read_image","description":"按image_id查看本批相关消息的本地图片，最多2次；只在文字不足时使用。未下载则不可用。","inputSchema":{"type":"object","additionalProperties":false,"properties":{"image_id":{"type":"string","maxLength":512}},"required":["image_id"]},"annotations":{"readOnlyHint":true,"destructiveHint":false,"openWorldHint":false}})
 }

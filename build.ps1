@@ -8,7 +8,16 @@ if(!$NsisPath){$NsisPath=(Get-Command makensis.exe -ErrorAction SilentlyContinue
 if(!$NsisPath){throw 'Provide -NsisPath pointing to NSIS 3 makensis.exe'}
 $previousBuildNonce=$env:SHISHI_PACKAGE_BUILD_NONCE
 $previousPublishedAt=$env:SHISHI_PACKAGE_PUBLISHED_AT
+$previousEncodedRustFlags=$env:CARGO_ENCODED_RUSTFLAGS
 try {
+ # Panic locations in shipped binaries must not disclose the build account or checkout.
+ $buildRustFlags=@()
+ if($previousEncodedRustFlags){$buildRustFlags=@($previousEncodedRustFlags -split [char]0x1f)}
+ elseif($env:RUSTFLAGS){$buildRustFlags=@($env:RUSTFLAGS -split '\s+' | Where-Object {$_})}
+ $buildRustFlags+="--remap-path-prefix=$PSScriptRoot=/shishi-source"
+ if($env:USERPROFILE){$buildRustFlags+="--remap-path-prefix=$env:USERPROFILE=/build-user"}
+ if($CargoHome){$buildRustFlags+="--remap-path-prefix=$CargoHome=/cargo-home"}
+ $env:CARGO_ENCODED_RUSTFLAGS=$buildRustFlags -join [char]0x1f
  $env:SHISHI_PACKAGE_BUILD_NONCE=[guid]::NewGuid().ToString('N')
  if($PublishedAt){$env:SHISHI_PACKAGE_PUBLISHED_AT=([DateTimeOffset]::ParseExact($PublishedAt,"yyyy-MM-dd'T'HH:mm:sszzz",[Globalization.CultureInfo]::InvariantCulture).ToUnixTimeSeconds()).ToString()}
  else{Remove-Item Env:SHISHI_PACKAGE_PUBLISHED_AT -ErrorAction SilentlyContinue}
@@ -19,8 +28,11 @@ try {
  else{$env:SHISHI_PACKAGE_BUILD_NONCE=$previousBuildNonce}
  if($null -eq $previousPublishedAt){Remove-Item Env:SHISHI_PACKAGE_PUBLISHED_AT -ErrorAction SilentlyContinue}
  else{$env:SHISHI_PACKAGE_PUBLISHED_AT=$previousPublishedAt}
+ if($null -eq $previousEncodedRustFlags){Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue}
+ else{$env:CARGO_ENCODED_RUSTFLAGS=$previousEncodedRustFlags}
 }
-$metadataText=& cargo metadata --locked --offline --format-version 1 --manifest-path "$PSScriptRoot\Cargo.toml"
+$hostTriple=((& rustc -vV | Select-String '^host: ').Line).Substring(6)
+$metadataText=& cargo metadata --locked --offline --format-version 1 --filter-platform $hostTriple --manifest-path "$PSScriptRoot\Cargo.toml"
 if($LASTEXITCODE -ne 0){throw 'Cannot resolve locked build dependencies'}
 $metadata=$metadataText | ConvertFrom-Json
 $loaders=@($metadata.packages | Where-Object { $_.name -eq 'webview2-com-sys' })

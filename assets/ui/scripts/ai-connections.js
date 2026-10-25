@@ -190,7 +190,7 @@ document.addEventListener('focusout', (e) => {
         document.hasFocus() &&
         !$('#connection-form')?.contains(document.activeElement)
       )
-        leaveConnectionEditor();
+        dismissUnchangedConnectionEditor();
     }, 0);
 });
 document.addEventListener(
@@ -249,6 +249,10 @@ document.addEventListener(
       return;
     }
     if (e.target.closest('[data-page],[data-recent],[data-view],[data-prompt-section]')) return;
+    if (!e.target.closest('[data-ai-add],[data-ai-edit],[data-ai-remove]')) {
+      dismissUnchangedConnectionEditor();
+      return;
+    }
     if (!leaveConnectionEditor()) {
       e.preventDefault();
       e.stopImmediatePropagation();
@@ -256,6 +260,10 @@ document.addEventListener(
   },
   true,
 );
+function dismissUnchangedConnectionEditor() {
+  if (connectionEditor && !connectionEditor.saving && !connectionEditor.busy && !connectionDirty())
+    closeConnectionEditor();
+}
 async function saveConnectionEditor() {
   const editor = connectionEditor;
   if (!editor || editor.saving) return;

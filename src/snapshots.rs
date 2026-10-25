@@ -578,6 +578,7 @@ mod tests {
             kind: "manual_archive".into(),
             task_id: "task".into(),
             detail: "旧备注".into(),
+            change_summary: String::new(),
             before: json!({}),
             after: json!({"archive_note":"长期要求"}),
         });
@@ -680,6 +681,7 @@ mod tests {
             kind: "manual_edit".into(),
             task_id: "t".into(),
             detail: "修改任务".into(),
+            change_summary: String::new(),
             before: json!([{"id":"t","title":"旧标题","config":{"api_key":"TOP-SECRET"}}]),
             after: json!([{"id":"t","title":"新标题","config":{"api_key":"TOP-SECRET-2"}}]),
         });
@@ -689,6 +691,7 @@ mod tests {
             kind: "settings".into(),
             task_id: String::new(),
             detail: "修改设置".into(),
+            change_summary: String::new(),
             before: json!({"config":{"api_key":"TOP-SECRET"}}),
             after: json!({"config":{"api_key":"TOP-SECRET-2"}}),
         });
@@ -716,6 +719,7 @@ mod tests {
             kind: "manual_archive".into(),
             task_id: "t".into(),
             detail: "归档".into(),
+            change_summary: String::new(),
             before: json!([]),
             after: json!([{"id":"t","archive_note":note,"status":"已完成"}]),
         });
@@ -791,6 +795,7 @@ mod tests {
             kind: "manual_archive".into(),
             task_id: task.id.clone(),
             detail: "归档完整长文".into(),
+            change_summary: String::new(),
             before: json!([before]),
             after: json!([task]),
         });
@@ -918,6 +923,7 @@ mod tests {
             kind: "manual_edit".into(),
             task_id: "t".into(),
             detail: "修改".into(),
+            change_summary: String::new(),
             before: json!({}),
             after: json!({}),
         });

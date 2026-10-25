@@ -537,7 +537,7 @@ h3 {
   padding: 3px 0;
   color: var(--g11);
 }
-.scan-controls .mini-switch {
+.mini-switch {
   width: 26px;
   height: 15px;
   padding: 0;
@@ -1527,19 +1527,22 @@ h3 {
   flex: none;
 }
 .tag-groups {
-  display: grid;
+  display: flex;
+  flex-wrap: wrap;
   flex: 1;
   min-width: 0;
-  grid-template-columns: repeat(auto-fit, minmax(min(210px, 100%), 1fr));
-  align-items: start;
+  align-items: flex-start;
 }
 .tag-slot {
   min-width: 0;
+  width: max-content;
+  max-width: min(360px, 100%);
 }
 .tag-group {
   box-sizing: border-box;
   display: flex;
   align-items: center;
+  max-width: 100%;
   border: 1px solid var(--blue-bg);
 }
 .tag-group-title {
@@ -3274,26 +3277,46 @@ select {
 }
 .plugin-strip {
   display: flex;
-  gap: 12px;
+  gap: 8px;
   overflow-x: auto;
   padding-bottom: 8px;
 }
 .plugin-tile {
-  flex: 0 0 240px;
+  flex: 0 0 160px;
+  min-width: 0;
   border: 1px solid var(--g7);
   background: var(--g4);
   border-radius: var(--r-md);
-  padding: 15px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 .plugin-tile > .row {
   justify-content: space-between;
+  gap: 6px;
+  flex-wrap: nowrap;
+}
+.plugin-tile > .row b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.plugin-tile > .row .tiny {
+  flex-shrink: 0;
+}
+.plugin-tile button {
+  padding: 4px 6px;
+  min-height: 28px;
+  font-size: var(--fs-caption);
+  white-space: nowrap;
 }
 .plugin-tile .plugin-actions {
   display: flex;
+  margin-left: 0;
   justify-content: space-between;
+  gap: 10px;
 }
 .source-section-title {
   font-size: var(--fs-body-large);
@@ -3497,7 +3520,8 @@ select {
   margin: 14px 0;
   padding: 12px 0;
 }
-.task-other-settings > summary {
+.task-other-settings > summary,
+.task-tag-settings > summary {
   cursor: pointer;
   color: var(--g12);
   font-size: var(--fs-body);

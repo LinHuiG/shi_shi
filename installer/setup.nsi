@@ -128,11 +128,11 @@ FunctionEnd
 Section "拾事" SEC_MAIN
  SetShellVarContext current
  SetOutPath "$INSTDIR"
- IfFileExists "$INSTDIR\shishi.exe" 0 copy_app
  InitPluginsDir
  File /oname=$PLUGINSDIR\shishi-install-process.ps1 "${SOURCE}\installer\process.ps1"
  File /oname=$PLUGINSDIR\shishi-prompt.exe "${SOURCE}\target\release\shishi.exe"
  File /oname=$PLUGINSDIR\WebView2Loader.dll "${LOADER}"
+ IfFileExists "$INSTDIR\shishi.exe" 0 migrate_data
  StrCpy $ProcessShell "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
  ${If} ${RunningX64}
   StrCpy $ProcessShell "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
@@ -174,7 +174,15 @@ Section "拾事" SEC_MAIN
   Abort
  ${EndIf}
  System::Call 'kernel32::CloseHandle(p r0)'
- copy_app:
+ migrate_data:
+ nsExec::ExecToStack '"$PLUGINSDIR\shishi-prompt.exe" --migrate-state "$INSTDIR"'
+ Pop $0
+ Pop $1
+ ${If} $0 != 0
+  MessageBox MB_ICONEXCLAMATION "旧数据迁移未完成，原始数据已保留。未替换程序，请检查数据目录后重试。$\r$\n$1" /SD IDOK
+  SetErrorLevel 1
+  Abort
+ ${EndIf}
  File "${SOURCE}\target\release\shishi.exe"
  File "${LOADER}"
  File "${SOURCE}\README.txt"

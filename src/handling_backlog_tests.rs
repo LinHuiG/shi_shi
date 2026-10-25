@@ -50,7 +50,7 @@ impl AgentSession for Agent {
         }
         self.alive.store(false, Ordering::SeqCst);
         if let Some(root) = self.fail_save_on_close.lock().unwrap().take() {
-            std::fs::create_dir(root.join("data/state.next.json")).unwrap();
+            crate::test_support::persistence_failure(&root, true).unwrap();
         }
         Ok(())
     }
@@ -263,7 +263,7 @@ fn failed_close_or_final_save_keeps_stop_marker_and_can_be_retried() {
     *agent.fail_save_on_close.lock().unwrap() = Some(root.clone());
     assert!(app.handling_terminate(&stop()).is_err());
     assert!(app.run("task").unwrap().stop_requested);
-    std::fs::remove_dir(root.join("data/state.next.json")).unwrap();
+    crate::test_support::persistence_failure(&root, false).unwrap();
     app.handling_terminate(&stop()).unwrap();
     assert!(can_restart(&app.run("task").unwrap()));
     drop(app);
@@ -272,11 +272,11 @@ fn failed_close_or_final_save_keeps_stop_marker_and_can_be_retried() {
 #[test]
 fn failed_initial_save_never_closes_a_backend_and_desktop_control_is_preserved() {
     let (app, agent, root) = fixture("dsh");
-    std::fs::create_dir(root.join("data/state.next.json")).unwrap();
+    crate::test_support::persistence_failure(&root, true).unwrap();
     assert!(app.handling_terminate(&stop()).is_err());
     assert!(agent.is_alive());
     assert!(!app.run("task").unwrap().stop_requested);
-    std::fs::remove_dir(root.join("data/state.next.json")).unwrap();
+    crate::test_support::persistence_failure(&root, false).unwrap();
     app.state.lock().unwrap().handling.runs[0].desktop_control = true;
     assert!(app.handling_terminate(&stop()).is_err());
     assert!(agent.is_alive());

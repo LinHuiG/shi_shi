@@ -9,6 +9,9 @@ mod regression_tests;
 mod reports;
 #[path = "engine/ui_state.rs"]
 mod ui_state;
+#[cfg(test)]
+#[path = "engine/workflow_tools_tests.rs"]
+mod workflow_tools_tests;
 
 use crate::{
     ai,
@@ -28,6 +31,10 @@ use std::{
 };
 
 pub struct App {
+    pub(crate) tool_runtime: crate::tool_calling::Runtime,
+    pub(crate) plugin_settings: Mutex<crate::plugin_settings::Sessions>,
+    pub(crate) notifications: Mutex<crate::task_notifications::Queue>,
+    pub(crate) store: Mutex<Option<crate::state_store::Store>>,
     pub(crate) desktop_bridge: Mutex<Option<std::sync::Arc<dyn crate::desktop_bridge::DesktopApi>>>,
     pub(crate) desktop_reading: Mutex<BTreeSet<String>>,
     pub(crate) handling_previews: Mutex<BTreeMap<String, crate::handling::Preview>>,
@@ -189,16 +196,7 @@ impl App {
         crate::message_progress::initialize(&mut state);
         crate::tags::initialize(&mut state);
         crate::handling::initialize(&mut state);
-        if state.config.handling_prompt.is_empty() {
-            state.config.handling_prompt = state
-                .handling
-                .versions
-                .last()
-                .unwrap()
-                .policy
-                .prompt
-                .clone();
-        }
+        crate::tool_calling::recover(&mut state);
         prompts::initialize(&mut state);
         crate::archive::initialize(&mut state);
         crate::archive::recover(&mut state, now());
@@ -243,6 +241,10 @@ impl App {
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
             .collect::<Vec<_>>();
         let a = Self {
+            tool_runtime: Default::default(),
+            plugin_settings: Mutex::new(Default::default()),
+            notifications: Mutex::new(Default::default()),
+            store: Mutex::new(None),
             updates: crate::updates::Runtime::load(&root),
             plugin_access: std::sync::RwLock::new(()),
             desktop_bridge: Mutex::new(None),
@@ -304,6 +306,7 @@ impl App {
         let purpose = match kind {
             "message_filter" => "消息过滤",
             "handling" => "AI一键处置",
+            "tool_call" => "工具调用",
             "archive" | "learning" | "prompt_review" | "report" | "handling_learning"
             | "advice_revision" => "归档分析",
             _ => "事项更新",
@@ -329,10 +332,34 @@ impl App {
             kind: kind.into(),
             task_id: task.into(),
             detail: detail.into(),
+            change_summary: String::new(),
             before,
             after,
         });
         s.revision += 1;
+    }
+    fn audit_ai_change(
+        s: &mut State,
+        action: &Value,
+        before: Option<&Task>,
+        after: &Task,
+        summary_allowed: bool,
+    ) {
+        let kind = if before.is_some() {
+            "ai_update"
+        } else {
+            "ai_create"
+        };
+        let before = json!(before);
+        let after_value = json!(after);
+        let summary = if summary_allowed {
+            accepted_change_summary(action, &before, &after_value)
+        } else {
+            String::new()
+        };
+        Self::audit(s, kind, &after.id, &after.reason, before, after_value);
+        // audit always appends one entry after reserving history capacity.
+        s.audit.last_mut().unwrap().change_summary = summary;
     }
     pub(crate) fn ai_allowed(&self, mode: AiMode) -> bool {
         let s = self.state.lock().unwrap();
@@ -345,7 +372,7 @@ impl App {
     ) -> Result<Config, String> {
         self.reserve_ai_inner(mode, input, "handling", None, None, None)
     }
-    fn reserve_ai_inner(
+    pub(crate) fn reserve_ai_inner(
         &self,
         mode: AiMode,
         input: Option<(&str, &Value)>,
@@ -449,7 +476,8 @@ impl App {
         self.require_ai_purpose(kind)?;
         let call = self.begin_ai_for(kind)?;
         let context_frozen = payload["_context_frozen"].as_bool() == Some(true);
-        let mut context = self.capture_prepare_context(kind, context_frozen)?;
+        let mut context =
+            self.capture_prepare_context(kind, context_frozen, payload["_tool_task_id"].as_str())?;
         let request = self.prepare_ai_request_with(kind, payload, mode, &mut context)?;
         self.invoke_prepared_request(&request, mode, &call, true)
     }
@@ -460,7 +488,7 @@ impl App {
         payload: &Value,
         mode: AiMode,
     ) -> Result<PreparedAiRequest, String> {
-        let mut context = self.capture_prepare_context("archive", true)?;
+        let mut context = self.capture_prepare_context("archive", true, None)?;
         self.prepare_ai_request_with("archive", payload, mode, &mut context)
     }
 
@@ -470,21 +498,27 @@ impl App {
         &self,
         kind: &str,
         context_frozen: bool,
+        task_id: Option<&str>,
     ) -> Result<PrepareContext, String> {
-        let projects = if ["classify", "format"].contains(&kind) {
-            let projects = self.handling_projects().unwrap_or_else(|_| json!([]));
+        let projects = if ["classify", "format", "edit"].contains(&kind) {
+            let projects = self.analysis_projects();
             json!(projects
                 .as_array()
                 .into_iter()
                 .flatten()
                 .take(60)
-                .map(|p| json!({"id":p["id"],"name":p["name"],"cwd":p["cwd"]}))
+                .map(|p| json!({"id":p["id"],"name":p["name"],"cwd":p["cwd"],"driver":p["driver"],"source":p["source"]}))
                 .collect::<Vec<_>>())
         } else {
             json!([])
         };
         let _files = self.snapshot_files.lock().unwrap();
         let state = self.state.lock().unwrap().clone();
+        if let Some(task_id) = task_id {
+            if !state.tasks.iter().any(|task| task.id == task_id) {
+                return Err("事项不存在".into());
+            }
+        }
         self.capture_prepare_context_from(&state, kind, context_frozen, projects)
     }
 
@@ -553,10 +587,8 @@ impl App {
         context: &mut PrepareContext,
     ) -> Result<PreparedAiRequest, String> {
         let mut enriched = crate::context_budget::prepare(kind, payload);
-        if ["classify", "format"].contains(&kind) {
+        if ["classify", "format", "edit"].contains(&kind) {
             enriched["available_projects"] = context.projects.clone();
-            enriched["project_selection_policy"] =
-                json!(crate::prompt_config::get("project_selection"));
         }
         if [
             "classify", "format", "edit", "learning", "schedule", "archive",
@@ -661,9 +693,18 @@ impl App {
         } else {
             crate::wire_context::IdMap::default()
         };
+        if ["classify", "format", "edit", "archive"].contains(&kind) {
+            // Registry IDs and templates are local authority, not evidence aliases.
+            enriched["_registered_tools"] = json!(context
+                .config
+                .tools
+                .iter()
+                .filter(|tool| tool.enabled && tool.compatibility_issue().is_none())
+                .collect::<Vec<_>>());
+        }
         let prepared = ai::prepare(&context.config, kind, &enriched);
         crate::analysis_context::acknowledge_inline_memory(&mut enriched, kind, &prepared.prompt);
-        let cache_components = ai::prompt_components(&context.config, kind, &enriched);
+        let cache_components = ai::prompt_components(&context.config, kind, &enriched, &prepared);
         Ok(PreparedAiRequest {
             decision_context: context.decision_context.clone(),
             kind: kind.into(),
@@ -785,18 +826,33 @@ impl App {
         }
         *self.ai_progress.lock().unwrap() = String::new();
         self.ai_live.lock().unwrap().start(&request_id);
-        self.log("ai_start",json!({"request_id":request_id,"kind":kind,"source":source,"trigger":trigger,"model":config.model,"reasoning_effort":config.reasoning_effort,"messages":payload["changes"].as_array().map(|a|a.len()).unwrap_or(0),"batch":payload["_batch_metrics"],"runtime":request.runtime,"input_chars":ai::public_payload(payload).to_string().chars().count(),"input_sizes":json!({"prompt_chars":prepared.prompt_chars,"schema_chars":prepared.schema_chars,"tool_schema_chars":prepared.tool_chars,"total_input_chars":prepared.total,"max_input_chars":config.max_input_chars}),"cache_diag":cache_diag}));
+        self.log("ai_start",json!({"request_id":request_id,"kind":kind,"source":source,"trigger":trigger,"model":config.model,"reasoning_effort":config.reasoning_effort,"messages":payload["changes"].as_array().map(|a|a.len()).unwrap_or(0),"batch":payload["_batch_metrics"],"runtime":request.runtime,"input_chars":ai::public_payload(payload).to_string().chars().count(),"input_sizes":json!({"prompt_chars":prepared.prompt_chars,"schema_chars":prepared.schema_chars,"tool_schema_chars":prepared.tool_chars,"wire_overhead_chars":prepared.wire_chars,"total_input_chars":prepared.total,"max_input_chars":config.max_input_chars}),"cache_diag":cache_diag}));
         let mut observed = Value::Null;
         let mut cache_diagnostics = Value::Null;
         let mut analysis_thread = String::new();
+        let tool_session = if let Some(tools) = payload.get("_registered_tools") {
+            let tools: Vec<crate::tool_registry::ToolDefinition> =
+                serde_json::from_value(tools.clone()).map_err(|e| e.to_string())?;
+            (!tools.is_empty()).then(|| {
+                crate::tool_calling::ToolSession::new(
+                    self,
+                    &request_id,
+                    kind,
+                    payload["_tool_task_id"].as_str().unwrap_or(""),
+                    tools,
+                    &config,
+                    prepared.total,
+                )
+            })
+        } else {
+            None
+        };
         let mut res = ai::invoke_prepared(
-            &config,
-            kind,
-            payload,
-            prepared,
+            request,
             &self.root,
             &request_id,
             &call.cancel,
+            tool_session.as_ref(),
             &mut |event| {
                 use crate::ai_backend::AnalysisEvent;
                 match event {
@@ -945,7 +1001,21 @@ impl App {
         }
         detail["wire_chars"] = json!({"before":request.compression_before,"after":ai::public_payload(payload).to_string().chars().count()});
         detail["response_received"] = json!(response_received);
-        self.finalize_ai_response(request, &request_id, detail, res.map(|(value, _)| value))
+        if tool_session
+            .as_ref()
+            .is_some_and(|session| session.budget_exhausted.load(Ordering::SeqCst))
+        {
+            res = Err(format!(
+                "{}：工具续轮超过全局输入预算，原事项保留",
+                ai::INPUT_LIMIT_ERROR
+            ));
+        }
+        let result =
+            self.finalize_ai_response(request, &request_id, detail, res.map(|(value, _)| value));
+        if let Some(session) = tool_session {
+            session.finish(result.as_ref().err().map(String::as_str), &usage)?;
+        }
+        result
     }
 
     fn finalize_ai_response(
@@ -1004,30 +1074,49 @@ impl App {
                 *lock = s;
                 v["_tag_catalog"] = request.catalog.clone();
             }
-            if ["classify", "format"].contains(&kind) {
-                let key = if kind == "classify" {
+            if ["classify", "format", "edit"].contains(&kind) {
+                let valid = |row: &mut Value| {
+                    let id = row["suggested_project_id"].as_str().unwrap_or("");
+                    let exists = !id.is_empty()
+                        && row["suggested_project_reason"]
+                            .as_str()
+                            .is_some_and(|s| !s.trim().is_empty())
+                        && payload["available_projects"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|p| p["id"] == id);
+                    if !exists {
+                        row["suggested_project_id"] = json!("");
+                        row["suggested_project_reason"] = json!("");
+                    }
+                };
+                if kind == "edit" {
+                    valid(&mut v);
+                } else if let Some(rows) = v[if kind == "classify" {
                     "actions"
                 } else {
                     "tasks"
-                };
-                if let Some(rows) = v[key].as_array_mut() {
+                }]
+                .as_array_mut()
+                {
                     for row in rows {
-                        let id = row["suggested_project_id"].as_str().unwrap_or("");
-                        let valid = !id.is_empty()
-                            && row["suggested_project_reason"]
-                                .as_str()
-                                .is_some_and(|s| !s.trim().is_empty())
-                            && payload["available_projects"]
-                                .as_array()
-                                .into_iter()
-                                .flatten()
-                                .any(|p| p["id"] == id);
-                        if !valid {
-                            row["suggested_project_id"] = json!("");
-                            row["suggested_project_reason"] = json!("");
-                        }
+                        valid(row);
                     }
                 }
+            }
+            if let Some(object) = v.as_object_mut() {
+                object.remove("_tool_run_id");
+            }
+            if self
+                .state
+                .lock()
+                .unwrap()
+                .tool_runs
+                .iter()
+                .any(|run| run.id == request_id && !run.calls.is_empty())
+            {
+                v["_tool_run_id"] = json!(request_id);
             }
             Ok(v)
         });
@@ -1202,6 +1291,8 @@ impl App {
         };
         let mut candidate = locked.clone();
         let state = &mut candidate;
+        let tool_result =
+            json!({"_tool_run_id":result.as_ref().ok().and_then(|value|value.get("_tool_run_id"))});
         let parsed = result.and_then(|value| {
             let catalog = crate::tags::result_catalog(state, &value);
             let rows = value["tasks"].as_array().ok_or("AI结果缺少事项列表")?;
@@ -1209,9 +1300,13 @@ impl App {
                 return Err("生成事项数量应在1–12条之间".into());
             }
             let mut tasks = vec![];
+            let mut tool_links = vec![];
             for row in rows {
                 // `steps_changed` is an update-action signal, not a Task field.
                 let mut row = row.clone();
+                let call_ids = row
+                    .as_object_mut()
+                    .and_then(|object| object.remove("tool_call_ids"));
                 if let Some(object) = row.as_object_mut() {
                     object.remove("steps_changed");
                     object.remove("steps");
@@ -1239,13 +1334,23 @@ impl App {
                 mark_content_changed(&mut t, updated);
                 normalize_task(&mut t);
                 crate::tags::sanitize(&mut t, None, &catalog);
+                let mut link = tool_result.clone();
+                if let Some(ids) = call_ids {
+                    link["tool_call_ids"] = ids;
+                } else if rows.len() > 1 {
+                    link["tool_call_ids"] = json!([]);
+                }
+                tool_links.push((t.id.clone(), link));
                 tasks.push(t)
             }
-            Ok(tasks)
+            Ok((tasks, tool_links))
         });
         let count = match parsed {
-            Ok(tasks) => {
+            Ok((tasks, tool_links)) => {
                 let count = tasks.len();
+                for (task_id, link) in tool_links {
+                    crate::tool_calling::link_tasks(state, &link, &[task_id]);
+                }
                 state.tasks.remove(pos);
                 for t in tasks.into_iter().rev() {
                     Self::audit(
@@ -1394,6 +1499,19 @@ impl App {
             };
             self.save(&s)?;
             *state_lock = s;
+        } else if mode == AiMode::Automatic {
+            // A continuation can overflow after commands have run. Pause the
+            // automatic workflow just as for an oversized initial request.
+            let mut state_lock = self.state.lock().unwrap();
+            if !state_lock.auto_analysis_blocked {
+                let mut s = state_lock.clone();
+                s.auto_analysis_blocked = true;
+                s.auto_analysis_blocked_at = now();
+                s.auto_analysis_block_reason = result.as_ref().unwrap_err().clone();
+                s.pending_analysis = true;
+                self.save(&s)?;
+                *state_lock = s;
+            }
         }
         result
     }
@@ -1412,13 +1530,13 @@ impl App {
         self.analysis_last_attempt.store(now(), Ordering::SeqCst);
         // Capture every preparation input once. Candidate reductions reuse the
         // same config, project catalog, memory, frozen runtime and snapshot rows.
-        let projects = self.handling_projects().unwrap_or_else(|_| json!([]));
+        let projects = self.analysis_projects();
         let projects = json!(projects
             .as_array()
             .into_iter()
             .flatten()
             .take(60)
-            .map(|p| json!({"id":p["id"],"name":p["name"],"cwd":p["cwd"]}))
+            .map(|p| json!({"id":p["id"],"name":p["name"],"cwd":p["cwd"],"driver":p["driver"],"source":p["source"]}))
             .collect::<Vec<_>>());
         let (batch, request, _message_claim) = {
             let mut state_lock = self.state.lock().unwrap();
@@ -1631,10 +1749,16 @@ impl App {
         let mut task_versions = frozen.task_versions.clone();
         task_versions
             .retain(|id, _| request.initial_tasks.contains(id) || seen.contains(&json!(id)));
-        let actions = result["actions"]
+        let mut actions = result["actions"]
             .as_array()
             .ok_or("AI结果缺少actions数组")?
             .clone();
+        for action in &mut actions {
+            action["_tool_run_id"] = result["_tool_run_id"].clone();
+            if action.get("tool_call_ids").is_none() {
+                action["tool_call_ids"] = json!([]);
+            }
+        }
         let mut locked = self.state.lock().unwrap();
         // Reject frozen bodies that no longer match the live state before
         // applying anything. The same check is repeated in apply_actions.
@@ -1655,6 +1779,10 @@ impl App {
         s.pending_analysis = remaining > 0;
         s.analysis_pending_since = if s.pending_analysis { now() } else { 0 };
         self.save(&s)?;
+        self.notifications
+            .lock()
+            .unwrap()
+            .push(&s.audit[audit_start..]);
         *locked = s;
         drop(locked);
         self.log("analysis_result",json!({"applied":applied,"processed":payload["changes"].as_array().map(|a|a.len()).unwrap_or(0),"remaining":remaining}));
@@ -1764,6 +1892,8 @@ impl App {
                     let mut update = action.clone();
                     update["action"] = json!("update");
                     update["task_id"] = json!(tid);
+                    // A summary of a new task may misdescribe a deduplicated update.
+                    update["change_summary"] = json!("");
                     let (count, rejected) = Self::apply_actions_detailed(
                         s,
                         &[update],
@@ -1813,9 +1943,11 @@ impl App {
                         .into_iter()
                         .flatten()
                         .any(|c| c["field"] == "status"));
+            let mut summary_allowed = true;
             if wants_completion {
                 if action["confidence"].as_f64().unwrap_or(0.) < 0.95 || completion_proof.is_empty()
                 {
+                    summary_allowed = false;
                     t.status = s
                         .tasks
                         .iter()
@@ -1856,7 +1988,8 @@ impl App {
                 preserve_model_summary(&mut t);
                 crate::tags::sanitize(&mut t, None, catalog);
                 normalize_task(&mut t);
-                Self::audit(&mut s, "ai_create", &t.id, &t.reason, Value::Null, json!(t));
+                Self::audit_ai_change(&mut s, action, None, &t, summary_allowed);
+                crate::tool_calling::link_tasks(s, action, &[t.id.clone()]);
                 s.tasks.push(t);
                 applied += 1;
             } else {
@@ -1878,6 +2011,7 @@ impl App {
                     // status/title/next-step backwards.
                     let mut evidence = old.clone();
                     merge_evidence(&mut evidence, &sources, &background, &completion_proof);
+                    crate::tool_calling::link_tasks(s, action, &[tid.to_string()]);
                     if evidence.evidence == old.evidence {
                         continue;
                     }
@@ -1972,14 +2106,8 @@ impl App {
                 preserve_model_summary(&mut candidate);
                 normalize_task(&mut candidate);
                 crate::tags::sanitize(&mut candidate, Some(&old), catalog);
-                Self::audit(
-                    &mut s,
-                    "ai_update",
-                    &candidate.id,
-                    &candidate.reason,
-                    json!(old),
-                    json!(candidate),
-                );
+                Self::audit_ai_change(&mut s, action, Some(&old), &candidate, summary_allowed);
+                crate::tool_calling::link_tasks(s, action, &[candidate.id.clone()]);
                 s.tasks[pos] = candidate;
                 task_versions.insert(tid.to_string(), s.tasks[pos].updated);
                 applied += 1;
@@ -2197,6 +2325,52 @@ fn preserve_model_summary(t: &mut Task) {
         t.summary_fallback = false;
     }
 }
+
+/// Presentation metadata is best-effort. Keep it only when every requested
+/// field survived validation, and the accepted task has a substantive change.
+fn accepted_change_summary(action: &Value, before: &Value, after: &Value) -> String {
+    let Some(summary) = action["change_summary"].as_str() else {
+        return String::new();
+    };
+    if summary.trim().is_empty()
+        || summary.chars().count() > 30
+        || summary.chars().any(char::is_control)
+        || summary.contains(['\u{2028}', '\u{2029}'])
+    {
+        return String::new();
+    }
+    let Some(fields) = action["fields"].as_array() else {
+        return String::new();
+    };
+    if fields.iter().any(|change| {
+        change["field"]
+            .as_str()
+            .is_none_or(|field| after.get(field) != Some(&change["value"]))
+    }) {
+        return String::new();
+    }
+    let tags = |value: &Value| {
+        serde_json::from_value::<Vec<crate::tags::Tag>>(value.clone())
+            .ok()
+            .map(|tags| tags.into_iter().collect::<BTreeSet<_>>())
+    };
+    if action
+        .get("tags")
+        .is_some_and(|requested| tags(requested) != tags(&after["tags"]))
+    {
+        return String::new();
+    }
+    if !before.is_null()
+        && fields.iter().all(|change| {
+            let key = change["field"].as_str().unwrap();
+            before[key] == after[key]
+        })
+        && tags(&before["tags"]) == tags(&after["tags"])
+    {
+        return String::new();
+    }
+    summary.trim().to_owned()
+}
 /// Admit only ids the model actually retrieved (`_context_seen`) from the
 /// frozen view captured before invocation. The frozen record is kept so
 /// `apply_actions` can compare it with live state.
@@ -2265,6 +2439,7 @@ fn task_from_ui(value: &Value) -> Result<Task, String> {
         for key in [
             "number",
             "evidence_count",
+            "has_tool_calls",
             "effective_priority",
             "effective_tags",
             "priority_rank",

@@ -240,10 +240,6 @@ document.addEventListener('click', async (e) => {
         await refreshState(true);
         toast('消息已删除，关联事项保留');
         break;
-      case 'handling-history':
-        page = 'handling';
-        await render();
-        break;
     }
   } catch (err) {
     if ($('#modal-error') && !$('#overlay').hidden) $('#modal-error').textContent = err.message;

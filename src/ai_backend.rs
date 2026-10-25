@@ -11,6 +11,7 @@ pub mod agent_approval;
 pub mod api;
 pub mod codex;
 pub mod dsh;
+pub mod model_api;
 
 /// No credentials belong in this serializable descriptor. Future API adapters
 /// must use a separate credential store and retain only credential references.
@@ -179,6 +180,7 @@ pub struct AnalysisRequest<'a> {
     /// Exact MCP tool declarations measured for this request. Adapters must use
     /// this value rather than deriving a second, potentially different set.
     pub tools: Option<&'a Value>,
+    pub(crate) registered_tools: Option<&'a crate::tool_calling::ToolSession<'a>>,
     pub cancel: &'a AtomicBool,
 }
 pub const NOT_SUBMITTED: &str = "处置未提交：";
@@ -337,6 +339,7 @@ mod tests {
                 "filter":{"connection_id":"api","model":"synthetic"},
                 "analysis":{"connection_id":"api","model":"synthetic"},
                 "review":{"connection_id":"api","model":"synthetic"},
+                "tool_call":{"connection_id":"api","model":"synthetic"},
                 "handling":{"connection_id":"api","model":"synthetic"}
             }
         })).unwrap();

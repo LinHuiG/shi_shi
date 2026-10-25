@@ -25,6 +25,7 @@ window.receive = (v) => {
   v.ok ? p.resolve(v.data) : p.reject(rpcError(v.error));
 };
 const longAiMethods = new Set([
+  'tool_test',
   'scan',
   'analyze',
   'format',
@@ -277,8 +278,11 @@ function badge(p) {
 function empty(title, text, button = '') {
   return `<div class="empty"><div class="empty-icon">▤</div><div>${title}</div><p>${text}</p>${button}</div>`;
 }
-let modalClosing = null;
+let modalClosing = null,
+  modalOutsideDismiss = null,
+  modalBack = null;
 function setModal(html) {
+  if (typeof cancelEmbeddedPluginSettings === 'function' && cancelEmbeddedPluginSettings() === false) return;
   const overlay = $('#overlay'),
     closing = modalClosing,
     opacity = getComputedStyle(overlay).opacity;
@@ -287,7 +291,9 @@ function setModal(html) {
   overlay.inert = false;
   delete overlay.dataset.closing;
   modalFromTrace = false;
-  $('#dialog').classList.remove('wide-dialog', 'live-dialog', 'approval-shell');
+  modalOutsideDismiss = null;
+  modalBack = null;
+  $('#dialog').classList.remove('wide-dialog', 'live-dialog', 'approval-shell', 'plugin-settings-dialog', 'plugin-settings-compact', 'tool-editor-dialog', 'tool-history-dialog', 'tool-detail-dialog');
   $('#dialog').innerHTML = html;
   overlay.hidden = false;
   if (closing) motionAnimate(overlay, [{ opacity }, { opacity: 1 }]);
@@ -297,11 +303,57 @@ function setModal(html) {
     { opacity: 1, transform: 'none' },
   ]);
 }
+function modalReturnPoint() {
+  if ($('#overlay').hidden || modalClosing) return null;
+  const dialog = $('#dialog'), nodes = [...dialog.childNodes], classes = dialog.className,
+    scroll = dialog.scrollTop, focused = document.activeElement, task = modalTask,
+    outside = modalOutsideDismiss, back = modalBack, fromTrace = modalFromTrace;
+  return () => {
+    setModal('');
+    dialog.className = classes;
+    dialog.replaceChildren(...nodes);
+    modalTask = task;
+    modalOutsideDismiss = outside;
+    modalBack = back;
+    modalFromTrace = fromTrace;
+    dialog.scrollTop = scroll;
+    if (focused?.isConnected) focused.focus({ preventScroll: true });
+  };
+}
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {}
+  const focused = document.activeElement, field = document.createElement('textarea');
+  field.value = text;
+  field.readOnly = true;
+  field.style.cssText = 'position:fixed;left:-9999px;top:0';
+  document.body.append(field);
+  field.focus({ preventScroll: true });
+  field.select();
+  try { return !!document.execCommand('copy'); }
+  catch { return false; }
+  finally {
+    field.remove();
+    if (focused?.isConnected) focused.focus({ preventScroll: true });
+  }
+}
 function closeModal() {
   const overlay = $('#overlay');
   if (overlay.hidden || modalClosing || $('#dialog').querySelector('[data-pending="true"]')) return;
+  if (modalBack) {
+    const back = modalBack;
+    modalBack = null;
+    back();
+    return;
+  }
+  if (typeof cancelEmbeddedPluginSettings === 'function') cancelEmbeddedPluginSettings();
   modalTask = null;
   modalFromTrace = false;
+  modalOutsideDismiss = null;
   const animation = motionAnimate(
     overlay,
     [{ opacity: getComputedStyle(overlay).opacity }, { opacity: 0 }],
@@ -370,6 +422,7 @@ function viewKey(s, p) {
         s.usage.day,
         s.pending,
         s.config.enabled,
+        s.config.tools,
         s.ai_busy,
         s.busy,
       ]);
@@ -391,7 +444,7 @@ function viewKey(s, p) {
     case 'logs':
       return JSON.stringify([s.audit, s.activity, s.usage]);
     case 'sources':
-      return JSON.stringify([s.chat_sources, s.disabled_plugins, pluginCatalogRevision]);
+      return JSON.stringify([s.chat_sources, pluginCatalogRevision]);
     case 'prompts':
       return JSON.stringify([
         promptSection,
@@ -401,8 +454,6 @@ function viewKey(s, p) {
             ? s.memory_state
             : s.prompt_state,
       ]);
-    case 'handling':
-      return JSON.stringify([s.handling_version, s.handling_proposals]);
     default:
       return '';
   }

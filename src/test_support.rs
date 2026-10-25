@@ -7,6 +7,20 @@ use crate::work_state::WorkSchedule;
 use chrono::{NaiveDate, TimeZone, Utc};
 use std::collections::BTreeMap;
 
+/// Existing commit-failure regressions now fail the SQLite commit instead of
+/// obstructing the retired JSON temporary file.
+pub fn persistence_failure(root: &std::path::Path, blocked: bool) -> Result<(), String> {
+    let db =
+        rusqlite::Connection::open(crate::storage::data_dir(root).join(crate::state_store::FILE))
+            .map_err(|e| e.to_string())?;
+    let sql = if blocked {
+        "CREATE TRIGGER reject_state_insert BEFORE INSERT ON metadata BEGIN SELECT RAISE(ABORT,'synthetic commit rejection'); END; CREATE TRIGGER reject_state_update BEFORE UPDATE ON metadata BEGIN SELECT RAISE(ABORT,'synthetic commit rejection'); END;"
+    } else {
+        "DROP TRIGGER reject_state_insert; DROP TRIGGER reject_state_update;"
+    };
+    db.execute_batch(sql).map_err(|e| e.to_string())
+}
+
 pub fn date(year: i32, month: u32, day: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month, day).expect("synthetic date")
 }

@@ -136,6 +136,9 @@ impl Backend for Dsh {
         r: AnalysisRequest<'_>,
         event: &mut dyn FnMut(AnalysisEvent),
     ) -> Result<(Value, Value), String> {
+        if r.payload["_model_only"] != true {
+            return super::model_api::analyze(c, r, event);
+        }
         self.validate(c, r.config)?;
         let job = crate::storage::data_dir(&r.root)
             .join("ai-work")
@@ -160,15 +163,21 @@ impl Backend for Dsh {
         }
         let snapshot = job.join("context.json");
         fs::write(&snapshot, r.payload["_local_context"].to_string()).map_err(|e| e.to_string())?;
-        let retrieval = r
-            .tools
-            .is_some_and(|tools| declares_tool(tools, "read_context"));
+        let retrieval = r.tools.is_some_and(|tools| {
+            tools["tools"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|tool| tool["name"] != "submit_analysis"))
+        });
         let (provider, model) = model_route(&r.config.model);
         let spec = shishi_acp::analysis::AnalysisSpec {
             request_id: crate::model::id(),
             kind: r.kind.into(),
             schema: r.schema.clone(),
             prompt: r.prompt.into(),
+            images: r.payload["_model_images"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default(),
             workdir: workdir.clone(),
             snapshot_path: snapshot.clone(),
             app_exe: std::env::current_exe().map_err(|e| e.to_string())?,
@@ -265,7 +274,9 @@ impl Backend for Dsh {
                     fs::write(r.trace.join("output.txt"), value.to_string())
                         .map_err(|e| format!("分析结果跟踪保存失败：{e}"))?;
                 }
-                super::api::attach_result(&mut value, &r.payload["_local_context"], &meter);
+                if r.payload["_model_only"] != true {
+                    super::api::attach_result(&mut value, &r.payload["_local_context"], &meter);
+                }
                 Ok((value, tokens))
             })();
             done.store(true, Ordering::SeqCst);
@@ -563,31 +574,6 @@ impl AgentSession for DshAgent {
         self.client
             .respond_permission(&p.request_id, &option.option_id)
             .map_err(|e| e.to_string())
-    }
-}
-
-/// Exact tool-name match; a name mentioned in another tool's description must
-/// not enable retrieval.
-fn declares_tool(tools: &Value, name: &str) -> bool {
-    tools["tools"]
-        .as_array()
-        .is_some_and(|list| list.iter().any(|tool| tool["name"] == name))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn retrieval_requires_an_exactly_named_tool() {
-        assert!(declares_tool(
-            &crate::analysis_context::tools(),
-            "read_context"
-        ));
-        let mention = json!({"tools":[{"name":"read_image","description":"unlike read_context, reads images"}]});
-        assert!(!declares_tool(&mention, "read_context"));
-        assert!(!declares_tool(&json!({}), "read_context"));
     }
 }
 

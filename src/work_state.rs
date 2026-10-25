@@ -522,6 +522,7 @@ pub struct WorkSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiPurpose {
+    ToolCall,
     Classify,
     Format,
     Edit,
@@ -537,7 +538,8 @@ pub enum AiPurpose {
 }
 
 impl AiPurpose {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
+        Self::ToolCall,
         Self::Classify,
         Self::Format,
         Self::Edit,
@@ -1547,7 +1549,7 @@ mod tests {
     fn scanning_is_not_part_of_the_ai_purpose_set() {
         // Scanning has no gate function in this crate; this length is a guard
         // that adding a Scan purpose to the AI enum is an explicit review event.
-        assert_eq!(AiPurpose::ALL.len(), 12);
+        assert_eq!(AiPurpose::ALL.len(), 13);
         assert_eq!(AiTrigger::ALL.len(), 7);
     }
 }

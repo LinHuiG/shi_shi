@@ -2,7 +2,7 @@
 
 Windows x64 Rust desktop application. UI lives in assets; Rust handles IPC, persistence and providers.
 
-- Base ongoing discussions and changes on `main`; use another branch only when the user explicitly requests it.
+- The public release checkout uses `main`; a private development checkout uses `test`. Preserve the checkout's role when synchronizing reviewed source snapshots, and use another branch only when the user explicitly requests it.
 - After implementation, pull and integrate remote changes before review, validation, and packaging. Resolve routine merge conflicts autonomously; ask about conflicts in functionality or design. Review and validate the integrated tree, and build the installer from that same tree.
 
 - Keep all real messages, personal settings, credentials, private adapters and build outputs out of source control.
@@ -20,7 +20,7 @@ Windows x64 Rust desktop application. UI lives in assets; Rust handles IPC, pers
 - AI analysis has one global total timeout, default 600 seconds for Codex, DSH and API; do not restore per-source or per-connection timeout settings. Keep provider-published streaming previews separate from validated business results. Raw response diagnostics remain local and obey the full-trace retention setting.
 - Explicit manual operations are independent of work hours, holidays and overtime. Automatic operations keep their schedule gate; manual requests still obey quotas, permissions, cancellation and validation. The bottom bar stays one line: latest public AI content in the center, pending-message management at the far right.
 
-- The initial public release is 1.2.0. Increment subsequent releases.
+- The initial public release is 1.2.0. Increment subsequent public releases and preserve the private checkout's independent version number during source synchronization.
 
 ## Persistent improvement backlog (all chats)
 

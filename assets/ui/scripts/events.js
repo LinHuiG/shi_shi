@@ -513,6 +513,14 @@ document.addEventListener('keydown', (e) => {
     closeModal();
   }
 });
+let modalPointerStartedOutside = false;
+$('#overlay').addEventListener('pointerdown', (e) => {
+  modalPointerStartedOutside = e.button === 0 && e.target === $('#overlay');
+});
+$('#overlay').addEventListener('pointercancel', () => { modalPointerStartedOutside = false; });
 $('#overlay').addEventListener('click', (e) => {
-  if (e.target === $('#overlay') && modalFromTrace) closeModal();
+  // Selecting text may end outside the dialog; that gesture is not an outside click.
+  const outsideClick = e.detail === 0 || modalPointerStartedOutside;
+  modalPointerStartedOutside = false;
+  if (e.target === $('#overlay') && outsideClick && (modalFromTrace || modalOutsideDismiss?.())) closeModal();
 });

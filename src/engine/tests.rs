@@ -2,6 +2,304 @@
 use super::*;
 
 #[cfg(test)]
+mod change_summary_tests {
+    use super::*;
+
+    fn fixture() -> State {
+        let mut state = State::default();
+        for (id, time) in [("old", 10), ("new", 20), ("newest", 30), ("older", 5)] {
+            state.messages.insert(
+                id.into(),
+                Message {
+                    id: id.into(),
+                    time,
+                    text: "合成进展".into(),
+                    private: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let mut task = Task {
+            id: "task".into(),
+            title: "合成验证事项".into(),
+            description: "核对合成结果".into(),
+            status: "待处理".into(),
+            next_step: "准备验证".into(),
+            updated: 10,
+            evidence: TaskEvidence {
+                direct: vec!["old".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        normalize_task(&mut task);
+        state.tasks.push(task);
+        state
+    }
+
+    fn update() -> Value {
+        json!({"action":"update","task_id":"task","sources":["new"],"tags":[],
+            "fields":[{"field":"next_step","value":"核对验证结果"}],
+            "reason":"新消息明确下一步","confidence":0.99,"change_summary":"已进入结果核对阶段"})
+    }
+
+    fn create() -> Value {
+        json!({"action":"create","task_id":"","sources":["new"],"tags":[],
+            "fields":[{"field":"title","value":"合成验证事项"},{"field":"description","value":"核对合成结果"}],
+            "reason":"明确的新请求","confidence":0.99,"change_summary":"需要核对最新验证结果"})
+    }
+
+    #[test]
+    fn tool_calls_follow_individual_accepted_actions_including_evidence_only_updates() {
+        use crate::tool_calling::{CallRecord, ToolRun};
+        let mut state = fixture();
+        state.tool_runs.push(ToolRun {
+            id: "synthetic-run".into(),
+            calls: ["update-call", "create-call", "evidence-call"]
+                .map(|call_id| CallRecord {
+                    call_id: call_id.into(),
+                    ..Default::default()
+                })
+                .into(),
+            ..Default::default()
+        });
+        let mut update = update();
+        update["_tool_run_id"] = json!("synthetic-run");
+        update["tool_call_ids"] = json!(["update-call"]);
+        let mut create = create();
+        create["sources"] = json!(["newest"]);
+        create["_tool_run_id"] = json!("synthetic-run");
+        create["tool_call_ids"] = json!(["create-call"]);
+        assert_eq!(apply(&mut state, &[update.clone(), create]).0, 2);
+        let created = state
+            .tasks
+            .iter()
+            .find(|t| t.id != "task")
+            .unwrap()
+            .id
+            .clone();
+        assert_eq!(state.tool_runs[0].calls[0].task_ids, ["task"]);
+        assert_eq!(state.tool_runs[0].calls[1].task_ids, [created]);
+        update["sources"] = json!(["older"]);
+        update["tool_call_ids"] = json!(["evidence-call"]);
+        assert_eq!(apply(&mut state, &[update]).0, 1);
+        assert_eq!(state.tool_runs[0].calls[2].task_ids, ["task"]);
+    }
+
+    fn apply(state: &mut State, actions: &[Value]) -> (usize, BTreeSet<String>) {
+        let allowed = state.messages.clone();
+        let versions = state
+            .tasks
+            .iter()
+            .map(|t| (t.id.clone(), t.updated))
+            .collect();
+        App::apply_actions_detailed(state, actions, &allowed, &versions, &[]).unwrap()
+    }
+    #[test]
+    fn analysis_preserves_explicit_tool_bindings_and_new_tasks_have_none() {
+        let mut state = fixture();
+        state.tasks[0].enabled_tool_ids = vec!["synthetic-bound-tool".into()];
+        apply(&mut state, &[update()]);
+        assert_eq!(
+            state.tasks[0].enabled_tool_ids,
+            vec!["synthetic-bound-tool"]
+        );
+        state.tasks.clear();
+        apply(&mut state, &[create()]);
+        assert!(state.tasks[0].enabled_tool_ids.is_empty());
+    }
+
+    #[test]
+    fn change_summary_is_saved_for_accepted_create_and_update() {
+        let mut state = fixture();
+        state.tasks.clear();
+        let action = create();
+        assert_eq!(apply(&mut state, &[action.clone()]).0, 1);
+        assert_eq!(state.audit[0].kind, "ai_create");
+        assert_eq!(
+            state.audit[0].change_summary,
+            action["change_summary"].as_str().unwrap()
+        );
+        assert_eq!(state.audit[0].after, json!(state.tasks[0]));
+        let mut state = fixture();
+        let action = update();
+        assert_eq!(apply(&mut state, &[action.clone()]).0, 1);
+        assert_eq!(state.tasks[0].next_step, "核对验证结果");
+        assert_eq!(state.audit[0].kind, "ai_update");
+        assert_eq!(
+            state.audit[0].change_summary,
+            action["change_summary"].as_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn change_summary_invalid_or_missing_never_blocks_business_changes() {
+        for invalid in [
+            Value::Null,
+            json!([]),
+            json!(17),
+            json!(""),
+            json!("  "),
+            json!("变".repeat(31)),
+            json!("第一行\n第二行"),
+            json!("一\u{2028}二"),
+        ] {
+            for creating in [false, true] {
+                let mut state = fixture();
+                let mut action = if creating {
+                    state.tasks.clear();
+                    create()
+                } else {
+                    update()
+                };
+                if invalid.is_null() {
+                    action.as_object_mut().unwrap().remove("change_summary");
+                } else {
+                    action["change_summary"] = invalid.clone();
+                }
+                assert_eq!(apply(&mut state, &[action]).0, 1, "{invalid}");
+                assert!(state.audit[0].change_summary.is_empty(), "{invalid}");
+                assert_eq!(state.tasks.len(), 1);
+            }
+        }
+        let mut state = fixture();
+        let mut action = update();
+        action["change_summary"] = json!("变".repeat(30));
+        apply(&mut state, &[action]);
+        assert_eq!(state.audit[0].change_summary.chars().count(), 30);
+    }
+
+    #[test]
+    fn change_summary_is_empty_when_requested_fields_are_rejected_or_corrected() {
+        for (field, value) in [
+            ("status", "已完成"),
+            ("status", "无效状态"),
+            ("due", "2026-10-24T17:30:00+08:00"),
+            ("due", "无效日期"),
+        ] {
+            let mut state = fixture();
+            let mut action = update();
+            action["fields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"field":field,"value":value}));
+            assert_eq!(apply(&mut state, &[action]).0, 1);
+            assert_eq!(state.tasks[0].next_step, "核对验证结果");
+            assert_eq!(state.tasks[0].status, "待处理");
+            assert!(state.tasks[0].due.is_empty());
+            assert!(state.audit[0].change_summary.is_empty(), "{field}/{value}");
+        }
+        let mut state = fixture();
+        let mut action = update();
+        action["tags"] = json!([{"kind":"目录中没有的组","value":"未知值"}]);
+        assert_eq!(apply(&mut state, &[action]).0, 1);
+        assert!(state.tasks[0].tags.is_empty());
+        assert!(state.audit[0].change_summary.is_empty());
+
+        // Even a redundant completion request needs accepted proof before its
+        // accompanying summary can describe other changes in the same action.
+        let mut state = fixture();
+        state.tasks[0].status = "已完成".into();
+        let mut action = update();
+        action["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"field":"status","value":"已完成"}));
+        apply(&mut state, &[action]);
+        assert!(state.audit[0].change_summary.is_empty());
+    }
+
+    #[test]
+    fn change_summary_is_retained_for_proven_completion_and_deadline_changes() {
+        for (field, value, proof) in [
+            ("status", "已完成", "completion_evidence"),
+            ("due", "2026-10-24T17:30:00+08:00", "deadline_evidence"),
+        ] {
+            let mut state = fixture();
+            let mut action = update();
+            action["fields"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"field":field,"value":value}));
+            action[proof] = json!(["new"]);
+            assert_eq!(apply(&mut state, &[action.clone()]).0, 1);
+            assert_eq!(state.audit[0].after[field], value);
+            assert_eq!(
+                state.audit[0].change_summary,
+                action["change_summary"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn change_summary_is_empty_for_evidence_only_or_unchanged_content() {
+        for source in ["older", "old", "new"] {
+            let mut state = fixture();
+            let mut action = update();
+            action["sources"] = json!([source]);
+            if source == "new" {
+                action["fields"][0]["value"] = json!("准备验证");
+            }
+            let applied = apply(&mut state, &[action]).0;
+            assert_eq!(applied, usize::from(source != "old"));
+            assert_eq!(state.tasks[0].next_step, "准备验证");
+            assert!(state.audit.iter().all(|row| row.change_summary.is_empty()));
+            if source == "older" {
+                assert_eq!(state.audit[0].kind, "ai_evidence");
+            }
+        }
+    }
+
+    #[test]
+    fn change_summary_never_leaks_from_rejected_or_deduplicated_actions() {
+        let mut state = fixture();
+        let allowed = state.messages.clone();
+        assert_eq!(
+            App::apply_actions_detailed(&mut state, &[update()], &allowed, &BTreeMap::new(), &[])
+                .unwrap()
+                .0,
+            0
+        );
+        assert!(state.audit.is_empty());
+        let mut action = update();
+        action["sources"] = json!(["missing"]);
+        assert_eq!(apply(&mut state, &[action]).0, 0);
+        assert!(state.audit.is_empty());
+
+        let mut action = create();
+        action["sources"] = json!(["old", "new"]);
+        action["fields"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"field":"next_step","value":"核对验证结果"}));
+        assert_eq!(apply(&mut state, &[action]).0, 1);
+        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.audit[0].kind, "ai_update");
+        assert!(state.audit[0].change_summary.is_empty());
+    }
+
+    #[test]
+    fn change_summary_stays_one_string_per_action_without_concatenation() {
+        let mut state = fixture();
+        let first = update();
+        let mut second = update();
+        second["sources"] = json!(["newest"]);
+        second["fields"][0]["value"] = json!("等待最终确认");
+        second["change_summary"] = json!("核对结束，等待最终确认");
+        assert_eq!(apply(&mut state, &[first.clone(), second.clone()]).0, 2);
+        assert_eq!(state.audit.len(), 2);
+        assert_eq!(
+            state.audit[0].change_summary,
+            first["change_summary"].as_str().unwrap()
+        );
+        assert_eq!(
+            state.audit[1].change_summary,
+            second["change_summary"].as_str().unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -207,12 +505,12 @@ mod tests {
         assert!(app.state.lock().unwrap().message_filter.early);
         app.state.lock().unwrap().config.daily_calls = 100;
         // Failure to persist a start must neither consume the decision nor invoke AI.
-        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .reserve_ai_inner(AiMode::Manual, None, "classify", None, Some(0), None)
             .is_err());
         assert!(app.state.lock().unwrap().message_filter.early);
-        fs::remove_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, false).unwrap();
         app.reserve_ai_inner(AiMode::Manual, None, "classify", None, Some(0), None)
             .unwrap();
         {
@@ -258,7 +556,7 @@ mod tests {
         }
         {
             let mut s = app.state.lock().unwrap();
-            s.messages = messages.clone();
+            s.messages = messages.clone().into();
             s.message_filter.early = true;
             s.message_filter.last_run = 1;
             s.config.daily_calls = 100;
@@ -462,7 +760,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        s.tasks = vec![
+        *s.tasks = vec![
             Task {
                 id: "a".into(),
                 evidence: TaskEvidence {
@@ -780,6 +1078,7 @@ mod today_tests {
             kind: "manual_status".into(),
             task_id: "x".into(),
             detail: String::new(),
+            change_summary: String::new(),
             before: json!({"status":"待处理"}),
             after: json!({"status":"已完成"}),
         }];
@@ -800,6 +1099,7 @@ mod today_tests {
             kind: "manual_status".into(),
             task_id: task.into(),
             detail: String::new(),
+            change_summary: String::new(),
             before: json!({"status":from}),
             after: json!({"status":to}),
         };
@@ -924,13 +1224,13 @@ mod schedule_tests {
     #[test]
     fn missed_days_are_not_backfilled_and_save_failure_is_retryable() {
         let (app, root, at) = fixture();
-        fs::create_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app.generate_scheduled(at + 5 * 86_400_000).is_err());
         assert!(app.state.lock().unwrap().tasks.is_empty());
         assert!(app.state.lock().unwrap().schedules[0]
             .last_generated_on
             .is_empty());
-        fs::remove_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, false).unwrap();
         assert_eq!(app.generate_scheduled(at + 5 * 86_400_000).unwrap(), 1);
         assert_eq!(app.snapshot()["tasks"][0]["scheduled_for"], "2026-10-20");
         let _ = fs::remove_dir_all(root);
@@ -1000,11 +1300,14 @@ mod ai_edit_tests {
     }
     #[test]
     fn updates_only_requested_fields_and_can_undo() {
-        let (app, root, old) = fixture();
+        let (app, root, mut old) = fixture();
+        old.enabled_tool_ids = vec!["synthetic-bound-tool".into()];
+        app.state.lock().unwrap().tasks[0].enabled_tool_ids = old.enabled_tool_ids.clone();
         let saved = app.complete_ai_edit(&old, old.clone(), "已经修复，现在等测试验证", json!({"reason":"根据人工进展调整阶段","changes":[{"field":"title","value":"确认更新后的会议安排"},{"field":"waiting_for","value":"测试同事"}]})).unwrap();
         let current: Task = serde_json::from_value(saved).unwrap();
         assert_eq!(current.id, old.id);
         assert_eq!(current.evidence, old.evidence);
+        assert_eq!(current.enabled_tool_ids, old.enabled_tool_ids);
         assert_eq!(current.created, old.created);
         assert_eq!(current.due, old.due);
         assert_eq!(current.status, old.status);
@@ -1050,7 +1353,7 @@ mod ai_edit_tests {
     #[test]
     fn failed_save_does_not_apply_ai_edit() {
         let (app, root, old) = fixture();
-        fs::create_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app
             .complete_ai_edit(
                 &old,
@@ -2104,7 +2407,8 @@ mod correction_tests {
         assert_eq!(
             accepted.prepared.prompt_chars
                 + accepted.prepared.schema_chars
-                + accepted.prepared.tool_chars,
+                + accepted.prepared.tool_chars
+                + accepted.prepared.wire_chars,
             accepted.prepared.total
         );
         assert!(accepted.prepared.tools.is_some());

@@ -384,6 +384,81 @@ fn image_tool_rejects_remote_urls_and_malformed_base64() {
 }
 
 #[test]
+fn continuation_budget_counts_text_but_not_native_image_pixels() {
+    struct Handler {
+        text: String,
+        image: String,
+        calls: usize,
+    }
+    impl ToolHandler for Handler {
+        fn input_char_limit(&self) -> Option<usize> {
+            Some(10_000)
+        }
+        fn invoke(
+            &mut self,
+            _: &shishi_api::ToolInvocation<'_>,
+        ) -> Result<shishi_api::ToolResult, ToolFailure> {
+            self.calls += 1;
+            shishi_api::ToolResult::from_mcp(&json!({"content":[
+                {"type":"text","text":self.text},
+                {"type":"image","mimeType":"image/png","data":self.image}]}))
+        }
+    }
+    for (text, image, expected) in [
+        ("short".into(), "aW1n".repeat(40_000), None),
+        (
+            "中".repeat(10_001),
+            "aW1n".into(),
+            Some(ApiErrorKind::InputLimit),
+        ),
+        (
+            "data:image/png;base64,".to_owned() + &"aW1n".repeat(3_000),
+            "aW1n".into(),
+            Some(ApiErrorKind::InputLimit),
+        ),
+        (
+            "short".into(),
+            "aW1n".repeat(1024 * 1024 + 1),
+            Some(ApiErrorKind::ToolFailed),
+        ),
+    ] {
+        let mock = MockTransport::new(vec![
+            tool_response(
+                vec![call("img", "read_image", r#"{"image_id":"one"}"#)],
+                Some(usage(11, 7, 18, None)),
+            ),
+            response_with_usage(&final_content(), None),
+        ]);
+        let mut handler = Handler {
+            text,
+            image,
+            calls: 0,
+        };
+        let result = analyze(
+            &mock,
+            &[read_image_tool()],
+            Some(&mut handler),
+            Duration::from_secs(5),
+        );
+        assert_eq!(handler.calls, 1);
+        if let Some(expected) = expected {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert_eq!(
+                mock.requests().len(),
+                1,
+                "no over-budget continuation or retry"
+            );
+            assert_eq!(error.usage().unwrap().completion_tokens, Some(7));
+        } else {
+            result.unwrap();
+            assert_eq!(mock.requests().len(), 2);
+            assert!(mock.requests()[1].body.len() > 100_000);
+        }
+    }
+}
+
+#[test]
 fn tool_loop_supports_multiple_readonly_calls_and_continuation() {
     let tool_usage = usage(10, 5, 15, Some(3));
     let final_usage = usage(4, 2, 6, Some(0));

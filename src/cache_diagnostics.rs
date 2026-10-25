@@ -141,6 +141,7 @@ mod tests {
         let prompt = "synthetic-private-sentinel\n当前上海时间：one";
         let request = AnalysisRequest {
             show_session: true,
+            registered_tools: None,
             config: &config,
             kind: "classify",
             payload: &payload,
@@ -157,6 +158,7 @@ mod tests {
         assert!(a["previous"].is_null());
         let request = AnalysisRequest {
             show_session: true,
+            registered_tools: None,
             trace: &second,
             prompt: "synthetic-private-sentinel\n当前上海时间：two",
             ..request

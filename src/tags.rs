@@ -964,7 +964,7 @@ mod tests {
     #[test]
     fn failed_save_does_not_change_filters() {
         let app = fixture();
-        std::fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .tag_filters(&json!({"filters":{"提出者":["产品"]}}))
             .is_err());

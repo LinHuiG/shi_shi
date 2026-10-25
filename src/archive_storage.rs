@@ -28,7 +28,7 @@ pub fn serialize<S: Serializer>(groups: &[ArchiveGroup], serializer: S) -> Resul
 
 pub fn deserialize<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<Vec<ArchiveGroup>, D::Error> {
+) -> Result<crate::shared::Shared<Vec<ArchiveGroup>>, D::Error> {
     let rows = Vec::<Value>::deserialize(deserializer)?;
     let mut prompts = BTreeMap::<String, String>::new();
     let mut groups = Vec::with_capacity(rows.len());
@@ -49,7 +49,7 @@ pub fn deserialize<'de, D: Deserializer<'de>>(
         prompts.insert(group.id.clone(), group.prompt.clone());
         groups.push(group);
     }
-    Ok(groups)
+    Ok(groups.into())
 }
 
 #[cfg(test)]

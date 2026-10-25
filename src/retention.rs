@@ -594,6 +594,7 @@ mod tests {
             kind: "manual_archive".into(),
             task_id: task.into(),
             detail: "归档".into(),
+            change_summary: String::new(),
             before: json!({}),
             after: json!({}),
         }
@@ -627,7 +628,7 @@ mod tests {
         let old = at - 100 * 86_400_000;
         let mut s = State::default();
         s.config.message_retention_days = 90;
-        s.audit = vec![
+        *s.audit = vec![
             audit(old, "t-old"),
             audit(old + 1, "t-keep"),
             audit(at - 1, "t-new"),
@@ -662,13 +663,13 @@ mod tests {
         });
         s.reports
             .push(json!({"suggestions":[{"id":"s","evidence":[2]}]}));
-        s.tasks = vec![
+        *s.tasks = vec![
             task("t-old", true, old),
             task("t-keep", true, at - 86_400_000),
             task("t-open", false, 0),
             task("t-run", true, old),
         ];
-        s.handling.runs = vec![
+        *s.handling.runs = vec![
             run("r-old", "t-old", "completed", old),
             run("r-recent", "t-run", "completed", at - 86_400_000),
         ];
@@ -706,7 +707,7 @@ mod tests {
         let old = at - 100 * 86_400_000;
         let mut s = State::default();
         s.config.message_retention_days = 90;
-        s.audit = vec![audit(old, "remove"), audit(old + 1, "keep")];
+        *s.audit = vec![audit(old, "remove"), audit(old + 1, "keep")];
         s.archive_ai_cursor = Some(2);
         s.analysis_memory.archived_entries.push(MemoryEntry {
             id: "live".into(),
@@ -757,8 +758,8 @@ mod tests {
         let old = at - 100 * 86_400_000;
         let mut s = State::default();
         s.config.message_retention_days = 90;
-        s.tasks = vec![task("t-active", true, old), task("t-proposal", true, old)];
-        s.handling.runs = vec![
+        *s.tasks = vec![task("t-active", true, old), task("t-proposal", true, old)];
+        *s.handling.runs = vec![
             run("r-active", "t-active", "inProgress", old),
             run("r-proposal", "t-proposal", "completed", old),
         ];
@@ -767,7 +768,8 @@ mod tests {
             base: "b".into(),
             reason: "r".into(),
             evidence: vec!["r-proposal".into()],
-            policy: Default::default(),
+            prompt: String::new(),
+            legacy_policy: None,
             adopted: false,
             created: old,
             archived_at: 0,
@@ -784,7 +786,7 @@ mod tests {
         let old = at - 100 * 86_400_000;
         let mut s = State::default();
         s.config.message_retention_days = 90;
-        s.audit = vec![audit(old, "t-open")];
+        *s.audit = vec![audit(old, "t-open")];
         s.archive_ai_cursor = Some(0);
         assert!(!prune(&mut s, at));
         assert_eq!(s.audit.len(), 1);
@@ -825,8 +827,8 @@ mod tests {
             s.retention_digest["messages"]["sources"][0]["name"],
             "示例来源"
         );
-        s.audit = vec![audit(old, "t-old")];
-        s.tasks = vec![task("t-old", true, old)];
+        *s.audit = vec![audit(old, "t-old")];
+        *s.tasks = vec![task("t-old", true, old)];
         s.archive_ai_cursor = Some(s.audit.len());
         assert!(prune(&mut s, at));
         assert_eq!(s.retention_digest["records"]["count"], 1);
@@ -863,7 +865,7 @@ mod tests {
             prompt_version: version.into(),
             ..Default::default()
         };
-        s.archive_versions = vec![
+        *s.archive_versions = vec![
             group("same", "规则 A", &version),
             group("edited", "规则 A（手改）", &version),
             group("orphan", "规则 B", "missing"),
@@ -896,14 +898,14 @@ mod tests {
             attempt_id: attempt.into(),
             ..Default::default()
         };
-        s.archive_versions = vec![
+        *s.archive_versions = vec![
             group("old-unreferenced", old, "", "a-old"),
             group("old-rollback-source", old, "", "a-source"),
             group("old-in-report", old, "", ""),
             group("recent-rollback", at, "old-rollback-source", ""),
             group("current", old + 1, "", ""),
         ];
-        s.reports = vec![json!({"archive_group_id":"old-in-report"})];
+        *s.reports = vec![json!({"archive_group_id":"old-in-report"})];
         let attempt = |id: &str, created: i64, status: &str| ArchiveAttempt {
             id: id.into(),
             created,

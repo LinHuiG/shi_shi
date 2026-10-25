@@ -47,10 +47,7 @@ fn text_previews_are_live_without_saves_and_terminal_commit_keeps_all_text() {
     .unwrap();
     assert_eq!(app.saves_revision(), saves + 1);
     assert!(app.handling_previews.lock().unwrap().is_empty());
-    let durable: Value = serde_json::from_slice(
-        &fs::read(crate::storage::data_dir(&root).join("state.json")).unwrap(),
-    )
-    .unwrap();
+    let durable = serde_json::to_value(crate::managed_data::load_state(&root).unwrap()).unwrap();
     assert_eq!(
         durable["handling"]["runs"][0]["rounds"][0]["steps"][0]["text"],
         "First and second"

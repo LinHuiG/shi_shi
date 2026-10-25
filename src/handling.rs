@@ -26,49 +26,17 @@ use desktop::is_desktop;
 
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
-pub struct Route {
-    pub keywords: Vec<String>,
-    pub project_id: String,
-    pub instructions: String,
-}
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Policy {
-    pub prompt: String,
-    pub routes: Vec<Route>,
-}
-impl Default for Policy {
-    fn default() -> Self {
-        Self {
-            prompt: crate::prompt_config::get("handling").into(),
-            routes: vec![],
-        }
-    }
-}
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Version {
-    pub id: String,
-    pub previous: String,
-    pub action: String,
-    pub reason: String,
-    pub created: i64,
-    pub policy: Policy,
-    #[serde(default = "default_boundary")]
-    pub boundary: String,
-}
-fn default_boundary() -> String {
-    crate::prompt_config::get("handling_boundary").into()
-}
-#[derive(Clone, Serialize, Deserialize)]
 pub struct Proposal {
-    #[serde(default)]
     pub archived_at: i64,
-    #[serde(default)]
     pub rejected: bool,
     pub id: String,
     pub base: String,
     pub reason: String,
     pub evidence: Vec<String>,
-    pub policy: Policy,
+    pub prompt: String,
+    // Preserve pre-1.1.32 snapshots as inert history; never execute their routes.
+    #[serde(rename = "policy", skip_serializing_if = "Option::is_none")]
+    pub legacy_policy: Option<Value>,
     pub adopted: bool,
     pub created: i64,
 }
@@ -76,9 +44,9 @@ pub struct Proposal {
 #[serde(default)]
 pub struct HandlingState {
     pub local_projects: Vec<Value>,
-    pub versions: Vec<Version>,
+    pub versions: Vec<Value>,
     pub proposals: Vec<Proposal>,
-    pub runs: Vec<Run>,
+    pub runs: crate::shared::Shared<Vec<Run>>,
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -176,16 +144,17 @@ fn business_run(run: &Run) -> Value {
     value
 }
 pub fn initialize(s: &mut State) {
-    if s.handling.versions.is_empty() {
-        s.handling.versions.push(Version {
-            id: id(),
-            previous: String::new(),
-            action: "initial".into(),
-            reason: "通用调查模板，无预设项目或个人信息".into(),
-            created: now(),
-            policy: Policy::default(),
-            boundary: default_boundary(),
-        });
+    // Older saves kept the active prompt only in the handling policy. Import
+    // it once; a later explicit reset in normal prompt history stays a reset.
+    if s.config.handling_prompt.is_empty() && crate::prompts::current(s, "handling").is_none() {
+        if let Some(prompt) = s
+            .handling
+            .versions
+            .last()
+            .and_then(|v| v["policy"]["prompt"].as_str())
+        {
+            s.config.handling_prompt = prompt.into();
+        }
     }
     // Current runs persist their connection snapshot at creation. Do not
     // rebind old records to whichever provider is selected now.
@@ -246,46 +215,6 @@ impl Drop for FollowupReservation<'_> {
 pub fn can_restart(run: &Run) -> bool {
     matches!(run.status.as_str(), "terminated" | "detached" | "ended")
         || (run.status == "failed" && run.rounds.iter().all(|r| r.not_submitted))
-}
-fn current(s: &State) -> &Version {
-    s.handling
-        .versions
-        .last()
-        .expect("initialized handling policy")
-}
-fn validate_policy(p: &Policy) -> Result<(), String> {
-    if p.prompt.trim().is_empty() || p.prompt.len() > 24000 || p.routes.len() > 100 {
-        return Err("提示词不能为空、最多 24000 字节；最多 100 条匹配规则".into());
-    }
-    for r in &p.routes {
-        if r.project_id.is_empty()
-            || r.keywords.is_empty()
-            || r.keywords.len() > 20
-            || r.keywords
-                .iter()
-                .any(|k| k.trim().is_empty() || k.len() > 240)
-            || r.instructions.len() > 8000
-        {
-            return Err("每条规则需要项目、1–20 个非空关键词和不超过 8000 字节的说明".into());
-        }
-    }
-    Ok(())
-}
-pub fn match_route<'a>(t: &Task, routes: &'a [Route]) -> Option<&'a Route> {
-    let text = format!("{} {} {}", t.title, t.description, t.category).to_lowercase();
-    let matches = routes
-        .iter()
-        .filter(|r| {
-            r.keywords
-                .iter()
-                .all(|k| !k.trim().is_empty() && text.contains(&k.to_lowercase()))
-        })
-        .collect::<Vec<_>>();
-    if matches.len() == 1 {
-        Some(matches[0])
-    } else {
-        None
-    }
 }
 fn context_config(app: &App, run: &Run) -> Result<ContextTool, String> {
     let s = app.state.lock().unwrap();
@@ -592,12 +521,11 @@ impl App {
             .cloned()
             .ok_or("当前接入尚未创建处置会话".into())
     }
-    pub fn handling_projects(&self) -> Result<Value, String> {
-        self.handling_projects_for(&self.handling_connection()?)
-    }
-    fn handling_projects_for(&self, connection: &Connection) -> Result<Value, String> {
-        let config = self.state.lock().unwrap().config.clone();
-        let path = crate::ai::analysis_workdir(&self.root, &config)?;
+    fn local_handling_projects(&self) -> Result<Vec<Value>, String> {
+        let state = self.state.lock().unwrap();
+        let path = crate::ai::analysis_workdir(&self.root, &state.config)?;
+        let local_projects = state.handling.local_projects.clone();
+        drop(state);
         let canonical = if path.exists() {
             path.canonicalize().map_err(|e| e.to_string())?
         } else {
@@ -611,55 +539,128 @@ impl App {
             json!({"id":"local:ai-workdir","name":"AI 工作目录","cwd":cwd,"local":true,"default":true}),
         ];
         data.extend(
-            self.state
-                .lock()
-                .unwrap()
-                .handling
-                .local_projects
+            local_projects
                 .iter()
                 .filter(|p| Path::new(str_at(p, "cwd")).is_dir())
                 .cloned(),
         );
-        // DSH has no project/list ACP method. Directory selection must not
-        // depend on starting the execution transport.
-        if connection.driver != "dsh" {
-            data.extend(self.desktop(connection).projects()?);
+        Ok(data)
+    }
+    fn native_handling_projects(&self, connection: &Connection) -> Result<Vec<Value>, String> {
+        let native = if connection.driver == "codex" {
+            self.desktop(connection).projects()?
         } else {
-            // Native desktop workspaces are projected by the optional bridge;
-            // reading them must not start an ACP process.
             let home = std::env::var_os("DSH_HOME")
                 .map(std::path::PathBuf::from)
                 .or_else(|| {
                     std::env::var_os("USERPROFILE")
                         .map(|p| std::path::PathBuf::from(p).join(".dsh"))
                 });
-            if let Some(home) = home {
-                data.extend(shishi_acp::workspace::projects(&home)?);
+            match home {
+                Some(home) => shishi_acp::workspace::projects(&home)?,
+                None => vec![],
+            }
+        };
+        let connection_id = if connection.id.is_empty() {
+            "__default_codex"
+        } else {
+            &connection.id
+        };
+        Ok(native
+            .into_iter()
+            .filter(|p| !str_at(p, "id").is_empty() && !str_at(p, "cwd").is_empty())
+            .map(|mut p| {
+                let legacy = str_at(&p, "id").to_owned();
+                p["id"] = json!(format!(
+                    "{}:{}:{}",
+                    connection.driver, connection_id, legacy
+                ));
+                p["legacy_id"] = json!(legacy);
+                p["connection_id"] = json!(connection_id);
+                p["driver"] = json!(connection.driver);
+                p["source"] = json!(connection.name);
+                p
+            })
+            .collect())
+    }
+    /// Read configured project metadata independently of the handling model route.
+    /// No provider/model request or DSH execution transport is started here.
+    pub(crate) fn analysis_projects(&self) -> Value {
+        let config = self.state.lock().unwrap().config.clone();
+        let mut data = match self.local_handling_projects() {
+            Ok(projects) => projects,
+            Err(error) => {
+                self.log(
+                    "project_catalog_error",
+                    json!({"source":"local","error":error}),
+                );
+                vec![]
+            }
+        };
+        let mut connections = config
+            .ai_connections
+            .iter()
+            .filter(|c| {
+                ["codex", "dsh"].contains(&c.driver.as_str()) && !c.executable.trim().is_empty()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !config.codex.trim().is_empty() {
+            connections.push(ai_backend::default_codex_connection(&config));
+        }
+        connections.sort_by(|a, b| (&a.driver, &a.id).cmp(&(&b.driver, &b.id)));
+        for connection in connections {
+            match self.native_handling_projects(&connection) {
+                Ok(projects) => data.extend(projects),
+                Err(error) => self.log(
+                    "project_catalog_error",
+                    json!({"driver":connection.driver,"connection_id":connection.id,"error":error}),
+                ),
             }
         }
+        // Preserve the local default first and expose the full selection list.
+        // AI request preparation applies its own bounded catalog projection.
         let mut seen = std::collections::BTreeSet::new();
-        data.retain(|p| {
-            seen.insert(crate::ai_connections::launcher_identity(Path::new(str_at(
-                p, "cwd",
-            ))))
-        });
+        data.retain(|project| seen.insert(str_at(project, "id").to_owned()));
+        json!(data)
+    }
+    pub fn handling_projects(&self) -> Result<Value, String> {
+        Ok(self.analysis_projects())
+    }
+    fn handling_projects_for(&self, connection: &Connection) -> Result<Value, String> {
+        let mut data = self.local_handling_projects()?;
+        data.extend(self.native_handling_projects(connection)?);
         Ok(json!(data))
     }
     pub fn handling_prepare(&self, task: &str) -> Result<Value, String> {
         self.require_ai_purpose("handling")?;
-        let projects = self.handling_projects()?;
+        let projects = self.analysis_projects();
         let s = self.state.lock().unwrap();
-        let t = s.tasks.iter().find(|t| t.id == task).ok_or("事项不存在")?;
-        let policy = current(&s);
-        let matched = match_route(t, &policy.policy.routes).filter(|r| {
-            projects
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|p| p["id"] == r.project_id)
-        });
+        let task = s.tasks.iter().find(|t| t.id == task).ok_or("事项不存在")?;
+        let rows = projects.as_array().unwrap();
+        let suggested = rows
+            .iter()
+            .find(|p| p["id"] == task.suggested_project_id)
+            .or_else(|| {
+                if task.suggested_project_id.is_empty() {
+                    return None;
+                }
+                let mut legacy = rows
+                    .iter()
+                    .filter(|p| p["legacy_id"] == task.suggested_project_id);
+                let first = legacy.next();
+                if legacy.next().is_none() {
+                    first
+                } else {
+                    None
+                }
+            })
+            .map(|p| json!({"project_id":p["id"]}));
         Ok(
-            json!({"projects":projects,"default_project_id":"local:ai-workdir","matched":matched,"suggested":if projects.as_array().into_iter().flatten().any(|p|p["id"]==t.suggested_project_id){json!({"project_id":t.suggested_project_id,"reason":t.suggested_project_reason})}else{Value::Null},"policy":policy,"run":s.handling.runs.iter().rev().find(|r|r.task_id==task)}),
+            json!({"projects":projects,"default_project_id":"local:ai-workdir","suggested":suggested,
+            "prompt":crate::prompts::content(&s.config,"handling"),
+            "boundary":crate::prompt_config::get("handling_boundary"),
+            "run":s.handling.runs.iter().rev().find(|r|r.task_id==task.id)}),
         )
     }
     fn stop_previous_runs(&self, task_id: &str, confirmed: bool) -> Result<(), String> {
@@ -731,33 +732,32 @@ impl App {
         let mut cfg = self.state.lock().unwrap().config.for_kind("handling");
         if let Some(target) = p["connection_id"].as_str() {
             let c = if target == "__default_codex" {
-                Connection {
-                    executable: cfg.codex.clone(),
-                    models: cfg.codex_models.clone(),
-                    ..Connection::default()
-                }
+                ai_backend::default_codex_connection(&cfg)
             } else {
                 cfg.ai_connections
                     .iter()
-                    .find(|c| c.id == target && c.driver == "codex")
+                    .find(|c| c.id == target && ["codex", "dsh"].contains(&c.driver.as_str()))
                     .cloned()
-                    .ok_or("请选择可用的 Codex 接入")?
+                    .ok_or("请选择可用的 Codex / DSH 接入")?
             };
+            if cfg.selected_connection != c.id {
+                cfg.model = c
+                    .models
+                    .first()
+                    .and_then(|m| m["model"].as_str())
+                    .filter(|model| !model.trim().is_empty())
+                    .ok_or("所选项目接入尚未配置模型，请先在 AI 设置中选择模型")?
+                    .into();
+                cfg.reasoning_effort = c
+                    .models
+                    .first()
+                    .and_then(|m| m["supportedReasoningEfforts"].as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v["reasoningEffort"].as_str())
+                    .unwrap_or("")
+                    .into();
+            }
             cfg.selected_connection = c.id.clone();
-            cfg.model = c
-                .models
-                .first()
-                .and_then(|m| m["model"].as_str())
-                .unwrap_or("")
-                .into();
-            cfg.reasoning_effort = c
-                .models
-                .first()
-                .and_then(|m| m["supportedReasoningEfforts"].as_array())
-                .and_then(|a| a.first())
-                .and_then(|v| v["reasoningEffort"].as_str())
-                .unwrap_or("")
-                .into();
         }
         let connection = ai_backend::connection(&cfg)?;
         let previous = self
@@ -782,7 +782,11 @@ impl App {
         if connection.driver == "api" {
             return Err("官方 API 仅用于分析，不能执行一键处置".into());
         }
-        let projects = self.handling_projects_for(&connection)?;
+        let projects = if str_at(p, "project_id").starts_with("local:") {
+            json!(self.local_handling_projects()?)
+        } else {
+            self.handling_projects_for(&connection)?
+        };
         let project = projects
             .as_array()
             .unwrap()
@@ -801,7 +805,7 @@ impl App {
                     .find(|t| t.id == task_id)
                     .cloned()
                     .ok_or("事项不存在")?,
-                current(&s).clone(),
+                crate::prompts::current(&s, "handling").unwrap().clone(),
             )
         };
         if task.merged_into.len() > 0 || task.generation.len() > 0 {
@@ -814,9 +818,9 @@ impl App {
         let mut prompt = format!(
             "{}{}{}{}{}{}{}{}{}",
             crate::prompt_config::get("handling_frame_0"),
-            version.boundary,
+            crate::prompt_config::get("handling_boundary"),
             crate::prompt_config::get("handling_frame_1"),
-            version.policy.prompt,
+            version.content,
             crate::prompt_config::get("handling_frame_2"),
             instructions,
             crate::prompt_config::get("handling_frame_3"),
@@ -1522,73 +1526,33 @@ impl App {
         Ok(json!(true))
     }
 
-    pub fn handling_history(&self) -> Value {
-        let s = self.state.lock().unwrap();
-        json!({"versions":s.handling.versions,"proposals":s.handling.proposals,"current":current(&s).id})
-    }
-    pub fn handling_policy_save(&self, p: &Value) -> Result<Value, String> {
+    pub fn handling_adopt(&self, p: &Value) -> Result<Value, String> {
         let mut lock = self.state.lock().unwrap();
         let mut s = lock.clone();
-        let old = current(&s).clone();
-        if str_at(p, "expected") != old.id {
-            return Err("处置规则已变化，请刷新后重新预览".into());
+        let base = crate::prompts::current(&s, "handling").unwrap().id.clone();
+        let proposal = s
+            .handling
+            .proposals
+            .iter_mut()
+            .find(|v| v.id == str_at(p, "id"))
+            .ok_or("建议不存在")?;
+        if proposal.base != base
+            || str_at(p, "expected") != base
+            || proposal.adopted
+            || proposal.rejected
+            || proposal.archived_at > 0
+            || proposal.prompt.trim().is_empty()
+        {
+            return Err("建议已失效，请重新生成或刷新后再采用".into());
         }
-        let mut reason = str_at(p, "reason").to_string();
-        let mut boundary = old.boundary.clone();
-        let (action, policy) = if let Some(target) = p["rollback"].as_str() {
-            let version = s
-                .handling
-                .versions
-                .iter()
-                .find(|v| v.id == target)
-                .ok_or("目标版本不存在")?;
-            reason = format!("回滚到 {}", version.id);
-            boundary = version.boundary.clone();
-            ("rollback", version.policy.clone())
-        } else {
-            let policy: Policy =
-                serde_json::from_value(p["policy"].clone()).map_err(|e| e.to_string())?;
-            validate_policy(&policy)?;
-            if let Some(proposal) = p["proposal"].as_str() {
-                let proposal = s
-                    .handling
-                    .proposals
-                    .iter_mut()
-                    .find(|x| x.id == proposal)
-                    .ok_or("建议不存在")?;
-                if proposal.base != old.id
-                    || proposal.adopted
-                    || proposal.rejected
-                    || proposal.archived_at > 0
-                {
-                    return Err("建议已失效或已采用，请重新生成".into());
-                }
-                proposal.adopted = true;
-                ("adopt", policy)
-            } else {
-                ("manual", policy)
-            }
-        };
-        let version = Version {
-            id: id(),
-            previous: old.id,
-            action: action.into(),
-            reason,
-            created: now(),
-            policy,
-            boundary,
-        };
-        if crate::prompts::content(&s.config, "handling") != version.policy.prompt {
-            s.config.handling_prompt = version.policy.prompt.clone();
-            crate::prompts::record(
-                &mut s,
-                "handling",
-                version.policy.prompt.clone(),
-                action,
-                &version.reason,
-            );
+        let text = str_at(p, "prompt").trim();
+        if text.is_empty() || text.chars().count() > 20000 {
+            return Err("提示词应为 1–20000 字".into());
         }
-        s.handling.versions.push(version.clone());
+        proposal.adopted = true;
+        let reason = proposal.reason.clone();
+        s.config.handling_prompt = text.into();
+        let version = crate::prompts::record(&mut s, "handling", text.into(), "adopt", &reason);
         self.save(&s)?;
         *lock = s;
         Ok(json!(version))
@@ -1626,15 +1590,14 @@ impl App {
 
 #[derive(Clone)]
 pub struct LearningBatch {
-    pub base: Version,
+    pub base: crate::model::PromptVersion,
     pub evidence: Vec<Value>,
     pub rounds: Vec<(String, String)>,
     pub fingerprints: Vec<String>,
-    pub projects: Vec<Value>,
 }
 impl LearningBatch {
     pub fn payload(&self) -> Value {
-        json!({"current":self.base.policy,"projects":self.projects,"evidence":self.evidence,"note":"只含有实际结论或已接收纠正的已结束轮次；结论是 AI 调查意见，不等于人工确认。truncated_fields 列出实际截断的字段，missing_fields 列出缺失内容。只读所给材料，不提供补查工具。"})
+        json!({"current_prompt":self.base.content,"evidence":self.evidence,"note":"只含有实际结论或已接收纠正的已结束轮次；结论是 AI 调查意见，不等于人工确认。truncated_fields 列出实际截断的字段，missing_fields 列出缺失内容。只读所给材料，不提供补查工具。"})
     }
 }
 fn learning_material(s: &State, r: &Run, v: &Round) -> Option<(Value, String)> {
@@ -1695,11 +1658,10 @@ fn learning_material(s: &State, r: &Run, v: &Round) -> Option<(Value, String)> {
 
 pub fn learning_batch(s: &State) -> LearningBatch {
     let mut batch = LearningBatch {
-        base: current(s).clone(),
+        base: crate::prompts::current(s, "handling").unwrap().clone(),
         evidence: vec![],
         rounds: vec![],
         fingerprints: vec![],
-        projects: vec![],
     };
     let mut candidates = s
         .handling
@@ -1730,17 +1692,6 @@ pub fn learning_batch(s: &State) -> LearningBatch {
         batch.evidence.push(row);
         batch.rounds.push((r.id.clone(), v.id.clone()));
         batch.fingerprints.push(fingerprint);
-        if !batch.projects.iter().any(|p| p["id"] == r.project_id) {
-            batch
-                .projects
-                .push(json!({"id":r.project_id,"name":r.project_name}));
-        }
-    }
-    // Existing routes may be retained, but no new route may reference an unseen project.
-    for route in &batch.base.policy.routes {
-        if !batch.projects.iter().any(|p| p["id"] == route.project_id) {
-            batch.projects.push(json!({"id":route.project_id}));
-        }
     }
     batch
 }
@@ -1749,7 +1700,7 @@ pub fn apply_learning(
     batch: &LearningBatch,
     result: &Value,
 ) -> Result<Value, String> {
-    if current(s).id != batch.base.id {
+    if crate::prompts::current(s, "handling").map(|v| &v.id) != Some(&batch.base.id) {
         return Err("处置提示词已改变，本批学习结果未应用".into());
     }
     let improved = result["improved"].as_bool().ok_or("缺少是否改进的判断")?;
@@ -1782,15 +1733,9 @@ pub fn apply_learning(
     }
     let mut out = json!({"unchanged":true,"reason":result["reason"]});
     if improved {
-        let policy: Policy =
-            serde_json::from_value(result["policy"].clone()).map_err(|e| e.to_string())?;
-        validate_policy(&policy)?;
-        if policy
-            .routes
-            .iter()
-            .any(|r| !batch.projects.iter().any(|p| p["id"] == r.project_id))
-        {
-            return Err("建议引用了未提供的项目".into());
+        let prompt = str_at(result, "proposed_prompt").trim();
+        if prompt.is_empty() || prompt.chars().count() > 20000 {
+            return Err("建议提示词应为 1–20000 字".into());
         }
         let evidence: Vec<String> =
             serde_json::from_value(result["evidence_ids"].clone()).map_err(|e| e.to_string())?;
@@ -1806,7 +1751,8 @@ pub fn apply_learning(
             base: batch.base.id.clone(),
             reason: short(str_at(result, "reason"), 1000),
             evidence,
-            policy,
+            prompt: prompt.into(),
+            legacy_policy: None,
             created: now(),
             adopted: false,
             rejected: false,
@@ -2347,6 +2293,7 @@ mod tests {
     fn learning_keeps_structured_first_question_and_reports_real_truncation() {
         let mut s = State::default();
         initialize(&mut s);
+        crate::prompts::initialize(&mut s);
         s.tasks.push(Task {
             id: "task".into(),
             title: "核对合成问题".into(),
@@ -2441,6 +2388,7 @@ mod tests {
     fn learning_rejects_unsupported_policy_changes_and_preserves_saved_prompts() {
         let mut s = State::default();
         initialize(&mut s);
+        crate::prompts::initialize(&mut s);
         s.config.handling_prompt = "用户保存的调查策略".into();
         s.handling.runs.push(Run {
             id: "run".into(),
@@ -2469,6 +2417,7 @@ mod tests {
     fn learning_does_not_grow_with_history_and_ignores_running_turns() {
         let mut s = State::default();
         initialize(&mut s);
+        crate::prompts::initialize(&mut s);
         let mut run = Run {
             id: "run".into(),
             project_id: "p".into(),
@@ -2500,45 +2449,91 @@ mod tests {
         assert!(next.rounds.iter().all(|v| !batch.rounds.contains(v)));
     }
     #[test]
-    fn policies_keep_history_stale_checks_and_failed_save_is_atomic() {
-        let root = std::env::temp_dir().join(format!("shishi-handling-policy-{}", id()));
-        let app = App::load(root.clone()).unwrap();
-        let original = app.handling_history()["current"]
-            .as_str()
+    fn old_routes_are_inert_and_prompt_adoption_uses_normal_versions_atomically() {
+        let app =
+            App::load(std::env::temp_dir().join(format!("shishi-legacy-routes-{}", id()))).unwrap();
+        let base = crate::prompts::current(&app.state.lock().unwrap(), "handling")
             .unwrap()
-            .to_string();
-        let changed=app.handling_policy_save(&json!({"expected":original,"policy":{"prompt":"Inspect evidence before drawing conclusions.","routes":[]},"reason":"Manual correction"})).unwrap();
+            .id
+            .clone();
+        app.commit_state(|s| {
+            s.handling.versions.push(json!({"id":"old","policy":{"prompt":"old text","routes":[{"keywords":["synthetic"],"project_id":"old-project"}]}}));
+            s.handling.proposals.push(Proposal {id:"new".into(),base:base.clone(),prompt:"Inspect synthetic evidence.".into(),..Default::default()});
+            Ok(())
+        }).unwrap();
+        let legacy = app.state.lock().unwrap().handling.versions.clone();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
-            .handling_policy_save(&json!({"expected":original,"rollback":original}))
+            .handling_adopt(
+                &json!({"id":"new","expected":base,"prompt":"Inspect synthetic evidence."})
+            )
             .is_err());
-        app.handling_policy_save(&json!({"expected":changed["id"],"rollback":original}))
-            .unwrap();
-        let before = app.handling_history();
-        assert_eq!(before["versions"].as_array().unwrap().len(), 3);
+        assert!(!app.state.lock().unwrap().handling.proposals[0].adopted);
+        crate::test_support::persistence_failure(&app.root, false).unwrap();
+        app.handling_adopt(
+            &json!({"id":"new","expected":base,"prompt":"Inspect synthetic evidence."}),
+        )
+        .unwrap();
+        assert!(app
+            .handling_adopt(&json!({"id":"new","expected":base,"prompt":"stale"}))
+            .is_err());
+        let edited = crate::prompts::current(&app.state.lock().unwrap(), "handling")
+            .unwrap()
+            .id
+            .clone();
+        app.rollback_prompt(&base, &edited).unwrap();
+        let s = app.state.lock().unwrap();
+        assert_eq!(s.handling.versions, legacy);
         assert_eq!(
-            before["versions"][2]["policy"]["prompt"],
+            crate::prompts::current(&s, "handling").unwrap().action,
+            "rollback"
+        );
+    }
+
+    #[test]
+    fn legacy_prompt_is_imported_once_without_overwriting_edits_or_resets() {
+        let mut state = State::default();
+        state.handling.versions.push(json!({"id":"legacy","policy":{"prompt":"Synthetic saved prompt","routes":[{"project_id":"removed"}]}}));
+        let legacy = state.handling.versions.clone();
+        initialize(&mut state);
+        crate::prompts::initialize(&mut state);
+        assert_eq!(
+            crate::prompts::content(&state.config, "handling"),
+            "Synthetic saved prompt"
+        );
+        assert_eq!(
+            crate::prompts::current(&state, "handling").unwrap().content,
+            "Synthetic saved prompt"
+        );
+        state.config.handling_prompt = "Explicit edit".into();
+        initialize(&mut state);
+        assert_eq!(state.config.handling_prompt, "Explicit edit");
+        state.config.handling_prompt.clear();
+        initialize(&mut state);
+        crate::prompts::initialize(&mut state);
+        assert_eq!(
+            crate::prompts::content(&state.config, "handling"),
             crate::prompt_config::get("handling")
         );
-        std::fs::create_dir(root.join("data/state.next.json")).unwrap();
-        assert!(app.handling_policy_save(&json!({"expected":before["current"],"policy":{"prompt":"do not commit failed save","routes":[]}})).is_err());
-        assert_eq!(app.handling_history(), before);
-        drop(app);
-        assert!(root.starts_with(std::env::temp_dir()));
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(state.handling.versions, legacy);
     }
+
     #[test]
-    fn ambiguous_routes_require_choice() {
-        let t = Task {
-            title: "inspect service".into(),
-            ..Default::default()
-        };
-        let r = Route {
-            keywords: vec!["inspect".into()],
-            project_id: "p".into(),
-            ..Default::default()
-        };
-        assert!(match_route(&t, &[r.clone()]).is_some());
-        assert!(match_route(&t, &[r.clone(), r]).is_none());
+    fn full_project_selector_keeps_the_default_without_dropping_valid_projects() {
+        let root = std::env::temp_dir().join(format!("ss-project-catalog-{}", id()));
+        let app = App::load(root.clone()).unwrap();
+        {
+            let mut state = app.state.lock().unwrap();
+            state.handling.local_projects = (0..80).map(|i| json!({"id":format!("local:{i:03}"),"name":format!("Synthetic {i}"),"cwd":root})).collect();
+            let duplicate = state.handling.local_projects[0].clone();
+            state.handling.local_projects.push(duplicate);
+        }
+        let projects = app.handling_projects().unwrap();
+        assert_eq!(projects.as_array().unwrap().len(), 81);
+        assert_eq!(projects[0]["id"], "local:ai-workdir");
+        assert_eq!(projects[80]["id"], "local:079");
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn conclusion_requires_completed_turn() {

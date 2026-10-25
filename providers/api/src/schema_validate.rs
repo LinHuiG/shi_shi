@@ -76,6 +76,104 @@ pub fn validate(schema: &Value, instance: &Value) -> Result<(), ValidationError>
     validate_at(schema, instance, "$", 0, &mut nodes)
 }
 
+/// Accept output with explicit scalar defaults, then validate it strictly.
+/// Defaults are opt-in presentation fallbacks, never inferred from a type.
+/// Tool arguments continue to use `validate` and cannot use this repair path.
+pub fn validate_output(schema: &Value, mut value: Value) -> Result<Value, ValidationError> {
+    check_schema(schema)?;
+    output_defaults(schema, &mut value, 0, &mut 0)?;
+    validate(schema, &value)?;
+    Ok(value)
+}
+
+fn scalar_default(schema: &Value) -> Option<&Value> {
+    schema
+        .get("default")
+        .filter(|value| !value.is_array() && !value.is_object() && validate(schema, value).is_ok())
+}
+
+fn output_defaults(
+    schema: &Value,
+    value: &mut Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<(), ValidationError> {
+    *nodes += 1;
+    if depth > MAX_INSTANCE_DEPTH || *nodes > MAX_INSTANCE_NODES {
+        return Err(ValidationError::new("$", "output traversal limit exceeded"));
+    }
+    if let Some(default) = scalar_default(schema) {
+        if validate(schema, value).is_err() {
+            *value = default.clone();
+            return Ok(());
+        }
+    }
+    if let (Some(properties), Some(object)) =
+        (schema["properties"].as_object(), value.as_object_mut())
+    {
+        for (name, child) in properties {
+            if let Some(value) = object.get_mut(name) {
+                output_defaults(child, value, depth + 1, nodes)?;
+            } else if let Some(default) = scalar_default(child) {
+                object.insert(name.clone(), default.clone());
+            }
+        }
+    } else if let (Some(items), Some(array)) = (schema.get("items"), value.as_array_mut()) {
+        for value in array {
+            output_defaults(items, value, depth + 1, nodes)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod output_default_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn optional_presentation_failure_does_not_relax_business_or_tool_validation() {
+        let schema = json!({"type":"object","additionalProperties":false,"properties":{
+            "actions":{"type":"array","items":{"type":"object","additionalProperties":false,
+                "properties":{"status":{"type":"string","enum":["pending","done"]},
+                    "summary":{"type":"string","maxLength":3,"default":""}},"required":["status","summary"]}}
+        },"required":["actions"]});
+        for summary in [
+            None,
+            Some(json!(null)),
+            Some(json!(["bad"])),
+            Some(json!("long")),
+        ] {
+            let mut value = json!({"actions":[{"status":"pending"}]});
+            if let Some(summary) = summary {
+                value["actions"][0]["summary"] = summary;
+            }
+            assert!(
+                validate(&schema, &value).is_err(),
+                "tool arguments stay strict"
+            );
+            assert_eq!(
+                validate_output(&schema, value).unwrap()["actions"][0]["summary"],
+                ""
+            );
+        }
+        assert_eq!(
+            validate_output(
+                &schema,
+                json!({"actions":[{"status":"done","summary":"ok"}]})
+            )
+            .unwrap()["actions"][0]["summary"],
+            "ok"
+        );
+        for action in [
+            json!({}),
+            json!({"status":"invalid"}),
+            json!({"status":"done","extra":true}),
+        ] {
+            assert!(validate_output(&schema, json!({"actions":[action]})).is_err());
+        }
+    }
+}
+
 fn check_schema_at(
     schema: &Value,
     path: &str,

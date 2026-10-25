@@ -531,17 +531,18 @@ pub fn serve(path: &Path) -> Result<(), String> {
     };
     let mut reader = std::io::stdin().lock();
     let mut out = std::io::stdout().lock();
+    let declarations = tools();
     loop {
         let mut line = String::new();
         let size = reader
             .by_ref()
-            .take(8193)
+            .take(128 * 1024 + 1)
             .read_line(&mut line)
             .map_err(|e| e.to_string())?;
         if size == 0 {
             break;
         }
-        if size > 8192 {
+        if size > 128 * 1024 {
             return Err("查询过长".into());
         }
         let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
@@ -551,9 +552,17 @@ pub fn serve(path: &Path) -> Result<(), String> {
                 json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"shishi_analysis","version":env!("CARGO_PKG_VERSION")}})
             }
             "ping" => json!({}),
-            "tools/list" => tools(),
+            "tools/list" => declarations.clone(),
             "tools/call" => {
-                let result = if v["params"]["name"] == "read_image" {
+                let name = v["params"]["name"].as_str().unwrap_or("");
+                let declared = declarations["tools"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|tool| tool["name"] == name);
+                let result = if !declared {
+                    json!({"isError":true,"content":[{"type":"text","text":"本次请求未声明此工具"}]})
+                } else if name == "read_image" {
                     match crate::images::read(&snapshot, &mut meter, &v["params"]["arguments"]) {
                         Ok(content) => content,
                         Err(error) => {
@@ -569,8 +578,10 @@ pub fn serve(path: &Path) -> Result<(), String> {
                     let text = query(&snapshot, &mut meter, &args)?;
                     json!({"content":[{"type":"text","text":text}]})
                 };
-                fs::write(&meter_path, serde_json::to_vec(&meter).unwrap())
-                    .map_err(|e| e.to_string())?;
+                if declared && ["read_context", "read_image"].contains(&name) {
+                    fs::write(&meter_path, serde_json::to_vec(&meter).unwrap())
+                        .map_err(|e| e.to_string())?;
+                }
                 result
             }
             _ => return Err("不支持的查询方法".into()),

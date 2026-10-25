@@ -353,6 +353,7 @@ pub fn transfer(plan: &TransferPlan, update: impl Fn(Progress)) -> Result<(), St
         if !empty_target(&plan.destination)? {
             return Err("新目录已有文件，未覆盖任何文件".into());
         }
+        crate::state_store::checkpoint(&plan.source)?;
         let mut entries = Vec::new();
         let mut directories = Vec::new();
         inventory(&plan.source, Path::new(""), &mut entries, &mut directories)?;
@@ -460,13 +461,23 @@ pub fn transfer(plan: &TransferPlan, update: impl Fn(Progress)) -> Result<(), St
 fn relocate_workdir(plan: &TransferPlan) -> Result<(), String> {
     // Only a managed AI directory moves. Absolute external workspaces and all
     // historical command text, messages and run cwd values are left untouched.
-    for name in ["state.json", "state.backup.json"] {
+    let names: &[&str] = if plan.destination.join(crate::state_store::FILE).exists() {
+        &[crate::state_store::FILE]
+    } else {
+        &["state.json", "state.backup.json"]
+    };
+    for &name in names {
         let path = plan.destination.join(name);
         if !path.is_file() {
             continue;
         }
-        let mut state: Value = serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let mut state: Value = if name == crate::state_store::FILE {
+            serde_json::to_value(crate::state_store::load(&plan.destination)?)
+                .map_err(|e| e.to_string())?
+        } else {
+            serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?
+        };
         let Some(workdir) = state["config"]["analysis_workdir"].as_str() else {
             continue;
         };
@@ -518,6 +529,12 @@ fn relocate_workdir(plan: &TransferPlan) -> Result<(), String> {
             }
         }
         if changed {
+            if name == crate::state_store::FILE {
+                let state = serde_json::from_value(state).map_err(|e| e.to_string())?;
+                crate::state_store::Store::open(&plan.destination)?.save(&state)?;
+                crate::state_store::checkpoint(&plan.destination)?;
+                continue;
+            }
             let mut file = File::create(path).map_err(|e| e.to_string())?;
             file.write_all(&serde_json::to_vec(&state).map_err(|e| e.to_string())?)
                 .and_then(|_| file.sync_all())

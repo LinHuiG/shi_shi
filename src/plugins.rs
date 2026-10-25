@@ -26,7 +26,17 @@ pub struct Manifest {
     pub entrypoint: String,
     pub files: Vec<String>,
     pub capabilities: Vec<String>,
+    #[serde(default)]
     pub config_fields: Vec<Field>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Settings {
+    pub api_version: u32,
+    pub entrypoint: String,
+    pub methods: Vec<String>,
 }
 #[derive(Clone)]
 pub struct Plugin {
@@ -121,6 +131,26 @@ impl Plugin {
         if size > 256 * 1024 * 1024 {
             return Err("插件包超过 256 MiB".into());
         }
+        if let Some(settings) = &manifest.settings {
+            let unique = settings
+                .methods
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            if settings.api_version != 1
+                || !settings.entrypoint.ends_with(".html")
+                || !manifest.files.contains(&settings.entrypoint)
+                || settings.methods.is_empty()
+                || settings.methods.len() > 32
+                || unique.len() != settings.methods.len()
+                || settings.methods.iter().any(|method| !simple(method))
+                || fs::metadata(plain_file(&dir, &settings.entrypoint)?)
+                    .map_err(|e| e.to_string())?
+                    .len()
+                    > 2 * 1024 * 1024
+            {
+                return Err("插件配置页面声明无效".into());
+            }
+        }
         Ok(Self { manifest, dir })
     }
     pub fn validate_fields(&self, config: &Value) -> Result<(), String> {
@@ -159,7 +189,7 @@ impl Plugin {
         library.call(&request)
     }
 }
-struct Library(windows_sys::Win32::Foundation::HMODULE);
+pub(crate) struct Library(windows_sys::Win32::Foundation::HMODULE);
 impl Drop for Library {
     fn drop(&mut self) {
         unsafe {
@@ -168,7 +198,7 @@ impl Drop for Library {
     }
 }
 impl Library {
-    fn open(path: &Path) -> Result<Self, String> {
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
         let path = path
             .to_string_lossy()
             .encode_utf16()
@@ -189,7 +219,10 @@ impl Library {
         }
         Ok(Self(handle))
     }
-    fn symbol(&self, name: &[u8]) -> Result<unsafe extern "system" fn() -> isize, String> {
+    pub(crate) fn symbol(
+        &self,
+        name: &[u8],
+    ) -> Result<unsafe extern "system" fn() -> isize, String> {
         unsafe {
             GetProcAddress(self.0, name.as_ptr()).ok_or("插件缺少 ABI 导出函数".into())
         }
@@ -260,35 +293,23 @@ pub fn find(root: &Path, id: &str) -> Result<Plugin, String> {
         .find(|p| p.manifest.id == id)
         .ok_or("插件尚未安装或文件损坏".into())
 }
-#[cfg(test)]
-pub fn install(root: &Path, path: &Path) -> Result<Manifest, String> {
-    install_with(root, path, |_, _| Ok(())).map(|installed| installed.manifest)
-}
 pub struct Installed {
     pub manifest: Manifest,
     pub status: &'static str,
 }
-// The caller holds plugin_access exclusively until files and application state are committed.
-pub fn install_with(
-    root: &Path,
-    path: &Path,
-    commit: impl FnOnce(&Manifest, bool) -> Result<(), String>,
-) -> Result<Installed, String> {
+// The caller holds plugin_access exclusively until package replacement is complete.
+pub fn install(root: &Path, path: &Path) -> Result<Installed, String> {
     if path
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case("zip"))
         .unwrap_or(false)
     {
-        return install_zip(root, path, commit);
+        return install_zip(root, path);
     }
-    install_manifest(root, path, commit)
+    install_manifest(root, path)
 }
-fn install_zip(
-    root: &Path,
-    path: &Path,
-    commit: impl FnOnce(&Manifest, bool) -> Result<(), String>,
-) -> Result<Installed, String> {
+fn install_zip(root: &Path, path: &Path) -> Result<Installed, String> {
     let parent = crate::storage::data_dir(&root).join("tmp/plugin-packages");
     fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
     let parent = parent.canonicalize().map_err(|e| e.to_string())?;
@@ -328,7 +349,7 @@ fn install_zip(
         if !manifest.starts_with(&unpack) {
             return Err("插件描述不在解压目录中".into());
         }
-        install_manifest(root, &manifest, commit)
+        install_manifest(root, &manifest)
     })();
     // This uniquely created directory is owned by this operation; ZIP entries cannot create links.
     if unpack.parent() == Some(parent.as_path()) {
@@ -388,11 +409,7 @@ fn clean_replaced(dir: &Path, old: &Plugin) {
     }
     let _ = fs::remove_dir(dir);
 }
-fn install_manifest(
-    root: &Path,
-    path: &Path,
-    commit: impl FnOnce(&Manifest, bool) -> Result<(), String>,
-) -> Result<Installed, String> {
+fn install_manifest(root: &Path, path: &Path) -> Result<Installed, String> {
     let plugin = Plugin::read(path)?;
     let parent = crate::storage::data_dir(&root).join("plugins");
     fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
@@ -443,23 +460,6 @@ fn install_manifest(
             }
             return Err(format!("插件更新失败，旧插件未改变：{error}"));
         }
-        if let Err(error) = commit(&plugin.manifest, replacing) {
-            fs::rename(&target, &staging).map_err(|rollback| {
-                format!(
-                    "保存失败：{error}；撤销更新失败：{rollback}；旧插件保留在 {}",
-                    backup.display()
-                )
-            })?;
-            if replacing {
-                fs::rename(&backup, &target).map_err(|rollback| {
-                    format!(
-                        "保存失败：{error}；旧插件保留在 {}，恢复失败：{rollback}",
-                        backup.display()
-                    )
-                })?;
-            }
-            return Err(format!("{error}；插件安装已撤销"));
-        }
         if let Some(old) = old {
             clean_replaced(&backup, &old);
         }
@@ -484,25 +484,17 @@ mod tests {
         let root = std::env::temp_dir().join(format!("shishi-package-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         if let Some(previous) = std::env::var_os("SHISHI_TEST_PREVIOUS_PACKAGE") {
-            let old = install(&root, Path::new(&previous)).unwrap();
-            let result = install_with(&root, Path::new(&package), |new, replacing| {
-                assert!(replacing);
-                assert_eq!(old.id, new.id);
-                assert_ne!(old.version, new.version);
-                Ok(())
-            })
-            .unwrap();
+            let old = install(&root, Path::new(&previous)).unwrap().manifest;
+            let result = install(&root, Path::new(&package)).unwrap();
+            assert_eq!(old.id, result.manifest.id);
+            assert_ne!(old.version, result.manifest.version);
             assert_eq!(result.status, "updated");
             assert_eq!(
-                install_with(&root, Path::new(&package), |_, _| panic!(
-                    "same ZIP must be a no-op"
-                ))
-                .unwrap()
-                .status,
+                install(&root, Path::new(&package)).unwrap().status,
                 "unchanged"
             );
         }
-        let installed = install(&root, Path::new(&package)).unwrap();
+        let installed = install(&root, Path::new(&package)).unwrap().manifest;
         let (found, errors) = catalog(&root);
         assert!(errors.is_empty());
         assert_eq!(found.len(), 1);
@@ -539,7 +531,7 @@ mod tests {
                 &package,
             )
             .unwrap();
-            let installed = install(&root, &package).unwrap();
+            let installed = install(&root, &package).unwrap().manifest;
             assert_eq!(installed.id, "zip-fixture");
             let dir = root.join("data/plugins/zip-fixture");
             assert_eq!(
@@ -551,14 +543,7 @@ mod tests {
                 "resource"
             );
             assert!(!dir.join("not-declared.txt").exists());
-            assert_eq!(
-                install_with(&root, &package, |_, _| panic!(
-                    "unchanged package must not rewrite state"
-                ))
-                .unwrap()
-                .status,
-                "unchanged"
-            );
+            assert_eq!(install(&root, &package).unwrap().status, "unchanged");
             assert_eq!(
                 fs::read_to_string(dir.join("plugin.dll")).unwrap(),
                 "inert DLL fixture"

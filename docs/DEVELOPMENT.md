@@ -32,6 +32,9 @@ cargo build --package shishi --release --locked --offline
 ```powershell
 npm install --prefix <dependency-directory> playwright
 $env:NODE_PATH='<dependency-directory>\node_modules'
+node tests/tool-calling-ui.cjs
+node tests/task-status-menu-ui.cjs
+python tests/tool-bridge-native.py --binary target/release/shishi.exe --output build/tool-bridge-native
 node tests/ai-controls-ui.cjs
 node tests/ui-regression.cjs
 node tests/workflow-ui.cjs
@@ -79,6 +82,8 @@ Codex 处置通过桌面消息管道创建、追加和读取，测试不得重�
 
 UI 测试使用合成数据和模拟 IPC，浏览器无头运行，输出写入系统临时目录；不会控制正在运行的拾事。某些测试明确标记 ignored，是进程模拟入口或需要显式数据的离线实验，不应以真实资料执行后把产物提交。
 
+`tool-calling-ui.cjs` 覆盖全局工具启用、兼容复制及手动复制兜底、受保护的编辑页、记录列表的多关键词搜索／分页、准确条目详情和逐层返回。`task-status-menu-ui.cjs` 覆盖完成按钮的悬停菜单、原状态请求、鼠标间隙、键盘、宽窄布局及减少动态效果。Codex 适配器的合成 CLI 用例只运行本机临时夹具，验证声明工具通过、未声明工具拒绝及工具运行环境错误中止，不调用真实 CLI 模型。
+
 `about-history-ui.cjs` 覆盖关于我们、三个外部入口、标题行更新控件、固定发布于标签及旧安装/更新时间隐藏、检查加载与重复点击、准备完成后的确认与稍后处理、固定事项编号、变更记录查询与排序、空依据禁用、长记录底部收起、宽窄窗口的数据目录布局、系统日志搜索请求和记忆副标题。原生更新助手的隔离验证边界见 [版本更新](UPDATES.md)。
 
 `update-schedule-ui.cjs` 使用合成安装包状态和可控时钟验证每日提醒、立即／稍后选择、凌晨独立安装请求、开关关闭、请求过期与失败去重。Rust 时钟用例另验证边界跨越、日期持久去重、启动／休眠不补执行以及缓存缺失或损坏；不修改系统时间，不下载真实发布包。
@@ -96,6 +101,8 @@ UI 测试使用合成数据和模拟 IPC，浏览器无头运行，输出写入�
 ```
 
 脚本构建主程序，定位 WebView2Loader.dll，调用 NSIS 并输出安装器 SHA-256。安装器仅包含主程序、运行依赖和安装说明，不嵌入 `data/` 或私人插件。不要直接覆盖正在使用的安装目录进行验证。
+
+发布构建通过 Rust 路径映射隐藏构建账户、Cargo 目录和源码检出路径；已有 Rust flags 继续保留，临时环境变量在构建结束后恢复。发布前仍须检查实际 EXE 与安装文件，不能仅凭源码扫描推断二进制不含个人路径。
 
 本地调试可使用 `target/release/shishi.exe --root <isolated-directory>`；仅使用全新隔离目录。仓库首发不承诺读取早期开发版本的数据。
 
@@ -166,3 +173,7 @@ DSH 缺少 ACP profile 时可显式确认初始化：`dsh_initialize_acp` 要求
 通用子进程 stdout 上限 64 MiB、stderr 8 MiB、单行 8 MiB；每读取 256 KiB 返回取消及期限检查，最终排空也执行检查。更新缓存仅回收超过 24 小时且命名可确认属于程序的文件，保留当前已验证包、被占用的助手及任何未知内容。
 
 构建脚本从 `cargo metadata --locked --offline` 的实际依赖定位 x64 WebView2 加载器，输出 `Shishi-Build-Metrics-<version>.json`，包含安装包、主程序、嵌入 UI 大小与加载器版本／摘要。不以源码行数或删除未使用 Rust 函数推断产物一定缩小。
+
+SS-191：`tool-calling-ui.cjs` 使用模拟 IPC 验证独立提示词类型、单层工具列表、草稿保存失败、开关、测试取消、制作提示词复制、预览和 API 用途路由。`tool_calling_tests.rs` 通过自建临时合成 EXE、CMD 包装命令和解释器脚本校验实际实参、双路有界输出、编码、退出状态、超时与进程树取消；API 使用内存模拟 Transport，不访问供应商。运行边界及首版 CMD 参数规则见 [工具调用](TOOL_CALLING.md)。
+
+SS-199—SS-205：工具记录回归覆盖逐调用事项关联、固定范围下的搜索／分页／详情、旧批次归属不猜测和保存失败保留。非处置的 Codex/DSH 使用模型文本适配层，复用 API 的 SS 工具循环；合成 CLI 检查补查、命令执行、参数拒绝、取消、总期限、跨轮用量和图片原生内容。`codex-tool-native.py` 用真实 CLI 与本地合成上游验证文本请求 → SS 执行 → 结果续轮，没有模型侧业务工具 MCP；`tool-bridge-native.py` 检查处置的通用 ss_tool 与既有凭证。UI 覆盖精简入口、详情分区、空／失败／未知结果、不可信长字符串、360px 窄窗口、系统日志用途合并、插件对齐及标签默认开合与收起保存。命令见 [回归规范](LIVE_AI_REGRESSION.md)，真实模型只在用户明确授权的范围内运行。

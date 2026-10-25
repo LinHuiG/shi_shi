@@ -138,6 +138,7 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     assert((await page.locator('#settings-models').innerText()).includes('AI一键处置'));
     assert((await page.locator('#settings-models').innerText()).includes('归档分析'));
     assert((await page.locator('#settings-models').innerText()).includes('消息过滤'));
+    assert.equal(await page.locator('[data-model-profile="tool_call"]').count(),0);
     assert.equal(await page.locator('#settings-models .model-profile .help-dot').count(),4);
     await page.locator('#settings-models .help-dot').first().focus();
     assert(await page.locator('.help-popover').isVisible());

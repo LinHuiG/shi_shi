@@ -900,6 +900,17 @@ impl AcpClient {
         timeout: Duration,
         on_event: &mut dyn FnMut(AcpEvent),
     ) -> Result<PromptResult, ClientError> {
+        self.prompt_with_images(session_id, exact_prompt, &[], timeout, on_event)
+    }
+
+    pub fn prompt_with_images(
+        &self,
+        session_id: &str,
+        exact_prompt: &str,
+        images: &[Value],
+        timeout: Duration,
+        on_event: &mut dyn FnMut(AcpEvent),
+    ) -> Result<PromptResult, ClientError> {
         if exact_prompt.is_empty() {
             return Err(ClientError::PromptEmpty);
         }
@@ -922,11 +933,38 @@ impl AcpClient {
             }
             on_event(event);
         };
+        let mut content = vec![json!({"type":"text","text":exact_prompt})];
+        if !images.is_empty()
+            && !self
+                .capabilities
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| c.prompt_image)
+        {
+            return Err(ClientError::Protocol(
+                "Agent does not support native image input".into(),
+            ));
+        }
+        if images.len() > 2 {
+            return Err(ClientError::Protocol("Too many input images".into()));
+        }
+        for image in images {
+            let data = image["data"]
+                .as_str()
+                .filter(|s| s.len() <= 4 * 1024 * 1024)
+                .ok_or_else(|| ClientError::Protocol("Invalid input image".into()))?;
+            let mime = image["mimeType"]
+                .as_str()
+                .filter(|s| matches!(*s, "image/jpeg" | "image/png" | "image/webp" | "image/gif"))
+                .ok_or_else(|| ClientError::Protocol("Invalid image type".into()))?;
+            content.push(json!({"type":"image","data":data,"mimeType":mime}));
+        }
         let response = self.request(
             "session/prompt",
             json!({
                 "sessionId": session_id,
-                "prompt": [{"type": "text", "text": exact_prompt}]
+                "prompt": content
             }),
             timeout,
             &mut handler,

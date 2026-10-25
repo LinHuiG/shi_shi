@@ -4,7 +4,8 @@ use serde_json::{json, Value};
 use std::fs;
 use std::sync::atomic::Ordering;
 
-pub const TARGETS: [&str; 7] = [
+pub const TARGETS: [&str; 8] = [
+    "tool_call",
     "classify",
     "format",
     "learning",
@@ -23,6 +24,7 @@ pub(crate) fn set_content(config: &mut Config, target: &str, text: String) -> Re
         "learning" => &mut config.learning_prompt,
         "report" => &mut config.report_prompt,
         "handling" => &mut config.handling_prompt,
+        "tool_call" => &mut config.tool_call_prompt,
         "prompt_review" => &mut config.review_prompt,
         "archive" => &mut config.archive_prompt,
         _ => return Err("未知提示词类型".into()),
@@ -128,7 +130,7 @@ mod tests {
             .unwrap()
             .id
             .clone();
-        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app.rollback_prompt(&review.base_version, &latest).is_err());
         assert_eq!(
             content(&app.state.lock().unwrap().config, "classify"),
@@ -156,9 +158,8 @@ mod tests {
             assert_eq!(json!(*app.state.lock().unwrap()), before);
         }
         app.retry_prompt_review_with(&old.id, |_| {
-            let disk: Value =
-                serde_json::from_slice(&fs::read(app.root.join("data/state.json")).unwrap())
-                    .unwrap();
+            let disk =
+                serde_json::to_value(crate::managed_data::load_state(&app.root).unwrap()).unwrap();
             assert_eq!(disk["prompt_reviews"].as_array().unwrap().len(), 1);
             assert!(!app
                 .state
@@ -197,12 +198,12 @@ mod tests {
         let before = json!(*app.state.lock().unwrap());
         let result =
             json!({"improved":false,"reason":"无需修改","proposed_prompt":"","evidence_ids":[]});
-        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .retry_prompt_review_with(&old.id, |_| Ok(result.clone()))
             .is_err());
         assert_eq!(json!(*app.state.lock().unwrap()), before);
-        fs::remove_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, false).unwrap();
         assert!(app
             .retry_prompt_review_with(&old.id, |_| {
                 app.state.lock().unwrap().prompt_reviews[0].status = "rejected".into();
@@ -355,9 +356,6 @@ impl App {
             return Err("当前已是此版本".into());
         }
         set_content(&mut s.config, &old.target, old.content.clone())?;
-        if old.target == "handling" {
-            crate::evolution::sync_handling_prompt(&mut s, &old.content, "从系统提示词历史回滚");
-        }
         let version = record(
             &mut s,
             &old.target,

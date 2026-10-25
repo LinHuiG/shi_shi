@@ -244,7 +244,7 @@ impl App {
         Err("设置正在被其他操作更新，请重试".into())
     }
     fn configure_candidate(&self, v: Value, expected: Option<&Value>) -> Result<Value, String> {
-        let c: Config = serde_json::from_value(v).map_err(|e| e.to_string())?;
+        let mut c: Config = serde_json::from_value(v).map_err(|e| e.to_string())?;
         ai::analysis_workdir(&self.root, &c)?;
         crate::ai_backend::validate_connections(&c)?;
         if !(5_000..=200_000).contains(&c.max_input_chars) {
@@ -273,6 +273,7 @@ impl App {
             &c.learning_prompt,
             &c.report_prompt,
             &c.handling_prompt,
+            &c.tool_call_prompt,
             &c.review_prompt,
             &c.archive_prompt,
         ]
@@ -295,11 +296,9 @@ impl App {
             return Err("settings_concurrent_change".into());
         }
         let mut s = locked.clone();
-        crate::evolution::sync_handling_prompt(
-            &mut s,
-            &prompts::content(&c, "handling"),
-            "在系统提示词中编辑处置规则",
-        );
+        // Tool CRUD has its own revision checks. Old/stale settings payloads
+        // must never clear the registry or overwrite a simultaneous tool edit.
+        c.tools = s.config.tools.clone();
         prompts::record_config_changes(&mut s, &c);
         let old = json!(s.config);
         let filter_disabled = s.config.message_filter_enabled && !c.message_filter_enabled;
@@ -507,7 +506,7 @@ impl App {
             .collect::<serde_json::Map<_, _>>();
         let result = self.ask_ai(
             "edit",
-            &json!({"current_task":fields,"current_tags":draft.tags,"user_instruction":text}),
+            &json!({"current_task":fields,"current_tags":draft.tags,"user_instruction":text,"_tool_task_id":draft.id}),
         )?;
         self.complete_ai_edit(&original, draft, text, result)
     }
@@ -568,6 +567,11 @@ impl App {
         if draft.status == "待处理" && original.status != "待处理" {
             draft.archived = false;
         }
+        draft.suggested_project_id = result["suggested_project_id"].as_str().unwrap_or("").into();
+        draft.suggested_project_reason = result["suggested_project_reason"]
+            .as_str()
+            .unwrap_or("")
+            .into();
         draft.manual = true;
         draft.locked = false;
         draft.reason = result["reason"]
@@ -577,6 +581,7 @@ impl App {
             .take(1000)
             .collect();
         s.tasks[pos] = draft.clone();
+        crate::tool_calling::link_tasks(&mut s, &result, &[draft.id.clone()]);
         Self::audit(
             &mut s,
             "manual_ai_edit",

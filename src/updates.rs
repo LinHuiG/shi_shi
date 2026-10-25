@@ -557,8 +557,8 @@ pub fn start_scheduler(app: Arc<App>) {
 pub fn open_link(target: &str) -> Result<Value, String> {
     let url = match target {
         "github" => "https://github.com/LinHuiG/shi_shi",
-        "blog" => "https://blog.linhui.fun/",
-        "intro" => "https://blog.linhui.fun/posts/shishi-ai-context-engineering/",
+        "blog" => "https://github.com/LinHuiG/shi_shi/tree/main/docs",
+        "intro" => "https://github.com/LinHuiG/shi_shi#readme",
         _ => return Err("链接无效".into()),
     };
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
@@ -595,7 +595,7 @@ fn plain_file(path: &Path) -> Result<fs::Metadata, String> {
     }
     Ok(meta)
 }
-fn sha256(path: &Path) -> Result<String, String> {
+pub(crate) fn sha256(path: &Path) -> Result<String, String> {
     use windows_sys::Win32::Security::Cryptography::*;
     unsafe {
         let mut algorithm = std::ptr::null_mut();

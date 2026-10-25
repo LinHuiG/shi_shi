@@ -90,7 +90,7 @@ function render() {
   if (!['sources', 'prompts'].includes(page)) $('#view').dataset.contentPage = page;
   for (const el of document.querySelectorAll('[data-page]'))
     el.classList.toggle('active', el.dataset.page === page);
-  $('#page-title').textContent = page === 'handling' ? '处置规则' : names[page];
+  $('#page-title').textContent = names[page];
   $('#page-subtitle').textContent =
     page === 'tasks'
       ? `${state.tasks.filter((t) => t.status === '待处理' && !t.archived && !t.merged_into && !t.deferred).length} 项待处理`
@@ -127,12 +127,7 @@ function render() {
                     ? '<span id="settings-save-status" role="status"><span data-settings-save-message>更改后自动保存</span><button type="button" data-settings-retry hidden>重试</button></span>'
                     : '<button data-action="open-data">打开数据目录</button>',
   );
-  if (page === 'handling')
-    return renderHandlingRules().catch((e) => {
-      renderedKey = '';
-      toast(e.message);
-    });
-  else if (page === 'tasks') renderTasks();
+  if (page === 'tasks') renderTasks();
   else if (page === 'schedules') renderSchedules();
   else if (page === 'sources') return renderSources();
   else if (page === 'prompts')
@@ -163,27 +158,32 @@ function statusBadge(t) {
   const s = taskState(t);
   return `<span class="task-status state-${s.key}"><i></i>${s.label}</span>`;
 }
+function taskScopeMatches(t, scope = tab) {
+  return scope === '今日事项'
+    ? t.today
+    : scope === '归档'
+      ? t.archived
+      : !t.archived && (scope === '全部' || (t.status === scope && !t.deferred));
+}
+function taskQuickViewMatches(t, view = quickView) {
+  return !view || (view === 'blocked'
+    ? !!t.blocker
+    : t.due && new Date(t.due).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) ===
+      new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }));
+}
+function taskSearchMatches(t, text = query) {
+  return !text || (t.title + ' ' + t.description + ' ' + t.blocker)
+    .toLowerCase().includes(text.toLowerCase());
+}
 function visibleTasks() {
   return state.tasks
     .filter(
       (t) =>
         tagMatches(t) &&
-        (!quickView ||
-          (quickView === 'blocked'
-            ? !!t.blocker
-            : t.due &&
-              new Date(t.due).toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) ===
-                new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }))) &&
+        taskQuickViewMatches(t) &&
         !t.merged_into &&
-        (tab === '今日事项'
-          ? t.today
-          : tab === '归档'
-            ? t.archived
-            : !t.archived && (tab === '全部' || (t.status === tab && !t.deferred))) &&
-        (!query ||
-          (t.title + ' ' + t.description + ' ' + t.blocker)
-            .toLowerCase()
-            .includes(query.toLowerCase())),
+        taskScopeMatches(t) &&
+        taskSearchMatches(t),
     )
     .sort(
       (a, b) =>
@@ -192,6 +192,60 @@ function visibleTasks() {
         b.updated - a.updated,
     );
 }
+function notificationCanLeaveDialog() {
+  if ($('#overlay').hidden || modalClosing) return true;
+  const dialog = $('#dialog');
+  if (dialog.querySelector('[data-pending="true"],[data-plugin-dirty="true"]')) return false;
+  if (modalOutsideDismiss) return modalOutsideDismiss();
+  // No generic modal baseline exists. Only task forms with unchanged native
+  // input defaults can be closed here; keep other dialogs and custom editors.
+  if (!dialog.querySelector('#f-title,#natural-input')) return false;
+  return [...dialog.querySelectorAll('input,textarea,select')].every(input => {
+    if (input.type === 'checkbox' || input.type === 'radio') return input.checked === input.defaultChecked;
+    if (input.tagName === 'SELECT') return input.value ===
+      ([...input.options].find(option => option.defaultSelected) || input.options[0])?.value;
+    return input.value === input.defaultValue;
+  });
+}
+let notifiedTaskRequest = 0;
+window.openNotifiedTask = async function (id) {
+  const request = ++notifiedTaskRequest;
+  const unavailable = message => { toast(message); return false; };
+  if (typeof id !== 'string' || !id) return unavailable('这条事项已不可用');
+  try {
+    if (!notificationCanLeaveDialog()) return unavailable('请先保存或关闭当前编辑，再查看事项');
+    if (!(await leaveSettings())) return false;
+    const fromPage = page, fromTask = selected, dialog = $('#dialog').firstElementChild;
+    const next = await rpc('state', { page: 'tasks', task: id });
+    if (request !== notifiedTaskRequest) return false;
+    if (page !== fromPage || selected !== fromTask || $('#dialog').firstElementChild !== dialog ||
+        !notificationCanLeaveDialog() || settingsChanged() || connectionEditor || memoryEditor)
+      return unavailable('当前页面正在编辑，请稍后再查看事项');
+    const task = next.tasks?.find(task => task.id === id);
+    if (!task || task.merged_into) return unavailable('这条事项已删除或合并');
+    // Keep the user's live filters, even when the new snapshot has older saved
+    // filters. Relax each rejecting group independently against fresh task data.
+    tagSelection();
+    prioritySelection();
+    state = { reports: [], audit: [], messages: [], ...state, ...next };
+    const tagsChanged = revealTaskTags(task);
+    if (!taskScopeMatches(task)) tab = task.archived ? '归档' : '全部';
+    if (!taskQuickViewMatches(task)) quickView = '';
+    if (!taskSearchMatches(task)) query = '';
+    if (!$('#overlay').hidden) closeModal();
+    page = 'tasks';
+    selected = id;
+    await render();
+    if (tagsChanged) saveTagFilters();
+    const row = [...document.querySelectorAll('.task-row')].find(row => row.dataset.task === id);
+    if (!row || selected !== id) return unavailable('暂时无法打开这条事项，请重试');
+    row.scrollIntoView({ block: 'nearest' });
+    row.focus({ preventScroll: true });
+    return true;
+  } catch {
+    return unavailable('暂时无法读取这条事项，请重试');
+  }
+};
 function renderTasks() {
   const savedTagBar = rememberTagBar();
   const composingField =
@@ -273,6 +327,68 @@ function evidenceCount(t) {
 function selectedTask() {
   return state.tasks.find((t) => t.id === selected);
 }
+function taskStatusActions(t) {
+  const open=$('[data-task-status]')?.dataset.taskStatus === t.id && $('[data-task-status]').classList.contains('is-open');
+  return `<div class="task-status-actions ${open ? 'is-open' : ''}" data-task-status="${esc(t.id)}"><button class="primary" data-task-status-trigger data-action="${t.status === '已完成' ? 'reopen' : 'done'}" aria-haspopup="menu" aria-expanded="${!!open}" aria-controls="task-status-options">${t.status === '已完成' ? '重新打开' : '标记完成'}<span class="task-status-chevron" aria-hidden="true"></span></button><div class="task-status-popover" id="task-status-options" role="menu" aria-label="事项状态操作" ${open ? '' : 'inert'}><div class="task-status-menu"><button role="menuitem" data-action="dismiss">无需处理</button>${t.status === '待处理' && !t.archived ? `<button role="menuitem" data-action="${t.deferred ? 'resume-today' : 'tomorrow'}">${t.deferred ? '恢复今日' : '明日处理'}</button>` : ''}<button role="menuitem" data-action="archive-note">${t.archived ? '归档备注' : '归档'}</button></div></div></div>`;
+}
+let taskStatusCloseTimer;
+function setTaskStatusMenu(host, open) {
+  clearTimeout(taskStatusCloseTimer);
+  if (!host?.isConnected) return;
+  host.classList.toggle('is-open',open);
+  host.querySelector('[data-task-status-trigger]').setAttribute('aria-expanded',String(open));
+  const menu=host.querySelector('[role="menu"]');
+  menu.inert=!open;
+  if (open) {
+    menu.style.left='0';
+    const bounds=menu.getBoundingClientRect(), pane=host.closest('.detail')?.getBoundingClientRect(),
+      right=Math.min(innerWidth-12,pane?.right ?? innerWidth-12);
+    menu.style.left=`${Math.max(12-bounds.left,Math.min(0,right-bounds.right))}px`;
+  }
+}
+document.addEventListener('pointerover', e => {
+  const host=e.target.closest('[data-task-status]');
+  if (host && !host.contains(e.relatedTarget)) setTaskStatusMenu(host,true);
+});
+document.addEventListener('pointerout', e => {
+  const host=e.target.closest('[data-task-status]');
+  if (host && !host.contains(e.relatedTarget)) {
+    clearTimeout(taskStatusCloseTimer);
+    taskStatusCloseTimer=setTimeout(() => setTaskStatusMenu(host,false),120);
+  }
+});
+document.addEventListener('focusin', e => {
+  const host=e.target.closest('[data-task-status]');
+  if (host) setTaskStatusMenu(host,true);
+});
+document.addEventListener('focusout', e => {
+  const host=e.target.closest('[data-task-status]');
+  if (host && !host.contains(e.relatedTarget) && !host.matches(':hover')) setTaskStatusMenu(host,false);
+});
+document.addEventListener('pointerdown', e => {
+  const host=$('[data-task-status].is-open');
+  if (host && !host.contains(e.target)) setTaskStatusMenu(host,false);
+});
+document.addEventListener('click', e => {
+  const host=e.target.closest('[data-task-status]');
+  if (host && e.target.closest('[data-action]')) setTaskStatusMenu(host,false);
+});
+document.addEventListener('keydown', e => {
+  const host=e.target.closest('[data-task-status]');
+  if (!host) return;
+  const items=[...host.querySelectorAll('[role="menuitem"]')];
+  if (['ArrowDown','ArrowUp','Home','End'].includes(e.key)) {
+    e.preventDefault();
+    setTaskStatusMenu(host,true);
+    const index=items.indexOf(document.activeElement), next=e.key === 'Home' ? 0 : e.key === 'End' || (index<0 && e.key === 'ArrowUp') ? items.length-1 : (index+(e.key === 'ArrowUp' ? -1 : 1)+items.length)%items.length;
+    items[next]?.focus();
+  } else if (e.key === 'Escape' && host.classList.contains('is-open')) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    host.querySelector('[data-task-status-trigger]').focus({preventScroll:true});
+    setTaskStatusMenu(host,false);
+  }
+});
 async function renderDetail() {
   const t = selectedTask();
   if (!t || !$('#task-detail')) return;
@@ -290,8 +406,10 @@ async function renderDetail() {
   }
   setHtml(
     '#task-detail',
-    `<div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${statusBadge(t)}</div><h2><span class="detail-task-number">#${taskNumber(t)}</span>${esc(t.title)}</h2><div class="task-times"><span>生成于 ${esc(t.created ? date(t.created) : '未记录')}</span><span>上次变更 ${esc(t.updated ? date(t.updated) : '未记录')}</span></div><div class="reason">${esc(t.reason || '手动创建的事项')}</div><div class="detail-actions"><button class="ai-dispose" data-handle="start" data-task-id="${esc(t.id)}"><span class="ai-mark" aria-hidden="true">✦</span>${handlingButton(t.id)}</button><button class="primary" data-action="${t.status === '已完成' ? 'reopen' : 'done'}">${t.status === '已完成' ? '重新打开' : '标记完成'}</button><button data-action="edit">编辑</button>${t.status === '待处理' && !t.archived ? `<button data-action="${t.deferred ? 'resume-today' : 'tomorrow'}">${t.deferred ? '恢复今日' : '明日处理'}</button>` : ''}<button data-action="archive-note">${t.archived ? '归档备注' : '归档'}</button><button data-action="merge">合并</button><button data-action="dismiss">无需处理</button></div>${t.deferred ? `<div class="deferred-note">已安排明日处理，${esc(date(t.deferred_until))} 自动恢复到今日事项。</div>` : ''}${t.schedule_id ? `<div class="helper">定时事项 · ${esc(t.scheduled_for)} 生成</div>` : ''}${t.blocker ? `<div class="block">有阻塞 · ${esc(t.blocker)}${t.waiting_for ? `<div class="muted">等待 ${esc(t.waiting_for)}</div>` : ''}</div>` : ''}${t.waiting_for && !t.blocker ? `<div class="waiting-note">等待 ${esc(t.waiting_for)} 的回复或处理结果</div>` : ''}${t.archive_note ? `<section class="archive-note"><h3>归档备注</h3><div class="description">${esc(t.archive_note)}</div><div class="helper">${esc(date(t.archived_at))} · 会作为后续汇总与建议的参考</div></section>` : ''}${t.description ? `<section class="detail-panel task-description"><h3>事项描述</h3><div class="description">${esc(t.description)}</div></section>` : ''}${t.due ? `<section><h3>截止时间</h3>${esc(dueLabel(t))}<div class="helper">后续对话有明确新证据时可自动更新期限</div></section>` : ''}${handlingPanel(t)}<details class="evidence-disclosure detail-panel"><summary>消息依据 <span data-evidence-count>${evidenceCount(t)} 条</span></summary><div id="evidence" data-preserve-content><div class="muted">读取中…</div></div>${detailCollapseFooter('消息依据')}</details>${taskChangesSection(t)}<section><h3>下一步</h3><div class="advice"><p>${esc(t.next_step || '尚无建议，可以先补充问题现象和预期结果。')}</p><button data-action="prompt">复制排查提示词</button></div></section>`,
+    `<div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${statusBadge(t)}</div><h2><span class="detail-task-number">#${taskNumber(t)}</span>${esc(t.title)}</h2><div class="task-times"><span>生成于 ${esc(t.created ? date(t.created) : '未记录')}</span><span>上次变更 ${esc(t.updated ? date(t.updated) : '未记录')}</span></div><div class="reason">${esc(t.reason || '手动创建的事项')}</div><div class="detail-actions"><button class="ai-dispose" data-handle="start" data-task-id="${esc(t.id)}"><span class="ai-mark" aria-hidden="true">✦</span>${handlingButton(t.id)}</button>${taskStatusActions(t)}<button data-action="edit">编辑</button><button data-action="merge">合并</button>${t.has_tool_calls ? `<button data-tool-run-history="${esc(t.id)}">工具调用记录</button>` : ''}</div>${t.deferred ? `<div class="deferred-note">已安排明日处理，${esc(date(t.deferred_until))} 自动恢复到今日事项。</div>` : ''}${t.schedule_id ? `<div class="helper">定时事项 · ${esc(t.scheduled_for)} 生成</div>` : ''}${t.blocker ? `<div class="block">有阻塞 · ${esc(t.blocker)}${t.waiting_for ? `<div class="muted">等待 ${esc(t.waiting_for)}</div>` : ''}</div>` : ''}${t.waiting_for && !t.blocker ? `<div class="waiting-note">等待 ${esc(t.waiting_for)} 的回复或处理结果</div>` : ''}${t.archive_note ? `<section class="archive-note"><h3>归档备注</h3><div class="description">${esc(t.archive_note)}</div><div class="helper">${esc(date(t.archived_at))} · 会作为后续汇总与建议的参考</div></section>` : ''}${t.description ? `<section class="detail-panel task-description"><h3>事项描述</h3><div class="description">${esc(t.description)}</div></section>` : ''}${t.due ? `<section><h3>截止时间</h3>${esc(dueLabel(t))}<div class="helper">后续对话有明确新证据时可自动更新期限</div></section>` : ''}${handlingPanel(t)}<details class="evidence-disclosure detail-panel"><summary>消息依据 <span data-evidence-count>${evidenceCount(t)} 条</span></summary><div id="evidence" data-preserve-content><div class="muted">读取中…</div></div>${detailCollapseFooter('消息依据')}</details>${taskChangesSection(t)}<section><h3>下一步</h3><div class="advice"><p>${esc(t.next_step || '尚无建议，可以先补充问题现象和预期结果。')}</p><button data-action="prompt">复制排查提示词</button></div></section>`,
   );
+  const statusMenu=$('[data-task-status].is-open');
+  if (statusMenu) setTaskStatusMenu(statusMenu,true);
   if (taskChangeView(t.id).open) void renderTaskChanges(t.id);
   const host = $('#evidence'),
     disclosure = host.closest('details');

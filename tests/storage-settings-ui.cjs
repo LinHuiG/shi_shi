@@ -45,8 +45,8 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
    const selection=await field.evaluate(el=>({start:el.selectionStart,end:el.selectionEnd,length:el.value.length}));
    assert(selection.end>selection.start,'drag retains selected text: '+id+' '+selector);
   }
-  await page.locator('#page-title').click();assert.equal(prompts,1,'a fresh outside click asks once');assert.equal(await page.locator('#connection-form').count(),1,'dismiss keeps draft');
-  await page.locator('[data-ai-cancel]').click();assert.equal(prompts,1,'explicit cancel does not ask twice');await page.close();
+  await page.locator('#page-title').click();assert.equal(prompts,0,'a fresh outside click preserves edits without a prompt');assert.equal(await page.locator('#connection-form').count(),1,'outside click keeps draft');
+  await page.locator('[data-ai-cancel]').click();assert.equal(prompts,0,'explicit cancel discards without a prompt');await page.close();
  }
  assert.equal(dialogs,0);assert.deepEqual(errors,[]);console.log('PASS directory copy/switch/cancel, async errors, saved settings, hidden AI workdir, duplicate protection, and real drag selection for Codex/DSH/API. '+out);
 }finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1});

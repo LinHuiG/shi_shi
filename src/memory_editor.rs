@@ -120,12 +120,12 @@ mod tests {
         assert!(app
             .memory_save(&json!({"kind":"archived","expected":0,"entries":[]}))
             .is_err());
-        std::fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .memory_save(&json!({"kind":"temporary","expected":1,"text":"不能提交"}))
             .is_err());
         assert_eq!(app.memory_read(), before);
-        std::fs::remove_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, false).unwrap();
         let reloaded = App::load(app.root.clone()).unwrap();
         assert_eq!(reloaded.memory_read(), before);
     }

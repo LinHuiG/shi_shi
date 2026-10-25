@@ -70,6 +70,7 @@ pub enum ApiErrorKind {
     Transport,
     HttpStatus,
     ResponseTooLarge,
+    InputLimit,
     EmptyResponse,
     Refusal,
     Truncated,
@@ -206,6 +207,7 @@ impl fmt::Display for ApiError {
             ApiErrorKind::ResponseTooLarge => {
                 f.write_str("provider response exceeded the size limit")
             }
+            ApiErrorKind::InputLimit => f.write_str("tool-loop input exceeded the character budget; completed commands were not replayed"),
             ApiErrorKind::EmptyResponse => f.write_str("provider returned no final content"),
             ApiErrorKind::Refusal => f.write_str("provider refused or filtered the response"),
             ApiErrorKind::Truncated => f.write_str("provider output was truncated"),
@@ -516,6 +518,25 @@ impl fmt::Debug for ToolInvocation<'_> {
 /// provider-supplied paths.
 pub trait ToolHandler {
     fn invoke(&mut self, invocation: &ToolInvocation<'_>) -> Result<ToolResult, ToolFailure>;
+    /// Query adapters keep signature deduplication. Action adapters opt in to
+    /// repeated arguments under distinct IDs; IDs themselves never replay.
+    fn allows_repeated_arguments(&self) -> bool {
+        false
+    }
+    fn input_char_limit(&self) -> Option<usize> {
+        None
+    }
+    fn validate_batch(&mut self, _calls: &[ToolInvocation<'_>]) -> Result<(), ToolFailure> {
+        Ok(())
+    }
+    fn invoke_guarded(
+        &mut self,
+        invocation: &ToolInvocation<'_>,
+        _cancel: &AtomicBool,
+        _deadline: Instant,
+    ) -> Result<ToolResult, ToolFailure> {
+        self.invoke(invocation)
+    }
 }
 
 /// Images are explicit local tool output, never provider-supplied URLs. Keep
@@ -643,6 +664,42 @@ pub struct AnalyzeRequest<'a, 'h> {
     pub tool_handler: Option<&'h mut dyn ToolHandler>,
 }
 
+/// Conservative first-request size using the same wire assembly as sending.
+/// Stream fields are included even for a non-streaming connection.
+pub fn initial_input_chars(
+    model: &str,
+    effort: Option<&str>,
+    prompt: &str,
+    schema: &Value,
+    tools: &[ToolDefinition],
+) -> usize {
+    initial_request_body(model, effort, prompt, schema, tools)
+        .to_string()
+        .chars()
+        .count()
+}
+
+/// Credential-free request assembly, also used by local plain-model adapters.
+pub fn initial_request_body(
+    model: &str,
+    effort: Option<&str>,
+    prompt: &str,
+    schema: &Value,
+    tools: &[ToolDefinition],
+) -> Value {
+    let messages = vec![
+        json!({"role":"system","content":prompt}),
+        json!({"role":"user","content":format!("{USER_INSTRUCTION}\n\nRequired JSON Schema (authoritative):\n{schema}")}),
+    ];
+    let mut body = build_chat_body(model, &messages, schema, tools, true);
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage":true});
+    body
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnalysisOutput {
     pub value: Value,
@@ -758,6 +815,7 @@ impl<'a> ChatCompletionsClient<'a> {
         let mut requests = 0usize;
         let mut tool_calls = 0usize;
         let mut seen_calls = BTreeSet::<String>::new();
+        let mut seen_ids = BTreeSet::<String>::new();
         let mut tool_handler = request.tool_handler;
 
         loop {
@@ -777,10 +835,26 @@ impl<'a> ChatCompletionsClient<'a> {
             if stream {
                 body["stream_options"] = json!({"include_usage":true});
             }
-            let body_bytes = serde_json::to_vec(&body)
+            let body_text = serde_json::to_string(&body)
                 .map_err(|_| ApiError::simple(ApiErrorKind::InvalidConfig))?;
-            if body_bytes.len() > MAX_REQUEST_BYTES {
+            if body_text.len() > MAX_REQUEST_BYTES {
                 return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
+            }
+            if let Some(limit) = tool_handler.as_ref().and_then(|h| h.input_char_limit()) {
+                // Native images have their own byte limits. Only their JSON
+                // framing, not base64 pixels, consumes the text budget.
+                let image_chars: usize = messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_array())
+                    .flatten()
+                    .filter(|part| part["type"] == "image_url")
+                    .filter_map(|part| part["image_url"]["url"].as_str())
+                    .filter_map(|url| url.strip_prefix("data:")?.split_once(";base64,"))
+                    .map(|(_, data)| data.len())
+                    .sum();
+                if body_text.chars().count().saturating_sub(image_chars) > limit {
+                    return Err(ApiError::simple(ApiErrorKind::InputLimit));
+                }
             }
             let url = self.endpoint.chat_completions_url();
             requests += 1;
@@ -789,7 +863,7 @@ impl<'a> ChatCompletionsClient<'a> {
                 HttpMethod::Post,
                 &url,
                 request.credential,
-                Some(&body_bytes),
+                Some(body_text.as_bytes()),
                 self.max_response_bytes,
             );
             let output_base = if usage.responses == 0 {
@@ -914,6 +988,9 @@ impl<'a> ChatCompletionsClient<'a> {
                     Ok(calls) => calls,
                     Err(error)
                         if error.kind() == ApiErrorKind::InvalidToolArguments
+                            && !tool_handler
+                                .as_ref()
+                                .is_some_and(|h| h.allows_repeated_arguments())
                             && !tool_correction_used
                             && parsed.tool_calls.iter().all(|call| {
                                 matches!(call.name.as_str(), "read_context" | "read_image")
@@ -942,13 +1019,34 @@ impl<'a> ChatCompletionsClient<'a> {
                 // response, so two identical calls cannot both run. The same
                 // signature repeated in a later response is also no progress.
                 let mut response_signatures = BTreeSet::new();
+                let mut response_ids = BTreeSet::new();
+                let allow_repeated = tool_handler
+                    .as_ref()
+                    .is_some_and(|h| h.allows_repeated_arguments());
                 for call in &validated {
-                    if !response_signatures.insert(call.signature.clone())
-                        || seen_calls.contains(&call.signature)
+                    if !response_ids.insert(call.id.clone())
+                        || seen_ids.contains(&call.id)
+                        || !allow_repeated
+                            && (!response_signatures.insert(call.signature.clone())
+                                || seen_calls.contains(&call.signature))
                     {
                         return Err(ApiError::simple(ApiErrorKind::NoProgress));
                     }
                 }
+                tool_handler
+                    .as_mut()
+                    .ok_or_else(|| ApiError::simple(ApiErrorKind::InvalidConfig))?
+                    .validate_batch(
+                        &validated
+                            .iter()
+                            .map(|call| ToolInvocation {
+                                call_id: &call.id,
+                                name: &call.name,
+                                arguments: &call.arguments,
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .map_err(|_| ApiError::simple(ApiErrorKind::InvalidToolArguments))?;
                 // Preserve provider-published reasoning and replay metadata on tool rounds.
                 messages.push(parsed.message.clone());
                 let mut image_messages = Vec::new();
@@ -956,20 +1054,29 @@ impl<'a> ChatCompletionsClient<'a> {
                     check_cancel(request.cancel)?;
                     remaining_time(deadline)?;
                     seen_calls.insert(call.signature.clone());
+                    seen_ids.insert(call.id.clone());
                     let handler = tool_handler
                         .as_mut()
                         .ok_or_else(|| ApiError::simple(ApiErrorKind::InvalidConfig))?;
-                    event(ApiEvent::Phase(if call.name == "read_context" {
+                    event(ApiEvent::Phase(if allow_repeated {
+                        "执行工具"
+                    } else if call.name == "read_context" {
                         "读取上下文"
-                    } else {
+                    } else if call.name == "read_image" {
                         "读取图片"
+                    } else {
+                        "执行工具"
                     }));
                     let result = handler
-                        .invoke(&ToolInvocation {
-                            call_id: &call.id,
-                            name: &call.name,
-                            arguments: &call.arguments,
-                        })
+                        .invoke_guarded(
+                            &ToolInvocation {
+                                call_id: &call.id,
+                                name: &call.name,
+                                arguments: &call.arguments,
+                            },
+                            request.cancel,
+                            deadline,
+                        )
                         .map_err(|_| ApiError::simple(ApiErrorKind::ToolFailed))?;
                     check_cancel(request.cancel)?;
                     remaining_time(deadline)?;
@@ -989,8 +1096,8 @@ impl<'a> ChatCompletionsClient<'a> {
             };
             event(ApiEvent::Phase("校验结果"));
             match serde_json::from_str::<Value>(content.trim()) {
-                Ok(value) => match schema_validate::validate(request.schema, &value) {
-                    Ok(()) => {
+                Ok(value) => match schema_validate::validate_output(request.schema, value) {
+                    Ok(value) => {
                         check_cancel(request.cancel)?;
                         remaining_time(deadline)?;
                         return Ok(AnalysisOutput {
@@ -1810,7 +1917,7 @@ mod tests {
 
     #[test]
     fn error_redaction_never_contains_provider_body_or_key() {
-        let key = "sk-synthetic-key-echo-9f4a";
+        let key = "synthetic-key";
         let error = ApiError::http_status(400);
         let rendered = format!("{error} {error:?} {error}");
         assert!(!rendered.contains(key));

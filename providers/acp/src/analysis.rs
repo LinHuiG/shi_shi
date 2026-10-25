@@ -26,6 +26,7 @@ pub struct AnalysisSpec {
     pub kind: String,
     pub schema: Value,
     pub prompt: String,
+    pub images: Vec<Value>,
     pub workdir: PathBuf,
     pub snapshot_path: PathBuf,
     pub app_exe: PathBuf,
@@ -233,7 +234,13 @@ pub fn run(
     if let Some(effort) = &spec.effort {
         client.select_effort(&session.session_id, effort, remaining()?)?;
     }
-    let prompt = match client.prompt(&session.session_id, &spec.prompt, remaining()?, on_event) {
+    let prompt = match client.prompt_with_images(
+        &session.session_id,
+        &spec.prompt,
+        &spec.images,
+        remaining()?,
+        on_event,
+    ) {
         Ok(prompt) => prompt,
         Err(error) => {
             let _ = client.close_session(&session.session_id, Duration::from_secs(2));
@@ -295,6 +302,7 @@ mod tests {
                 "required": ["reason"]
             }),
             prompt: "exact caller payload".into(),
+            images: vec![],
             workdir: base.join("work"),
             snapshot_path: base.join("snapshot.json"),
             app_exe: base.join("shishi.exe"),

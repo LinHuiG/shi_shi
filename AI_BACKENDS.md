@@ -9,7 +9,7 @@
 - `src/ai_backend/codex.rs`、`src/codex_bridge.rs`：Codex CLI/app-server 参数、模型目录、登录状态、分析输出与事件解析。
 - `src/desktop_bridge.rs`、`src/handling_desktop.rs`：桌面管道、独立来源登记、项目与上下文准备、创建、追加和只读同步；不恢复目标执行会话。`src/ai_backend/agent_approval.rs` 保留其他接入仍使用的审批范围校验。
 - `src/ai_backend/dsh.rs`、`providers/acp/`：Harness 桌面 ACP 启动、受限 profile 就绪检查、分析提交、会话/审批/取消/历史适配。
-- `src/ai_backend/api.rs`、`providers/api/`：OpenAI Chat Completions 兼容 HTTP、WinHTTP、严格 schema 校验、多模态只读工具循环和 `/models` 发现。
+- `src/ai_backend/api.rs`、`providers/api/`：OpenAI Chat Completions HTTP、严格 schema、SS 共用工具循环和模型目录。`src/ai_backend/model_api.rs` 把 Codex/DSH 文本响应适配到同一循环，不通过 MCP 执行非处置工具；图片保持原生内容，续轮共用预算、取消、总期限和用量累加。
 - `src/credentials.rs`：DPAPI 本地密钥或指定环境变量；密钥不进配置、状态、提示词 trace 或日志。
 - `src/handling.rs`：事项关联、处置轮次状态、用量入账、学习和持久化。通过命名的会话操作调用适配器，不发送 RPC 方法。
 
@@ -27,13 +27,13 @@
 
 1. `Backend` 实现分析、模型目录、参数校验和状态查询。只有真正支持处置的驱动才能开放处置；`api` 的 Agent 操作明确返回不支持。
 2. 官方 API 端点必须是绝对 HTTPS，不能包含 userinfo、query 或 fragment；`/chat/completions` 和 `/models` 由客户端追加到调用方给定的路径前缀。
-3. 请求使用应用实际测量并接受的同一 prompt/schema/tools。工具循环只执行调用方声明的只读工具；不支持的工具、参数越界、消息/工具/响应格式错误都失败，不用普通文本冒充结构化结果。只在服务端明确表示不支持 `response_format` 时做有限降级，不重放模糊失败或可能有副作用的调用。
+3. 请求使用应用实际测量并接受的同一 prompt/schema/tools。工具循环只执行本次声明的补查和用户全局启用的注册业务工具，命令由 SS 执行；不支持的工具、参数越界、消息/工具/响应格式错误都失败，不用普通文本冒充结构化结果。只在服务端明确表示不支持 `response_format` 时做有限降级，不重放模糊失败或可能有副作用的调用。
 4. 分析成功结果为业务 JSON 与用量。用量采用 `input_tokens/output_tokens/cached_input_tokens` 等现有字段；缺失计数表示未知，不能按零展示。工具结果中的图片转换为 Chat Completions 多模态 `image_url`，base64 不放进普通文本；限制 mime、base64 和总体积。
 5. 处置结果沿用现有历史/审批 DTO。`start/read/resume` 返回 `thread`，`submit` 返回 `turn`，`history` 返回逆序 `data` 轮次数组；轮次保留 `id/status/startedAt/items/error`。适配器只保存在内存的历史不得在重启后覆盖应用已保存的轮次。
 6. `UsageEvent` 含会话 ID、可选轮次 ID、原生 `notification` 及可选用量。Harness 处置保留受限会话；Codex 处置只连接桌面消息桥接，查询与入账继续去重。Codex 桌面未提供的用量保持未知；没有独立执行或交接回退。
 7. 审批列表沿用 `id/method/params` 展示 DTO；回答由适配器转换，必须校验会话归属并展示协议原始范围，不扩大用户授予的权限。过期请求明确失败，不返回假成功。
 8. 创建、提交和运行中插话的结果不确定时不得自动重试。独立分析必须使用新会话；处置继续原持久会话。补查次数、图片预算、取消、工具隔离和提交 schema 不能靠提示词替代。
-9. Harness 分析和处置启动必须使用同一受限配置：分析使用 `--profile acp --patch <overlay>`、只读权限、空 `DSH_AGENTS_HOME` 和实际 `$DSH_HOME`；就绪检查读取版本和组合后的 `--dump-config`，校验活动插件 id/实现而不是只校验文件名。分析工具只允许 `read_context`/`read_image` 和 `submit_analysis`；没有 `submit_analysis` 接受结果或 schema 校验失败即整体失败。处置按用户已有权限展示审批，不支持的重命名、运行中插话等明确报错。
+9. Harness 分析和处置启动必须使用同一受限配置：分析使用 `--profile acp --patch <overlay>`、只读权限、空 `DSH_AGENTS_HOME` 和实际 `$DSH_HOME`；就绪检查读取版本和组合后的 `--dump-config`，校验活动插件 id/实现而不是只校验文件名。分析的 MCP 仅保留 `submit_analysis` 作为结构化文本返回通道；补查和业务工具都由 SS 的共用循环调度；没有 `submit_analysis` 接受结果或 schema 校验失败即整体失败。处置按用户已有权限展示审批，不支持的重命名、运行中插话等明确报错。
 10. 不在普通日志记录提示词原文、模型思考、消息正文、密钥或会话凭据；只记录请求 id、长度、哈希、用量和失败类别。
 
 ## 流式、期限与本地诊断

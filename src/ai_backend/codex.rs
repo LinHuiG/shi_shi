@@ -12,7 +12,11 @@ impl super::Backend for Codex {
         r: super::AnalysisRequest<'_>,
         event: &mut dyn FnMut(super::AnalysisEvent),
     ) -> Result<(Value, Value), String> {
-        analyze(r, c, event)
+        if r.payload["_model_only"] == true {
+            analyze(r, c, event)
+        } else {
+            super::model_api::analyze(c, r, event)
+        }
     }
     fn models(&self, c: &super::Connection, _root: &Path) -> Result<Value, String> {
         list_models(&c.executable)
@@ -71,6 +75,10 @@ fn analyze(
         .map_err(|e| e.to_string())?;
     let executable = resolve_cli(&config.codex)?;
     let mut cmd = Command::new(&executable);
+    // A desktop-agent shell can lend its own tool pipe to children. This
+    // analysis owns its MCP server and must not borrow the launching chat.
+    cmd.env_remove("CODEX_THREAD_ID")
+        .env_remove("CODEX_APP_TOOLS_PIPE_PATH");
     let help = exec_help(&executable, root, cancel)?;
     cmd.arg("exec");
     for option in ["--ignore-user-config", "--ignore-rules"] {
@@ -123,8 +131,6 @@ fn analyze(
         "-c",
         "features.hooks=false",
         "-c",
-        "features.code_mode_host=false",
-        "-c",
         "features.code_mode=false",
         "-c",
         "features.plugins=false",
@@ -141,17 +147,6 @@ fn analyze(
     .arg(&result)
     .arg("-C")
     .arg(&workdir);
-    let context_path = job.join("context.json");
-    let retrieval = payload["_local_context"].is_object();
-    if retrieval {
-        fs::write(
-            &context_path,
-            serde_json::to_vec(&payload["_local_context"]).unwrap(),
-        )
-        .map_err(|e| e.to_string())?;
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        cmd.arg("-c").arg(format!("mcp_servers.shishi_analysis={{command={},args=[\"--analysis-mcp\",{}],enabled=true,startup_timeout_sec=10,tool_timeout_sec=30}}",serde_json::to_string(&exe).unwrap(),serde_json::to_string(&context_path).unwrap()));
-    }
     if !config.model.trim().is_empty() {
         cmd.arg("--model").arg(&config.model);
     }
@@ -162,6 +157,10 @@ fn analyze(
         ));
     }
     cmd.arg("-");
+    let model_images = crate::images::model_files(&job, &payload["_model_images"])?;
+    for image in &model_images.0 {
+        cmd.arg("--image").arg(image);
+    }
     if config.retain_ai_traces {
         let diagnostic = crate::cache_diagnostics::prepare(&request, connection, &cmd);
         let _ = fs::write(trace.join("cache-diagnostics.json"), diagnostic.to_string());
@@ -241,7 +240,6 @@ fn analyze(
                                         .ok_or_else(|| "Codex 前台关联服务暂不可用".to_string())?
                                         .call_guarded(method, params, Some(&stop))
                                 },
-                                &mut || crate::codex_bridge::open_thread(&thread),
                                 std::time::Duration::from_secs(20),
                             );
                             match visible {
@@ -276,19 +274,9 @@ fn analyze(
                 }
                 let item = &v["item"];
                 match item["type"].as_str().unwrap_or("") {
-                    "mcp_tool_call" => {
-                        let permitted = retrieval
-                            && item["server"] == "shishi_analysis"
-                            && matches!(item["tool"].as_str(), Some("read_context" | "read_image"));
-                        // Per-page output is bounded and duplicate/no-progress
-                        // pages are deduplicated by the local meter. A valid
-                        // long source can require hundreds of pages, so there is
-                        // deliberately no cumulative call count here.
-                        if !permitted {
-                            budget_stop.set(true);
-                        }
+                    "mcp_tool_call" | "command_execution" | "web_search" | "file_change" => {
+                        budget_stop.set(true)
                     }
-                    "command_execution" | "web_search" | "file_change" => budget_stop.set(true),
                     _ => {}
                 }
                 if let Some(update) = analysis_event(&v) {
@@ -308,7 +296,7 @@ fn analyze(
     } else {
         run
     };
-    let mut answer = match run {
+    let answer = match run {
         Ok((stdout, _)) => {
             let mut usage = json!({});
             let mut tool_used = false;
@@ -326,16 +314,7 @@ fn analyze(
                         ]
                         .contains(&t)
                         {
-                            if t != "mcp_tool_call"
-                                || !retrieval
-                                || v["item"]["server"] != "shishi_analysis"
-                                || !matches!(
-                                    v["item"]["tool"].as_str(),
-                                    Some("read_context" | "read_image")
-                                )
-                            {
-                                tool_used = true;
-                            }
+                            tool_used = true;
                         }
                     }
                 }
@@ -356,50 +335,15 @@ fn analyze(
             .map(|error| format!("Codex 请求失败：{error}"))
             .unwrap_or(e)),
     };
-    if let Ok(raw) = fs::read(context_path.with_extension("meter")) {
-        if let Ok(meter) = serde_json::from_slice::<crate::analysis_context::Meter>(&raw) {
-            if config.retain_ai_traces {
-                let _ = fs::write(trace.join("context-usage.json"), &raw);
-            }
-            if let Ok((v, _)) = &mut answer {
-                v["_context_seen"] = json!(meter.seen);
-                v["_context_usage"] = json!({"calls":meter.calls,"chars":meter.chars,"image_calls":meter.image_calls,"image_bytes":meter.image_bytes,"budget_exhausted":meter.exhausted});
-            }
-        } else {
-            answer = Err("分析补查记录损坏，本次结果未采用".into());
-        }
-    }
     if config.retain_ai_traces {
         if let Ok(raw) = fs::read_to_string(&result) {
             let _ = fs::write(trace.join("output.txt"), raw);
         }
     }
-    if let Ok((v, _)) = &mut answer {
-        let meter = fs::read(context_path.with_extension("meter"))
-            .ok()
-            .and_then(|raw| serde_json::from_slice::<crate::analysis_context::Meter>(&raw).ok())
-            .unwrap_or_default();
-        v["_image_notes"] = crate::images::notes(&meter, v);
-        match crate::analysis_context::memory_update(&payload["_local_context"], &meter, v) {
-            Ok(Some(update)) => v["_memory_update"] = update,
-            Ok(None) => {}
-            Err(error) => v["_memory_error"] = json!(error),
-        }
-        if let Some(o) = v.as_object_mut() {
-            o.remove("memory_update");
-            o.remove("image_notes");
-        }
-    }
     // Job directory is generated beneath data/ai-work and contains no user-supplied paths.
     let _ = fs::remove_file(schema_path);
     let _ = fs::remove_file(result);
-    for path in [
-        &context_path,
-        &context_path.with_extension("meter"),
-        &context_path.with_extension("lock"),
-    ] {
-        let _ = fs::remove_file(path);
-    }
+    drop(model_images);
     let _ = fs::remove_dir(job);
     answer
 }

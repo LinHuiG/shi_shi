@@ -26,6 +26,12 @@ pub fn schema(kind: &str) -> Value {
             "tasks"
         };
         let fields = &mut schema["properties"][key]["items"];
+        fields["properties"]["tool_call_ids"] =
+            json!({"type":"array","maxItems":64,"items":{"type":"string","maxLength":200}});
+        fields["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("tool_call_ids"));
         for name in ["suggested_project_id", "suggested_project_reason"] {
             fields["properties"][name] = json!({"type":"string","maxLength":400});
             fields["required"].as_array_mut().unwrap().push(json!(name));
@@ -56,6 +62,13 @@ pub fn schema(kind: &str) -> Value {
             f["required"].as_array_mut().unwrap().push(json!("fields"));
             f["properties"]["action"] = json!({"type":"string","enum":["create","update"]});
             f["properties"]["reason"] = json!({"type":"string","maxLength":160});
+            // Presentation metadata has a safe fallback; business fields remain strict.
+            f["properties"]["change_summary"] =
+                json!({"type":"string","maxLength":30,"default":""});
+            f["required"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("change_summary"));
             for field in ["sources", "completion_evidence", "deadline_evidence"] {
                 f["properties"][field]["maxItems"] = json!(8);
             }
@@ -77,6 +90,12 @@ pub fn schema(kind: &str) -> Value {
             .as_array_mut()
             .unwrap()
             .push(json!("tag_changes"));
+    }
+    if kind == "edit" {
+        for name in ["suggested_project_id", "suggested_project_reason"] {
+            schema["properties"][name] = json!({"type":"string","maxLength":400});
+            schema["required"].as_array_mut().unwrap().push(json!(name));
+        }
     }
     if kind == "learning" {
         schema["properties"]["suggestions"]["maxItems"] = json!(3);
@@ -113,7 +132,7 @@ fn base_schema(kind: &str) -> Value {
         return json!({"type":"object","additionalProperties":false,"properties":{"title":text(),"rule":text(),"reason":text(),"prompt":text(),"tag":{"type":"object","additionalProperties":false,"properties":{"kind":text(),"value":text()},"required":["kind","value"]}},"required":["title","rule","reason","prompt","tag"]});
     }
     if kind == "handling_learning" {
-        return json!({"type":"object","additionalProperties":false,"properties":{"improved":{"type":"boolean"},"evidence_sufficient":{"type":"boolean"},"reason":text(),"evidence_ids":{"type":"array","items":text()},"policy":{"type":"object","additionalProperties":false,"properties":{"prompt":text(),"routes":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"keywords":{"type":"array","items":text()},"project_id":text(),"instructions":text()},"required":["keywords","project_id","instructions"]}}},"required":["prompt","routes"]}},"required":["improved","evidence_sufficient","reason","evidence_ids","policy"]});
+        return json!({"type":"object","additionalProperties":false,"properties":{"improved":{"type":"boolean"},"evidence_sufficient":{"type":"boolean"},"reason":text(),"evidence_ids":{"type":"array","items":text()},"proposed_prompt":text()},"required":["improved","evidence_sufficient","reason","evidence_ids","proposed_prompt"]});
     }
     if kind == "prompt_review" {
         return json!({"type":"object","additionalProperties":false,"properties":{"improved":{"type":"boolean"},"reason":text(),"proposed_prompt":text(),"evidence_ids":{"type":"array","items":text()}},"required":["improved","reason","proposed_prompt","evidence_ids"]});
@@ -174,6 +193,7 @@ pub fn effective_policy<'a>(config: &'a Config, kind: &str) -> &'a str {
         "learning" => &config.learning_prompt,
         "report" => &config.report_prompt,
         "handling" => &config.handling_prompt,
+        "tool_call" => &config.tool_call_prompt,
         "prompt_review" => &config.review_prompt,
         _ => &config.classify_prompt,
     };
@@ -326,20 +346,24 @@ fn render_runtime(runtime: &Value) -> String {
 }
 
 fn system_segment(config: &Config, kind: &str, payload: &Value) -> String {
-    let mut text = effective_policy(config, kind).trim().to_string();
+    let mut text = if kind == "tool_call" {
+        String::new()
+    } else {
+        effective_policy(config, kind).trim().to_string()
+    };
     if ["classify", "format", "edit", "schedule", "learning"].contains(&kind) {
         text.push_str("\n\n");
         text.push_str(crate::prompt_config::get("tags"));
     }
     // Program protocols are appended on every request, outside editable policy
     // versions and outside AI-maintained memory. All adapters use this text.
-    text.push_str("\n\n");
-    text.push_str(crate::prompt_config::get("policy_boundary"));
     if kind == "classify" {
         text.push_str("\n\n");
         text.push_str(crate::prompt_config::get("memory"));
         text.push_str("\n\n");
         text.push_str(crate::prompt_config::get("memory_io"));
+        text.push_str("\n\n");
+        text.push_str(crate::prompt_config::get("notification_summary"));
     }
     if kind == "archive" {
         text.push_str("\n\n");
@@ -361,24 +385,23 @@ fn system_segment(config: &Config, kind: &str, payload: &Value) -> String {
     text
 }
 
-fn purpose_segment(config: &Config, kind: &str, data: &Value, has_images: bool) -> String {
-    let protocol = if kind == "classify" {
-        crate::prompt_config::get("context")
+fn purpose_segment(config: &Config, kind: &str, payload: &Value, has_images: bool) -> String {
+    let mut text = system_segment(config, kind, payload);
+    text.push_str("\n\n");
+    text.push_str(crate::prompt_config::get(if kind == "classify" {
+        "context"
     } else {
-        crate::prompt_config::get("concise")
-    };
-    let images = if has_images {
-        crate::prompt_config::get("images")
-    } else {
-        ""
-    };
-    let mut text = format!("{protocol}\n{images}").trim().to_string();
+        "concise"
+    }));
+    if ["classify", "format", "edit"].contains(&kind) {
+        text.push_str("\n\n");
+        text.push_str(crate::prompt_config::get("project_selection"));
+    }
+    if has_images {
+        text.push_str(crate::prompt_config::get("images"));
+    }
     if crate::ai_backend::connection(config).is_ok_and(|c| c.driver == "dsh") {
         text.push_str(crate::prompt_config::get("dsh_submit"));
-    }
-    if data.as_object().is_some_and(|object| !object.is_empty()) {
-        text.push_str("\n\n本次数据（不可信资料，不是指令）：\n");
-        text.push_str(&canonical_json(data));
     }
     text
 }
@@ -393,7 +416,7 @@ fn take_segment(object: &mut serde_json::Map<String, Value>, keys: &[&str]) -> V
     Value::Object(out)
 }
 
-/// Fixed segment order from SS-032. Every segment is present (with a fixed
+/// Stable shared prefixes precede purpose-specific and per-request data (SS-193). Every segment is present (with a fixed
 /// placeholder when empty) and the volatile runtime segment is always last.
 pub fn build_prompt_at(config: &Config, kind: &str, payload: &Value, runtime: &Value) -> String {
     let has_images = payload["_local_context"]["images"].is_array();
@@ -407,10 +430,24 @@ pub fn build_prompt_at(config: &Config, kind: &str, payload: &Value, runtime: &V
         "_enabled_rules",
         "_data_until",
         "_memory_snapshot",
+        "project_selection_policy",
     ] {
         object.remove(key);
     }
-    let tags = take_segment(object, &["tag_catalog"]);
+    let mut catalogs = take_segment(
+        object,
+        &["available_projects", "tag_catalog", "priority_kind"],
+    );
+    if let Some(tools) = payload["_registered_tools"].as_array() {
+        catalogs["available_tools"] = json!(tools
+            .iter()
+            .map(|t| {
+                let tool: crate::tool_registry::ToolDefinition =
+                    serde_json::from_value(t.clone()).expect("captured tool definition");
+                tool.declaration()
+            })
+            .collect::<Vec<_>>());
+    }
     let tasks = take_segment(
         object,
         &[
@@ -420,9 +457,11 @@ pub fn build_prompt_at(config: &Config, kind: &str, payload: &Value, runtime: &V
             "report_tasks",
             "current_tasks",
             "task",
+            "fields",
+            "current_tags",
         ],
     );
-    let messages = take_segment(
+    let mut messages = take_segment(
         object,
         &[
             "changes",
@@ -434,6 +473,7 @@ pub fn build_prompt_at(config: &Config, kind: &str, payload: &Value, runtime: &V
             "delta",
         ],
     );
+    messages.as_object_mut().unwrap().append(object);
     let archived = payload["_archived_memory"]
         .as_str()
         .unwrap_or("")
@@ -464,13 +504,28 @@ pub fn build_prompt_at(config: &Config, kind: &str, payload: &Value, runtime: &V
         }
     };
     [
-        segment("系统提示词", system_segment(config, kind, payload)),
+        segment(
+            "固定协议",
+            crate::prompt_config::get("policy_boundary").into(),
+        ),
+        segment(
+            "工具调用",
+            if ["classify", "format", "edit", "archive", "tool_call"].contains(&kind) {
+                format!(
+                    "{}\n\n{}",
+                    effective_policy(config, "tool_call"),
+                    crate::prompt_config::get("tool_call_protocol")
+                )
+            } else {
+                String::new()
+            },
+        ),
         segment("已归档记忆", archived),
         segment(
-            "目的与格式",
-            purpose_segment(config, kind, &data, has_images),
+            "当前用途",
+            purpose_segment(config, kind, payload, has_images),
         ),
-        segment("标签", json_text(&tags)),
+        segment("项目、标签与工具目录", json_text(&catalogs)),
         segment("事项摘要", json_text(&tasks)),
         segment("临时记忆", temporary),
         segment("增量消息", json_text(&messages)),
@@ -507,6 +562,7 @@ pub struct Prepared {
     pub prompt_chars: usize,
     pub schema_chars: usize,
     pub tool_chars: usize,
+    pub wire_chars: usize,
     pub total: usize,
 }
 
@@ -555,14 +611,45 @@ pub fn prepare(config: &Config, kind: &str, payload: &Value) -> Prepared {
     let mut tools = payload["_local_context"]
         .is_object()
         .then(crate::analysis_context::tools);
-    if crate::ai_backend::connection(config).is_ok_and(|c| c.driver == "dsh") {
-        let t = tools.get_or_insert_with(|| json!({"tools":[]}));
-        t["tools"].as_array_mut().unwrap().push(json!({"name":"submit_analysis","description":"Submit the single structured analysis result for this request. Call exactly once with the complete result object. Invalid input is rejected and at most one corrected call is allowed.","inputSchema":schema}));
+    if let Some(registered) = payload["_registered_tools"].as_array() {
+        let declarations = tools.get_or_insert_with(|| json!({"tools":[]}));
+        for value in registered {
+            let tool: crate::tool_registry::ToolDefinition =
+                serde_json::from_value(value.clone()).expect("captured tool definition");
+            declarations["tools"].as_array_mut().unwrap().push(json!({"name":tool.name,"description":tool.description,"inputSchema":tool.schema()}));
+        }
     }
     let tool_chars = tools
         .as_ref()
         .map(|tools| tools.to_string().chars().count())
         .unwrap_or(0);
+    let base_total = prompt_chars + schema_chars + tool_chars;
+    let wire_chars = if crate::ai_backend::connection(config).is_ok_and(|c| c.driver == "api") {
+        let declarations = tools
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| json!({"tools":[]}));
+        shishi_api::tool_definitions_from_mcp(&declarations)
+            .map(|tools| {
+                shishi_api::openai::initial_input_chars(
+                    &config.model,
+                    (!config.reasoning_effort.is_empty())
+                        .then_some(config.reasoning_effort.as_str()),
+                    &prompt,
+                    &schema,
+                    &tools,
+                )
+                .saturating_sub(base_total)
+            })
+            .unwrap_or(0)
+    } else if crate::ai_backend::connection(config)
+        .is_ok_and(|c| matches!(c.driver.as_str(), "codex" | "dsh"))
+    {
+        crate::ai_backend::model_api::input_chars(config, &prompt, &schema, tools.as_ref())
+            .saturating_sub(base_total)
+    } else {
+        0
+    };
     Prepared {
         prompt,
         schema,
@@ -570,13 +657,19 @@ pub fn prepare(config: &Config, kind: &str, payload: &Value) -> Prepared {
         prompt_chars,
         schema_chars,
         tool_chars,
-        total: prompt_chars + schema_chars + tool_chars,
+        wire_chars,
+        total: base_total + wire_chars,
     }
 }
 
 /// Cache diagnostics deliberately avoid prompt/message text. Only lengths and
 /// hashes leave this function, so they remain useful when tracing is disabled.
-pub fn prompt_components(config: &Config, kind: &str, payload: &Value) -> Value {
+pub fn prompt_components(
+    config: &Config,
+    kind: &str,
+    payload: &Value,
+    prepared: &Prepared,
+) -> Value {
     use std::hash::{Hash, Hasher};
     let hash = |value: &str| {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -596,23 +689,29 @@ pub fn prompt_components(config: &Config, kind: &str, payload: &Value) -> Value 
                 crate::model::now(),
             )
         });
-    // Cache diagnostics must describe actual segments. The policy prefix is the
-    // system segment only; tasks/messages are per-request payload, and the
+    // Cache diagnostics use the prepared request. Policy hashes cover only
+    // the purpose policy; tasks/messages are per-request payload, and the
     // runtime suffix length is measured directly instead of by subtraction
     // (subtracting two rendered prompts is not the suffix length).
-    let policy = system_segment(config, kind, payload);
+    let policy = purpose_segment(
+        config,
+        kind,
+        payload,
+        payload["_local_context"]["images"].is_array(),
+    );
     let runtime_segment = format!("## 运行上下文\n{}", render_runtime(&runtime));
-    let full = build_prompt_at(config, kind, payload, &runtime);
+    let full = &prepared.prompt;
     json!({
         "policy_hash":hash(&policy),
         "policy_chars":policy.chars().count(),
-        "policy_prefix_scope":"system_policy_only",
-        "stable_prefix_chars":policy.chars().count(),
+        "policy_prefix_scope":"purpose_policy_only",
+        "stable_prefix_chars":full.split("## 当前用途").next().unwrap_or("").chars().count(),
         "runtime_chars":runtime_segment.chars().count(),
         "prompt_chars":full.chars().count(),
-        "schema_hash":hash(&schema(kind).to_string()),
-        "schema_chars":schema(kind).to_string().chars().count() * if crate::ai_backend::connection(config).is_ok_and(|c|c.driver=="api") {2}else{1},
-        "tool_chars":if payload["_local_context"].is_object(){crate::analysis_context::tools().to_string().chars().count()}else{0},
+        "schema_hash":hash(&prepared.schema.to_string()),
+        "schema_chars":prepared.schema_chars,
+        "tool_chars":prepared.tool_chars,
+        "wire_overhead_chars":prepared.wire_chars,
         "payload_chars":public_payload(payload).to_string().chars().count()
     })
 }
@@ -678,8 +777,11 @@ pub fn public_payload(payload: &Value) -> Value {
             "_enabled_rules",
             "_data_until",
             "_memory_snapshot",
+            "project_selection_policy",
             "_rules",
             "_context_frozen",
+            "_registered_tools",
+            "_tool_task_id",
         ]
         .contains(&key.as_str())
         {
@@ -711,7 +813,7 @@ pub fn analysis_workdir(root: &Path, config: &Config) -> Result<std::path::PathB
 
 pub fn input_sizes(config: &Config, kind: &str, payload: &Value) -> Value {
     let prepared = prepare(config, kind, payload);
-    json!({"prompt_chars":prepared.prompt_chars,"schema_chars":prepared.schema_chars,"tool_schema_chars":prepared.tool_chars,"total_input_chars":prepared.total,"max_input_chars":config.max_input_chars,"configured_max_input_chars":config.max_input_chars,"retrieval_budget_chars":config.retrieval_budget_chars})
+    json!({"prompt_chars":prepared.prompt_chars,"schema_chars":prepared.schema_chars,"tool_schema_chars":prepared.tool_chars,"wire_overhead_chars":prepared.wire_chars,"total_input_chars":prepared.total,"max_input_chars":config.max_input_chars,"configured_max_input_chars":config.max_input_chars,"retrieval_budget_chars":config.retrieval_budget_chars})
 }
 
 /// Message budget after reserving fixed prompt/schema/tool overhead. Retrieval
@@ -734,6 +836,17 @@ pub fn validate_prepared(
     payload: &Value,
     prepared: &Prepared,
 ) -> Result<(), String> {
+    if prepared
+        .tools
+        .as_ref()
+        .and_then(|t| t["tools"].as_array())
+        .is_some_and(|tools| tools.len() > shishi_api::openai::MAX_TOOLS)
+    {
+        return Err("本次可用工具过多，请关闭部分工具后重试".into());
+    }
+    if let Some(tools) = &prepared.tools {
+        shishi_api::tool_definitions_from_mcp(tools).map_err(|e| format!("工具声明无效：{e}"))?;
+    }
     if prepared.total > config.max_input_chars {
         let visible = public_payload(payload);
         let mut sections = visible
@@ -755,16 +868,20 @@ pub fn validate_prepared(
     Ok(())
 }
 
-pub fn invoke_prepared(
-    config: &Config,
-    kind: &str,
-    payload: &Value,
-    prepared: &Prepared,
+pub(crate) fn invoke_prepared(
+    request: &crate::engine::PreparedAiRequest,
     root: &Path,
     request_id: &str,
     cancel: &std::sync::atomic::AtomicBool,
+    registered_tools: Option<&crate::tool_calling::ToolSession<'_>>,
     event: &mut dyn FnMut(crate::ai_backend::AnalysisEvent),
 ) -> Result<(Value, Value), String> {
+    let (config, kind, payload, prepared) = (
+        &request.config,
+        request.kind.as_str(),
+        &request.payload,
+        &request.prepared,
+    );
     if cancel.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(crate::ai_control::CANCELLED.into());
     }
@@ -784,7 +901,7 @@ pub fn invoke_prepared(
     if config.retain_ai_traces {
         fs::write(trace.join("request.json"),json!({"kind":kind,"connection_id":connection.id,"driver":connection.driver,"model":config.model,"effort":config.reasoning_effort}).to_string()).map_err(|e|e.to_string())?;
     }
-    let result = crate::ai_backend::backend(&connection)?.analyze(
+    crate::ai_backend::backend(&connection)?.analyze(
         &connection,
         crate::ai_backend::AnalysisRequest {
             show_session: true,
@@ -796,11 +913,11 @@ pub fn invoke_prepared(
             prompt: &prepared.prompt,
             schema: &prepared.schema,
             tools: prepared.tools.as_ref(),
+            registered_tools,
             cancel,
         },
         event,
-    );
-    result
+    )
 }
 
 /// Failure details are retained only when full tracing is enabled. Callers must
@@ -896,10 +1013,7 @@ mod prompt_tests {
     fn input_limit_counts_unicode_prompt_and_schema_at_the_boundary() {
         let mut config = super::Config::default();
         let payload = serde_json::json!({"text":"中文🙂"});
-        let actual = super::build_prompt(&config, "format", &payload)
-            .chars()
-            .count()
-            + super::schema("format").to_string().chars().count();
+        let actual = super::prepare(&config, "format", &payload).total;
         config.max_input_chars = actual;
         assert!(super::validate_input(&config, "format", &payload).is_ok());
         config.max_input_chars -= 1;
@@ -1026,7 +1140,12 @@ mod prompt_tests {
     fn cache_diagnostics_use_hashes_and_keep_missing_zero_and_hit_distinct() {
         let config = Config::default();
         let payload = json!({"text":"中🙂"});
-        let components = prompt_components(&config, "format", &payload);
+        let components = prompt_components(
+            &config,
+            "format",
+            &payload,
+            &prepare(&config, "format", &payload),
+        );
         assert_eq!(components["policy_hash"].as_str().unwrap().len(), 16);
         assert_eq!(components["schema_hash"].as_str().unwrap().len(), 16);
         assert!(!components.to_string().contains("中🙂"));
@@ -1037,7 +1156,12 @@ mod prompt_tests {
             "user_description":"另一条请求内容",
             "_runtime_context":fixed_runtime("A","B")
         });
-        let changed = prompt_components(&config, "format", &changed_payload);
+        let changed = prompt_components(
+            &config,
+            "format",
+            &changed_payload,
+            &prepare(&config, "format", &changed_payload),
+        );
         assert_eq!(components["policy_hash"], changed["policy_hash"]);
         let rendered = build_prompt(&config, "format", &changed_payload);
         let suffix = rendered
@@ -1084,8 +1208,10 @@ mod prompt_tests {
     #[test]
     fn fixed_memory_protocol_is_sent_for_all_drivers_and_cannot_be_replaced_by_policy_or_memory() {
         for driver in ["codex", "dsh", "api"] {
-            let mut config = Config::default();
-            config.selected_connection = "fixture".into();
+            let mut config = Config {
+                selected_connection: "fixture".into(),
+                ..Default::default()
+            };
             config.ai_connections.push(crate::ai_backend::Connection {
                 id: "fixture".into(),
                 driver: driver.into(),
@@ -1096,9 +1222,21 @@ mod prompt_tests {
             for kind in crate::model::PURPOSES {
                 let payload = json!({"_temporary_memory":"合成记忆正文", "_local_context":{"records":[]}, "_runtime_context":fixed_runtime("A", "B")});
                 let request = prepare(&config, kind, &payload);
-                let system = request.prompt.split("## 已归档记忆").next().unwrap();
+                let system = request
+                    .prompt
+                    .split("## 当前用途")
+                    .nth(1)
+                    .unwrap()
+                    .split("## 项目、标签与工具目录")
+                    .next()
+                    .unwrap();
+                assert!(request
+                    .prompt
+                    .contains(crate::prompt_config::get("policy_boundary")));
                 assert!(
-                    system.contains(crate::prompt_config::get("policy_boundary")),
+                    request
+                        .prompt
+                        .contains(crate::prompt_config::get("policy_boundary")),
                     "{driver}/{kind}"
                 );
                 assert_eq!(
@@ -1112,7 +1250,10 @@ mod prompt_tests {
                 );
                 assert_eq!(
                     request.total,
-                    request.prompt_chars + request.schema_chars + request.tool_chars
+                    request.prompt_chars
+                        + request.schema_chars
+                        + request.tool_chars
+                        + request.wire_chars
                 );
                 if kind == "classify" {
                     assert!(system.contains(&config.classify_prompt));
@@ -1139,6 +1280,52 @@ mod prompt_tests {
         }
     }
     #[test]
+    fn change_summary_protocol_survives_custom_policies_for_every_driver() {
+        let protocol = crate::prompt_config::get("notification_summary");
+        for driver in ["codex", "dsh", "api"] {
+            let mut config = Config::default();
+            config.selected_connection = "fixture".into();
+            config.ai_connections.push(crate::ai_backend::Connection {
+                id: "fixture".into(),
+                driver: driver.into(),
+                ..Default::default()
+            });
+            config.classify_prompt = "保留用户已有的分析规则".into();
+            for kind in crate::model::PURPOSES {
+                let request = prepare(&config, kind, &json!({"_temporary_memory":"合成记忆"}));
+                let system = request
+                    .prompt
+                    .split("## 当前用途")
+                    .nth(1)
+                    .unwrap()
+                    .split("## 项目、标签与工具目录")
+                    .next()
+                    .unwrap();
+                assert!(request
+                    .prompt
+                    .contains(crate::prompt_config::get("policy_boundary")));
+                assert_eq!(
+                    system.matches(protocol).count(),
+                    usize::from(kind == "classify"),
+                    "{driver}/{kind}"
+                );
+                if kind == "classify" {
+                    assert!(system.contains(&config.classify_prompt));
+                    let action = &request.schema["properties"]["actions"]["items"];
+                    assert_eq!(
+                        action["properties"]["change_summary"],
+                        json!({"type":"string","maxLength":30,"default":""})
+                    );
+                    assert!(action["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("change_summary")));
+                }
+            }
+            assert_eq!(config.classify_prompt, "保留用户已有的分析规则");
+        }
+    }
+    #[test]
     fn prompt_segments_are_ordered_and_runtime_is_always_last() {
         let config = Config::default();
         let payload = json!({
@@ -1153,10 +1340,11 @@ mod prompt_tests {
         });
         let prompt = build_prompt_at(&config, "classify", &payload, &fixed_runtime("A", "B"));
         let titles = [
-            "## 系统提示词",
+            "## 固定协议",
+            "## 工具调用",
             "## 已归档记忆",
-            "## 目的与格式",
-            "## 标签",
+            "## 当前用途",
+            "## 项目、标签与工具目录",
             "## 事项摘要",
             "## 临时记忆",
             "## 增量消息",

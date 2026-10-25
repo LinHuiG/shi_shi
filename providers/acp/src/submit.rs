@@ -229,14 +229,14 @@ impl SubmitPaths {
             ));
         }
         let mut invalid = read_invalid_count(&self.state_path);
-        match schema_validate::validate(&ticket.schema, arguments) {
-            Ok(()) => {
+        match shishi_api::schema_validate::validate_output(&ticket.schema, arguments.clone()) {
+            Ok(value) => {
                 let result = SubmitResultFile {
                     version: TICKET_VERSION,
                     request_id: ticket.request_id.clone(),
                     kind: ticket.kind.clone(),
                     schema_hash: ticket.schema_hash.clone(),
-                    value: arguments.clone(),
+                    value,
                 };
                 let bytes = serde_json::to_vec(&result)
                     .map_err(|error| SubmitError::Io(error.to_string()))?;
@@ -250,11 +250,7 @@ impl SubmitPaths {
                 invalid = invalid.saturating_add(1);
                 fs::write(&self.state_path, json!({"invalid": invalid}).to_string())
                     .map_err(|error| SubmitError::Io(error.to_string()))?;
-                let bounded = errors
-                    .iter()
-                    .take(8)
-                    .map(|error| error.chars().take(240).collect::<String>())
-                    .collect::<Vec<_>>();
+                let bounded = vec![errors.to_string().chars().take(240).collect::<String>()];
                 if invalid > ticket.max_invalid {
                     let reason = json!({
                         "reason": "invalid_correction_exhausted",
@@ -577,6 +573,32 @@ mod tests {
             paths.submit(&ticket, &json!({"reason": "ok", "changes": []})),
             Err(SubmitError::Duplicate)
         ));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn presentation_defaults_are_saved_before_strict_readback() {
+        let base = temp_dir("output-default");
+        let mut schema = schema();
+        schema["properties"]["summary"] = json!({"type":"string","maxLength":3,"default":""});
+        schema["required"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("summary"));
+        let (paths, ticket) =
+            SubmitPaths::create(&base, "req-default", "edit", schema.clone()).unwrap();
+        assert_eq!(
+            paths
+                .submit(
+                    &ticket,
+                    &json!({"reason":"ok","changes":[],"summary":["invalid"]})
+                )
+                .unwrap()["isError"],
+            false
+        );
+        let accepted = paths.read_accepted("req-default", "edit", &schema).unwrap();
+        assert_eq!(accepted.value["summary"], "");
+        assert_eq!(read_invalid_count(&paths.state_path), 0);
         let _ = fs::remove_dir_all(base);
     }
 

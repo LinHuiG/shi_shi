@@ -199,9 +199,6 @@ impl App {
         let mut next = locked.clone();
         let mut config = next.config.clone();
         prompts::set_content(&mut config, target, text.into())?;
-        if target == "handling" {
-            crate::evolution::sync_handling_prompt(&mut next, text, "编辑处置提示词");
-        }
         prompts::record_config_changes(&mut next, &config);
         next.config = config;
         self.save(&next)?;
@@ -396,6 +393,7 @@ mod tests {
             .config
             .ai_connections
             .is_empty());
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -416,7 +414,7 @@ mod tests {
             store.get(reference).unwrap().unwrap().expose_secret(),
             "synthetic-before"
         );
-        std::fs::create_dir(root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app
             .save_connection(&json!({"connection":old,"expected":old,"key":"synthetic-after"}))
             .is_err());
@@ -428,10 +426,12 @@ mod tests {
             store.get(reference).unwrap().unwrap().expose_secret(),
             "synthetic-before"
         );
-        assert!(!std::fs::read_to_string(root.join("data/state.json"))
-            .unwrap()
-            .contains("synthetic-before"));
-        std::fs::remove_dir(root.join("data/state.next.json")).unwrap();
+        assert!(
+            !serde_json::to_string(&crate::managed_data::load_state(&root).unwrap())
+                .unwrap()
+                .contains("synthetic-before")
+        );
+        crate::test_support::persistence_failure(&root, false).unwrap();
         let cleared = app
             .save_connection(&json!({"connection":old,"expected":old,"clear_key":true}))
             .unwrap();
@@ -440,6 +440,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(store.get(reference).unwrap().is_none());
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -465,6 +466,7 @@ mod tests {
             Config::default().max_input_chars
         );
         drop(state);
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -486,6 +488,7 @@ mod tests {
         assert!(app
             .save_connection(&json!({"connection":edited,"expected":saved["connection"]}))
             .is_err());
+        drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -166,6 +166,40 @@ fn shape_error(object: &serde_json::Map<String, Value>) -> Option<String> {
     None
 }
 
+/// Consume retired flags at the persistence boundary. Old inactive plugins
+/// remain inactive through their sources; malformed values still fail loading.
+pub(crate) fn upgrade_legacy_plugin_flags(value: &mut Value) -> Result<bool, String> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(false);
+    };
+    let Some(flags) = object.remove("disabled_plugins") else {
+        return Ok(false);
+    };
+    let disabled: std::collections::BTreeSet<String> =
+        serde_json::from_value(flags).map_err(|e| format!("disabled_plugins: {e}"))?;
+    if let Some(sources) = object.get_mut("chat_sources").and_then(Value::as_array_mut) {
+        for source in sources {
+            if source["enabled"] == true
+                && source["plugin_id"]
+                    .as_str()
+                    .is_some_and(|id| disabled.contains(id))
+            {
+                let updated = match source.get("updated") {
+                    Some(value) => value.as_i64().ok_or("来源版本必须是整数")?,
+                    None => 0,
+                };
+                source["enabled"] = Value::Bool(false);
+                source["updated"] = Value::from(updated.saturating_add(1));
+            }
+        }
+    }
+    Ok(true)
+}
+pub(crate) fn decode_state(mut value: Value) -> Result<State, String> {
+    upgrade_legacy_plugin_flags(&mut value)?;
+    serde_json::from_value(value).map_err(|e| e.to_string())
+}
+
 fn fingerprint(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -214,7 +248,7 @@ fn inspect_file(root: &Path, name: &str) -> Option<(Problem, Option<String>)> {
     if let Some(error) = shape_error(object) {
         return Some((Problem::Structural(error), fingerprint));
     }
-    match serde_json::from_value::<State>(value) {
+    match decode_state(value) {
         Ok(state) => state
             .work_scheduler
             .validate()
@@ -332,6 +366,12 @@ pub fn load_state(root: &Path) -> Result<State, String> {
     load_from_directory(&state_dir(root))
 }
 pub(crate) fn load_from_directory(directory: &Path) -> Result<State, String> {
+    if directory.join(crate::state_store::FILE).exists() {
+        return crate::state_store::load(directory);
+    }
+    load_legacy(directory)
+}
+pub(crate) fn load_legacy(directory: &Path) -> Result<State, String> {
     let path = directory.join("state.json");
     if !path.exists() {
         return Ok(State::default());
@@ -362,7 +402,7 @@ pub(crate) fn load_from_directory(directory: &Path) -> Result<State, String> {
             STATE_SCHEMA_VERSION
         ));
     }
-    let state = serde_json::from_value::<State>(value).map_err(|e| {
+    let state = decode_state(value).map_err(|e| {
         format!(
             "数据文件结构不兼容，保留原文件并停止加载：{e}；请通过启动清理入口处理 data/state.json"
         )
@@ -547,6 +587,10 @@ pub fn startup_with(
     smoke: bool,
     choose_cleanup: impl FnOnce(&str) -> bool,
 ) -> Result<(), String> {
+    if state_dir(root).join(crate::state_store::FILE).exists() {
+        crate::state_store::load(&state_dir(root))?;
+        return Ok(());
+    }
     if !smoke {
         discard_interrupted_save(root);
     }
@@ -602,6 +646,34 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn retired_plugin_flags_migrate_only_matching_sources_and_reject_invalid_data() {
+        let root = root();
+        let mut value = json!(State::default());
+        value["disabled_plugins"] = json!(["old-plugin"]);
+        value["chat_sources"] = json!([
+            {"id":"paused","plugin_id":"old-plugin","enabled":true,"updated":4,"cursor":{"offset":12}},
+            {"id":"already-paused","plugin_id":"old-plugin","enabled":false,"updated":7},
+            {"id":"active","plugin_id":"other-plugin","enabled":true,"updated":9}
+        ]);
+        write_state(&root, value.clone());
+        assert!(inspect(&root).is_empty());
+        let restored = load_legacy(&root.join("data")).unwrap();
+        assert!(!restored.chat_sources[0].enabled);
+        assert_eq!(restored.chat_sources[0].updated, 5);
+        assert_eq!(restored.chat_sources[0].cursor, json!({"offset":12}));
+        assert_eq!(restored.chat_sources[1].updated, 7);
+        assert!(restored.chat_sources[2].enabled);
+        assert!(json!(restored).get("disabled_plugins").is_none());
+        for flags in [json!(null), json!("old-plugin"), json!([1])] {
+            let mut invalid = value.clone();
+            invalid["disabled_plugins"] = flags;
+            assert!(decode_state(invalid).is_err());
+        }
+        value["unknown_field"] = json!(true);
+        assert!(decode_state(value).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn missing_version_unsupported_version_and_structure_are_distinct() {
         let root = root();

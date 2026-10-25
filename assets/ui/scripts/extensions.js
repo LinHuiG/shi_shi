@@ -116,9 +116,20 @@ const promptLabels = {
   learning: '优化建议',
   report: '报表汇总',
   handling: 'AI一键处置',
+  tool_call: '工具调用',
   prompt_review: '提示词建议',
   archive: '归档与记忆',
 };
+function sourceSwitch(source, draft = false) {
+  const enabled = source.enabled !== false;
+  return `<button type="button" role="switch" class="mini-switch ${enabled ? 'on' : ''}" aria-checked="${enabled}" aria-label="启用${esc(source.name || '此来源')}" title="${enabled ? '停用此来源' : '启用此来源'}" ${draft ? 'data-source-draft-toggle data-initial-enabled="' + enabled + '"' : 'data-source-toggle="' + esc(source.id) + '"'}><i></i></button>`;
+}
+function sourceEditorHeading(plugin, source) {
+  return `<header class="source-settings-heading"><h2>${esc(plugin.name)} · ${source.id ? '配置来源' : '添加来源'}</h2>${plugin.settings ? '' : help('填写文件和目录，或自动查找；来源配置中请勿填写密钥。')}<span class="source-heading-space"></span><span class="source-enable">${sourceSwitch(source, true)}<span class="source-enable-label">${source.enabled !== false ? '启用' : '停用'}</span></span><button class="quiet" data-action="close" aria-label="关闭配置">×</button></header>`;
+}
+function sourceDraft() {
+  return { ...editingSource, enabled: $('[data-source-draft-toggle]').getAttribute('aria-checked') === 'true' };
+}
 async function renderSources() {
   const request = ++sourceRequest,
     epoch = renderEpoch,
@@ -133,7 +144,7 @@ async function renderSources() {
     sourceCatalog = catalog;
     setHtml(
       '#view',
-      `<div class="page sources-page"><header class="source-toolbar"><h2>插件</h2><button type="button" class="plugin-dropzone" data-extension="install-plugin"><span id="plugin-drop-hint">＋ 安装插件</span></button>${help('点击选择或拖入插件 ZIP；仅安装可信插件。')}</header><div class="plugin-strip">${catalog.plugins.map((p) => `<article class="plugin-tile"><div class="row"><b>${esc(p.name)}</b><span class="tiny">${esc(p.version)}</span></div><div class="plugin-actions"><button role="switch" aria-checked="${p.enabled !== false}" class="switch ${p.enabled !== false ? 'on' : ''}" data-source-plugin-toggle="${esc(p.id)}">${p.enabled !== false ? '已开启' : '已停用'}</button><button class="quiet" data-source-plugin-uninstall="${esc(p.id)}">卸载</button></div><button data-source-add="${esc(p.id)}" ${p.enabled === false ? 'disabled' : ''}>＋ 添加来源</button></article>`).join('') || '<p class="plugin-empty">尚未安装插件</p>'}</div>${catalog.errors.map((e) => `<div class="error-box">${esc(e)}</div>`).join('')}<h2 class="source-section-title">接入源 <span class="tiny">${catalog.sources.length}</span></h2><div class="source-grid">${catalog.sources.map((s) => `<article class="source-card"><div class="row"><h3>${esc(s.name)}</h3><span class="badge ${s.enabled ? 'green' : ''}">${s.enabled ? '已启用' : '已停用'}</span></div><span class="muted">${esc(catalog.plugins.find((p) => p.id === s.plugin_id)?.name || '插件不可用')}</span><p class="tiny">最近读取 ${esc(date(s.last_scan))}</p>${s.last_error ? `<div class="error-box">${esc(s.last_error)}</div>` : ''}<div class="source-card-actions"><button data-source-edit="${esc(s.id)}">配置</button><button data-source-range="${esc(s.id)}">补读</button><button class="quiet" data-source-remove="${esc(s.id)}">删除</button></div></article>`).join('') || '<p class="muted">选择上方插件添加来源。</p>'}</div></div>`,
+      `<div class="page sources-page"><header class="source-toolbar"><h2>插件</h2><button type="button" class="plugin-dropzone" data-extension="install-plugin"><span id="plugin-drop-hint">＋ 安装插件</span></button>${help('点击选择或拖入插件 ZIP；仅安装可信插件。')}</header><div class="plugin-strip">${catalog.plugins.map((p) => `<article class="plugin-tile"><div class="row"><b title="${esc(p.name)}">${esc(p.name)}</b><span class="tiny">${esc(p.version)}</span></div><div class="plugin-actions"><button data-source-add="${esc(p.id)}">＋ 添加来源</button><button class="quiet" data-source-plugin-uninstall="${esc(p.id)}">卸载</button></div></article>`).join('') || '<p class="plugin-empty">尚未安装插件</p>'}</div>${catalog.errors.map((e) => `<div class="error-box">${esc(e)}</div>`).join('')}<h2 class="source-section-title">接入源 <span class="tiny">${catalog.sources.length}</span></h2><div class="source-grid">${catalog.sources.map((s) => `<article class="source-card"><div class="row"><h3>${esc(s.name)}</h3>${sourceSwitch(s)}</div><span class="muted">${esc(catalog.plugins.find((p) => p.id === s.plugin_id)?.name || '插件不可用')}</span><p class="tiny">最近读取 ${esc(date(s.last_scan))}</p>${s.last_error ? `<div class="error-box">${esc(s.last_error)}</div>` : ''}<div class="source-card-actions"><button data-source-edit="${esc(s.id)}">配置</button><button data-source-range="${esc(s.id)}">补读</button><button class="quiet" data-source-remove="${esc(s.id)}">删除</button></div></article>`).join('') || '<p class="muted">选择上方插件添加来源。</p>'}</div></div>`,
     );
     updatePluginInstallUi();
   } catch (e) {
@@ -153,17 +164,80 @@ function sourceForm(source) {
   sourceFormToken++;
   const plugin = sourceCatalog.plugins.find((p) => p.id === source.plugin_id);
   if (!plugin) throw new Error('插件不可用，请先安装完整插件包');
+  if (!editingSource.name?.trim()) editingSource.name = plugin.name;
+  if (plugin.settings) {
+    setModal(`${sourceEditorHeading(plugin, source)}<div id="source-settings-content">正在加载配置…</div><div id="modal-error" class="error-box"></div>`);
+    $('#dialog').classList.add('plugin-settings-dialog');
+    allowUnchangedSourceDismissal();
+    void openSourceSettings();
+    return;
+  }
   setModal(
-    `<h2>${esc(plugin.name)} · ${source.id ? '配置来源' : '添加来源'}</h2>${help('填写文件和目录，或自动查找；来源配置中请勿填写密钥。')}<div class="form-group"><label for="source-name">来源名称</label><input id="source-name" maxlength="100" value="${esc(source.name || plugin.name)}"></div>${plugin.config_fields.map((f) => `<div class="form-group"><label for="source-field-${esc(f.key)}">${esc(f.label)}${f.required ? ' *' : ''}</label><div class="field-row"><input id="source-field-${esc(f.key)}" type="${f.type === 'password' ? 'password' : 'text'}" value="${esc(source.config?.[f.key] || '')}" spellcheck="false">${['file', 'directory'].includes(f.type) ? `<button data-source-pick="${esc(f.key)}">选择…</button>` : ''}</div>${f.description ? help(f.description) : ''}</div>`).join('')}<button data-extension="source-discover">重新查找</button><div id="source-candidates" class="helper" style="margin:12px 0"></div><label class="check"><input id="source-enabled" type="checkbox" ${source.enabled ? 'checked' : ''}>校验后启用此来源</label><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-extension="source-save">保存配置</button></div>`,
+    `${sourceEditorHeading(plugin, source)}${plugin.config_fields.map((f) => `<div class="form-group"><label for="source-field-${esc(f.key)}">${esc(f.label)}${f.required ? ' *' : ''}${f.description ? help(f.description) : ''}</label><div class="field-row"><input id="source-field-${esc(f.key)}" type="${f.type === 'password' ? 'password' : 'text'}" value="${esc(source.config?.[f.key] || '')}" spellcheck="false">${['file', 'directory'].includes(f.type) ? `<button data-source-pick="${esc(f.key)}">选择…</button>` : ''}</div></div>`).join('')}<button data-extension="source-discover">重新查找</button><div id="source-candidates" class="helper" style="margin:12px 0"></div><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-extension="source-save">保存配置</button></div>`,
   );
+  allowUnchangedSourceDismissal();
   if (plugin.capabilities.includes('discover')) void discoverSource();
+}
+
+function allowUnchangedSourceDismissal() {
+  const dialog = $('#dialog');
+  const fields = [...dialog.querySelectorAll('[id^="source-field-"]')];
+  const enabled = dialog.querySelector('[data-source-draft-toggle]');
+  modalOutsideDismiss = () => fields.every(input => input.isConnected && (
+    input.type === 'checkbox' ? input.checked === input.defaultChecked : input.value === input.defaultValue
+  )) && (!enabled || enabled.getAttribute('aria-checked') === enabled.dataset.initialEnabled)
+    && !dialog.querySelector('[data-plugin-dirty="true"],[data-pending="true"]');
+}
+
+async function openSourceSettings() {
+  const host = $('#source-settings-content'), form = sourceFormToken;
+  const current = () => form === sourceFormToken && host.isConnected && !$('#overlay').hidden && !$('#overlay').inert;
+  host.textContent = '正在加载配置…';
+  try {
+    const result = await rpc('source_discover', {
+      plugin_id: editingSource.plugin_id, config: editingSource.config || {},
+    });
+    if (!current()) {
+      if (result.settings) void rpc('plugin_settings', { session: result.settings.session, action: 'cancel' }).catch(() => {});
+      return;
+    }
+    if (!result.settings) throw Error('插件未返回配置页面');
+    const plugin = sourceCatalog.plugins.find(p => p.id === editingSource.plugin_id);
+    const suggestable = !editingSource.name?.trim() || editingSource.name === plugin.name;
+    showPluginSettings(result.settings, {
+      host,
+      suggestName: value => {
+        if (typeof value !== 'string' || !value.trim() || [...value.trim()].length > 100)
+          throw Error('建议来源名称应为 1–100 字');
+        if (!current() || !suggestable) return false;
+        editingSource.name = value.trim();
+        return true;
+      },
+      source: sourceDraft,
+      complete: async () => {
+        const enabled = sourceDraft().enabled;
+        closeModal();
+        await refreshState(true);
+        toast(enabled ? '配置已校验并启用' : '配置已保存，暂未启用');
+      },
+      cancel: closeModal,
+    });
+  } catch (error) {
+    if (current()) {
+      host.textContent = error.message;
+      const retry = document.createElement('button');
+      retry.textContent = '重试';
+      retry.onclick = openSourceSettings;
+      host.append(retry);
+    }
+  }
 }
 
 function sourceConfig() {
   const plugin = sourceCatalog.plugins.find((p) => p.id === editingSource.plugin_id);
-  return Object.fromEntries(
+  return { ...editingSource.config, ...Object.fromEntries(
     plugin.config_fields.map((f) => [f.key, $('#source-field-' + f.key).value.trim()]),
-  );
+  ) };
 }
 function sourceRangeForm(id) {
   setModal(
@@ -199,14 +273,17 @@ function promptPreview(id) {
   );
   $('#dialog').classList.add('wide-dialog');
 }
-function applySourceCandidate(index) {
+function applySourceCandidate(index, automatic = false) {
   const candidate = sourceCandidates[index];
   if (!candidate) return;
+  editingSource.config = structuredClone(candidate.config || {});
   for (const f of sourceCatalog.plugins.find((p) => p.id === editingSource.plugin_id)
     .config_fields) {
     const input = $('#source-field-' + f.key);
-    if (input)
+    if (input) {
       input.value = typeof candidate.config?.[f.key] === 'string' ? candidate.config[f.key] : '';
+      if (automatic) input.defaultValue = input.value;
+    }
   }
   const select = $('#source-candidate');
   if (select) select.value = String(index);
@@ -230,7 +307,14 @@ async function discoverSource() {
   host.textContent = '正在自动查找程序、文件和目录…';
   try {
     const result = await rpc('source_discover', { plugin_id, config });
-    if (!current()) return;
+    if (!current()) {
+      if (result.settings) void rpc('plugin_settings', { session: result.settings.session, action: 'cancel' }).catch(() => {});
+      return;
+    }
+    if (result.cancelled) {
+      host.textContent = '已取消配置，原输入保留。';
+      return;
+    }
     sourceCandidates = result.candidates || [];
     const changed = JSON.stringify(sourceConfig()) !== JSON.stringify(config);
     const match = sourceCandidates.findIndex((c) =>
@@ -240,13 +324,11 @@ async function discoverSource() {
     );
     const selected = changed
       ? -1
-      : sourceCandidates.length === 1
-        ? 0
-        : Object.values(config).some(Boolean)
-          ? match
-          : -1;
+      : Object.values(config).some(Boolean)
+        ? match
+        : sourceCandidates.length === 1 ? 0 : -1;
     host.innerHTML = `${sourceCandidates.length ? `<label>${sourceCandidates.length === 1 ? '找到 1 个候选' : `找到 ${sourceCandidates.length} 个候选，请核对选择`}</label><select id="source-candidate"><option value="">选择完整候选配置…</option>${sourceCandidates.map((c, i) => `<option value="${i}">${esc(c.label)}</option>`).join('')}</select>` : '未找到可用配置。可填写路径或目录后重新查找。'}<div>${(result.warnings || []).map(esc).join('<br>')}</div><div>${changed ? '查找期间你修改了配置，已保留输入；可选择候选整套替换。' : selected >= 0 ? '已自动选中候选并填入完整配置，请核对后保存。' : ''}</div>`;
-    if (selected >= 0) applySourceCandidate(selected);
+    if (selected >= 0) applySourceCandidate(selected, true);
   } catch (error) {
     if (current()) host.textContent = '自动查找失败：' + error.message + '；可手动填写或重新查找。';
   } finally {
@@ -272,10 +354,19 @@ document.addEventListener('click', async (e) => {
   )
     return;
   try {
-    if (b.dataset.sourcePluginToggle) {
-      const p = sourceCatalog.plugins.find((p) => p.id === b.dataset.sourcePluginToggle);
-      await rpc('plugin_toggle', { id: p.id, enabled: p.enabled === false });
-      pluginCatalogRevision++;
+    if (b.hasAttribute('data-source-draft-toggle')) {
+      const enabled = b.getAttribute('aria-checked') !== 'true';
+      b.setAttribute('aria-checked', String(enabled));
+      b.classList.toggle('on', enabled);
+      b.title = enabled ? '停用此来源' : '启用此来源';
+      b.closest('.source-enable').querySelector('.source-enable-label').textContent = enabled ? '启用' : '停用';
+      return;
+    }
+    if (b.dataset.sourceToggle) {
+      b.disabled = true;
+      const source = sourceCatalog.sources.find(s => s.id === b.dataset.sourceToggle);
+      if (!source) throw Error('消息来源已变化，请刷新后重试');
+      await rpc('source_toggle', { id: source.id, updated: source.updated, enabled: !source.enabled });
       await refreshState(true);
       return;
     }
@@ -361,10 +452,8 @@ document.addEventListener('click', async (e) => {
       case 'source-save': {
         b.dataset.pending = 'true';
         const source = {
-          ...editingSource,
-          name: $('#source-name').value.trim(),
+          ...sourceDraft(),
           config: sourceConfig(),
-          enabled: $('#source-enabled').checked,
         };
         await rpc('source_save', { source });
         delete b.dataset.pending;

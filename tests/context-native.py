@@ -61,8 +61,9 @@ def main():
     root = args.output.resolve() / ('context-' + str(uuid.uuid4()))
     context_dir = root / 'data' / 'handling-context'
     context_dir.mkdir(parents=True)
-    state = {'tasks': [{'id': 'task-a', 'title': 'Synthetic A'},
+    state = {'schema_version':1,'config':{'enabled':False,'auto_ai':False,'auto_update':False},'analysis_memory':{},'tag_state':{},'audit':[],'suggestions':[],'work_scheduler':{'schema_version':1,'runtime':{'schema_version':1,'active_overtime':None,'day_records':{}},'last_schedule':None,'clock_floor_ms':None},'tasks': [{'id': 'task-a', 'title': 'Synthetic A'},
                        {'id': 'task-b', 'title': 'Synthetic B'}], 'messages': {}}
+    for task in state['tasks']:task.update({'tags':[],'evidence':{'direct':[],'background':[],'completion':[]}})
     (root/'data'/'state.json').write_text(json.dumps(state), encoding='utf-8')
     tokens = [str(uuid.uuid4()), str(uuid.uuid4())]
     for token, task in zip(tokens, ['task-a', 'task-b']):

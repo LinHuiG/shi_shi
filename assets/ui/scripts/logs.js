@@ -231,6 +231,12 @@ async function renderLogs() {
       };
       title = titles[a.kind] || title;
     }
+    if (a.kind.startsWith('tool_call_')) {
+      bad=!!d.error || ['failed','rejected','nonzero_exit','start_failed','output_error','timed_out'].includes(d.status);
+      title=`工具调用 · ${d.tool || ''} · ${a.kind === 'tool_call_started' ? '开始' : toolStatus[d.status] || d.status || ''}`;
+      body=`${toolPurposes[d.kind] || '历史用途'}${d.elapsed_ms == null ? '' : ` · ${d.elapsed_ms} ms`}${d.exit_code == null ? '' : ` · 退出码 ${d.exit_code}`}${d.error ? ` · ${d.error}` : ''}`;
+    }
+    if (d.kind === 'tool_call') title = title.replace('AI 分析','工具调用');
     if (a.kind.startsWith('handling_')) {
       title =
         a.kind === 'handling_steer'
@@ -272,7 +278,7 @@ async function renderLogs() {
         ? `<div class="event-description">${a.kind === 'ai_failed' ? esc(aiModelLabel(d) + ' · ' + (d.reasoning_effort || '默认') + ' 推理 · ' + Math.round((d.elapsed_ms || 0) / 1000) + ' 秒') : ''}</div>` +
           usageCard(d)
         : '';
-    return `<article data-event-key="${esc(a.index ?? a.id ?? String(a.time) + ':' + a.kind + ':' + (a.task_id || ''))}" class="event ${bad ? 'event-error' : ''}"><div class="event-dot"></div><div class="event-content"><div class="event-heading"><b>${esc(title)}</b><time>${esc(date(a.time))}</time>${a.audit && ['manual_edit', 'manual_status', 'manual_ai_edit', 'merge'].includes(a.kind) ? `<button class="quiet" data-undo="${a.index}">撤销</button>` : ''}</div>${task ? `<div class="event-task">${a.task_number ? `#${esc(a.task_number)} ` : ''}${esc(task.title)}</div>` : ''}<div class="event-description">${esc(body)}</div>${tokenLine}${d.thread_id && ['codex', 'dsh'].includes(d.source?.driver) ? `<button class="quiet" data-analysis-session="${esc(d.thread_id)}" data-session-driver="${esc(d.source.driver)}">${d.source.driver === 'dsh' ? '在 DSH 查看会话' : '在 Codex 查看'} ↗</button>` : ''}${d.request_id && a.kind !== 'ai_rejected' ? `<button class="quiet" data-trace="${esc(d.request_id)}">查看提示词与输出 ↗</button>` : ''}${a.audit ? changeRows(a) : ''}</div></article>`;
+    return `<article data-event-key="${esc(a.index ?? a.id ?? String(a.time) + ':' + a.kind + ':' + (a.task_id || ''))}" class="event ${bad ? 'event-error' : ''}"><div class="event-dot"></div><div class="event-content"><div class="event-heading"><b>${esc(title)}</b><time>${esc(date(a.time))}</time>${a.audit && ['manual_edit', 'manual_status', 'manual_ai_edit', 'merge'].includes(a.kind) ? `<button class="quiet" data-undo="${a.index}">撤销</button>` : ''}</div>${task ? `<div class="event-task">${a.task_number ? `#${esc(a.task_number)} ` : ''}${esc(task.title)}</div>` : ''}<div class="event-description">${esc(body)}</div>${tokenLine}${d.thread_id && ['codex', 'dsh'].includes(d.source?.driver) ? `<button class="quiet" data-analysis-session="${esc(d.thread_id)}" data-session-driver="${esc(d.source.driver)}">${d.source.driver === 'dsh' ? '在 DSH 查看会话' : '在 Codex 查看'} ↗</button>` : ''}${d.run_id && a.kind.startsWith('tool_call_') ? `<button data-tool-log-run="${esc(d.run_id)}">查看调用详情</button>` : ''}${d.request_id && !a.kind.startsWith('tool_call_') && a.kind !== 'ai_rejected' ? `<button class="quiet" data-trace="${esc(d.request_id)}">查看提示词与输出 ↗</button>` : ''}${a.audit ? changeRows(a) : ''}</div></article>`;
   }
   setHtml(
     '#log-results',
@@ -303,7 +309,7 @@ function renderLogShell(data, day) {
             ['analysis', 'AI 分析'],
             ['message_filter', '消息过滤'],
             ['report', '报表'],
-            ['archive', '归档'],
+            ['archive', '归档'], ['format','事项生成'], ['edit','一句话修改'], ['tool_call', '工具调用'],
           ]
             .map(
               ([key, label]) =>

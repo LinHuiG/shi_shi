@@ -374,6 +374,7 @@ fn apply_memory_changes(
                 kind: "archive_memory_once".into(),
                 task_id: change["task_id"].as_str().unwrap_or("").into(),
                 detail: format!("一次性归档经验：{key}"),
+                change_summary: String::new(),
                 before: Value::Null,
                 after: json!({"key":key,"text":change["text"],"source":source}),
             });
@@ -422,6 +423,7 @@ fn apply_memory_changes(
             kind: "archive_memory".into(),
             task_id: change["task_id"].as_str().unwrap_or("").into(),
             detail: format!("归档维护长期记忆：{key}"),
+            change_summary: String::new(),
             before,
             after: json!(entries),
         });
@@ -521,7 +523,15 @@ fn apply(s: &mut State, candidate: &Candidate, result: Value, at: i64) -> Result
 
     // Completed tasks become archived only in the successful commit. Tasks
     // edited while the model was running are left for a later archive.
+    let tool_audit_start = s.audit.len();
     let archived = finalize_tasks(s, candidate, at);
+    let tool_tasks = s
+        .audit
+        .iter()
+        .skip(tool_audit_start)
+        .map(|audit| audit.task_id.clone())
+        .collect::<Vec<_>>();
+    crate::tool_calling::link_tasks(s, &result, &tool_tasks);
 
     s.archive_ai_cursor = Some(candidate.cutoff);
     s.learning_cursor = s.learning_cursor.max(candidate.cutoff);
@@ -1096,6 +1106,10 @@ impl App {
             self.mark_attempt_failed_in_memory(&candidate.attempt_id, &message);
             return Err(message);
         }
+        self.notifications
+            .lock()
+            .unwrap()
+            .task_changes(&lock.tasks, &s.tasks);
         *lock = s;
         drop(lock);
         if let Err(error) = self.write_report_file(&report) {
@@ -1436,6 +1450,7 @@ mod tests {
                 kind: "manual_status".into(),
                 task_id: task.id.clone(),
                 detail: "done".into(),
+                change_summary: String::new(),
                 before: json!({"status":"待处理"}),
                 after: json!(task),
             });
@@ -1659,7 +1674,7 @@ mod tests {
         assert_eq!(app.state.lock().unwrap().tasks[0].id, task);
         // A final save failure must not apply the candidate in memory.
         let before_save = json!(*app.state.lock().unwrap());
-        std::fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .commit(candidate.clone(), result("处理完毕"), now())
             .is_err());
@@ -1676,7 +1691,7 @@ mod tests {
         let attempt = after.archive_attempts.last().unwrap();
         assert_eq!(attempt.status, "failed");
         assert!(attempt.error.contains("保存失败"));
-        std::fs::remove_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, false).unwrap();
         drop(after);
         drop(app);
         let _ = fs::remove_dir_all(root);
@@ -2042,6 +2057,7 @@ mod tests {
                 kind: "manual_archive".into(),
                 task_id: "t".into(),
                 detail: "人工归档".into(),
+                change_summary: String::new(),
                 before: json!({}),
                 after: json!({"archive_note":"合成备注"}),
             });
@@ -2156,13 +2172,13 @@ mod tests {
             value["advice_decisions"] = json!([{"kind":"prompt","action":"enable"}]);
             value["handling_review"] = json!([{"improved":true,"policy":{"prompt":"不应采用"}}]);
             value["memory_update"] = json!(["不应覆盖临时记忆"]);
-            fs::create_dir(root.join("data/state.next.json")).unwrap();
+            crate::test_support::persistence_failure(&root, true).unwrap();
             assert!(app.commit(candidate.clone(), value.clone(), now()).is_err());
             assert_eq!(
                 json!(app.state.lock().unwrap().analysis_memory),
                 json!(before.analysis_memory)
             );
-            fs::remove_dir(root.join("data/state.next.json")).unwrap();
+            crate::test_support::persistence_failure(&root, false).unwrap();
             let report = app.commit(candidate, value, now()).unwrap();
             let s = app.state.lock().unwrap();
             assert!(s
@@ -2355,6 +2371,7 @@ mod tests {
                 kind: "ai_update".into(),
                 task_id: task.id.clone(),
                 detail: "早期进展".into(),
+                change_summary: String::new(),
                 before: json!([task.clone()]),
                 after: json!([task.clone()]),
             });
@@ -2373,6 +2390,7 @@ mod tests {
                     kind: "manual_status".into(),
                     task_id: filler.id.clone(),
                     detail: "人工完成".into(),
+                    change_summary: String::new(),
                     before: json!([filler.clone()]),
                     after: json!([filler.clone()]),
                 });
@@ -2384,6 +2402,7 @@ mod tests {
                 kind: "manual_archive".into(),
                 task_id: task.id.clone(),
                 detail: "最终完成与备注".into(),
+                change_summary: String::new(),
                 before: json!([task.clone()]),
                 after: json!([{
                     "id":"t","archive_note":"最终才出现的备注","status":"已完成"
@@ -2443,6 +2462,7 @@ mod tests {
                     kind: "manual_status".into(),
                     task_id: task.id.clone(),
                     detail: "人工完成".into(),
+                    change_summary: String::new(),
                     before: json!([before]),
                     after: json!([task.clone()]),
                 });

@@ -18,6 +18,8 @@ pub struct Config {
     pub model_profiles: Option<ModelProfiles>,
     pub message_retention_days: u32,
     pub handling_prompt: String,
+    pub tool_call_prompt: String,
+    pub tools: Vec<crate::tool_registry::ToolDefinition>,
     pub review_prompt: String,
     pub archive_prompt: String,
     pub codex: String,
@@ -85,6 +87,7 @@ fn legacy_model_profiles() -> Option<ModelProfiles> {
         analysis: Some(default_model("low")),
         handling: Some(default_model("medium")),
         review: Some(default_model("high")),
+        legacy_tool_call: None,
     })
 }
 fn legacy_model_choice() -> Option<ModelChoice> {
@@ -100,6 +103,8 @@ impl Default for Config {
             model_profiles: Some(ModelProfiles::default()),
             message_retention_days: 90,
             handling_prompt: String::new(),
+            tool_call_prompt: String::new(),
+            tools: vec![],
             review_prompt: String::new(),
             archive_prompt: String::new(),
             codex: String::new(),
@@ -143,6 +148,9 @@ pub struct ModelChoice {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelProfiles {
+    /// Retired independent route, preserved only when reading an older configuration.
+    #[serde(rename = "tool_call", skip_serializing_if = "Option::is_none")]
+    pub legacy_tool_call: Option<ModelChoice>,
     #[serde(default = "legacy_model_choice")]
     pub filter: Option<ModelChoice>,
     #[serde(default = "legacy_model_choice")]
@@ -205,6 +213,7 @@ impl Config {
             analysis: materialized(&resolved[1]),
             handling: materialized(&resolved[2]),
             review: materialized(&resolved[3]),
+            legacy_tool_call: None,
         });
         for (choice, c) in [
             &mut p.filter,
@@ -297,6 +306,8 @@ pub struct TaskStep {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Task {
+    /// Legacy storage only; all tasks now use the global enabled tool registry.
+    pub enabled_tool_ids: Vec<String>,
     /// Frozen versions used for the last AI decision, preserved in subsequent
     /// manual audit before/after records. No prompt or personal text here.
     pub decision_context: Value,
@@ -370,6 +381,8 @@ pub struct Audit {
     pub kind: String,
     pub task_id: String,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub change_summary: String,
     pub before: Value,
     pub after: Value,
 }
@@ -523,7 +536,7 @@ pub struct State {
     pub archive_attempt_day: String,
     pub archive_attempts: Vec<ArchiveAttempt>,
     #[serde(with = "crate::archive_storage")]
-    pub archive_versions: Vec<ArchiveGroup>,
+    pub archive_versions: crate::shared::Shared<Vec<ArchiveGroup>>,
     pub analysis_memory: AnalysisMemory,
     /// A hard budget failure pauses automatic retries until a manual analysis
     /// succeeds. It never advances cursors or marks messages analyzed.
@@ -531,18 +544,18 @@ pub struct State {
     pub auto_analysis_blocked_at: i64,
     pub auto_analysis_block_reason: String,
     pub deleted_messages: BTreeMap<String, i64>,
-    pub advice_revisions: Vec<Value>,
+    pub advice_revisions: crate::shared::Shared<Vec<Value>>,
     pub archive_review_cursor: usize,
     pub archive_log_cursor: i64,
     pub tag_state: crate::tags::TagState,
-    pub disabled_plugins: Vec<String>,
     pub handling: crate::handling::HandlingState,
+    pub tool_runs: crate::shared::Shared<Vec<crate::tool_calling::ToolRun>>,
     pub config: Config,
-    pub messages: BTreeMap<String, Message>,
-    pub tasks: Vec<Task>,
+    pub messages: crate::shared::Shared<BTreeMap<String, Message>>,
+    pub tasks: crate::shared::Shared<Vec<Task>>,
     pub task_numbers: BTreeMap<String, u64>,
     pub schedules: Vec<Schedule>,
-    pub audit: Vec<Audit>,
+    pub audit: crate::shared::Shared<Vec<Audit>>,
     pub suggestions: Vec<Suggestion>,
     pub rule_version: u64,
     pub last_scan: i64,
@@ -556,7 +569,7 @@ pub struct State {
     pub cached_input_tokens: u64,
     pub cached_reports: u64,
     pub unreported_calls: u64,
-    pub reports: Vec<Value>,
+    pub reports: crate::shared::Shared<Vec<Value>>,
     pub retention_digest: Value,
     pub revision: u64,
     pub pending_scan: bool,
@@ -590,24 +603,24 @@ impl Default for State {
             archive_ai_cursor: None,
             archive_attempt_day: String::new(),
             archive_attempts: Vec::new(),
-            archive_versions: Vec::new(),
+            archive_versions: Default::default(),
             analysis_memory: AnalysisMemory::default(),
             auto_analysis_blocked: false,
             auto_analysis_blocked_at: 0,
             auto_analysis_block_reason: String::new(),
             deleted_messages: BTreeMap::new(),
-            advice_revisions: Vec::new(),
+            advice_revisions: Default::default(),
             archive_review_cursor: 0,
             archive_log_cursor: 0,
             tag_state: crate::tags::TagState::default(),
-            disabled_plugins: Vec::new(),
             handling: crate::handling::HandlingState::default(),
+            tool_runs: Default::default(),
             config: Config::default(),
-            messages: BTreeMap::new(),
-            tasks: Vec::new(),
+            messages: Default::default(),
+            tasks: Default::default(),
             task_numbers: BTreeMap::new(),
             schedules: Vec::new(),
-            audit: Vec::new(),
+            audit: Default::default(),
             suggestions: Vec::new(),
             rule_version: 0,
             last_scan: 0,
@@ -621,7 +634,7 @@ impl Default for State {
             cached_input_tokens: 0,
             cached_reports: 0,
             unreported_calls: 0,
-            reports: Vec::new(),
+            reports: Default::default(),
             retention_digest: Value::Null,
             revision: 0,
             pending_scan: false,
@@ -820,6 +833,16 @@ pub fn merge_evidence(
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn audit_change_summary_is_optional_for_legacy_data_and_roundtrips() {
+        let legacy = json!({"time":1,"kind":"ai_update","task_id":"synthetic","detail":"新进展","before":{},"after":{}});
+        let mut audit: Audit = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(audit.change_summary.is_empty());
+        assert_eq!(json!(audit), legacy);
+        audit.change_summary = "阻塞已解除，继续验证".into();
+        let restored: Audit = serde_json::from_value(json!(audit)).unwrap();
+        assert_eq!(restored.change_summary, audit.change_summary);
+    }
     #[test]
     fn message_revisions_ignore_all_metadata_including_replies_and_paths() {
         let original = Message {

@@ -87,36 +87,16 @@ impl App {
             return Err("搜索词最多200字".into());
         }
         let s = self.state.lock().unwrap();
-        let keep = protected(&s);
-        let mut matches = s
-            .messages
-            .values()
-            .filter(|m| {
-                !m.withdrawn
-                    && m.time >= since as i64
-                    && m.time <= until as i64
-                    && allowed_with(&s, m, &keep)
-            })
-            .filter(|m| {
-                q.is_empty()
-                    || [&m.text, &m.sender, &m.group, &m.chat, &m.source_name]
-                        .iter()
-                        .any(|x| x.to_lowercase().contains(&q))
-            })
-            .collect::<Vec<_>>();
-        matches.sort_by(|a, b| b.time.cmp(&a.time).then_with(|| b.id.cmp(&a.id)));
-        if ascending {
-            matches.reverse();
-        }
-        let total = matches.len();
-        let pages = total.div_ceil(size as usize).max(1);
-        let page = (requested as usize).min(pages);
-        let rows = matches
-            .into_iter()
-            .skip((page - 1) * size as usize)
-            .take(size as usize)
-            .collect::<Vec<_>>();
-        Ok(json!({"rows":rows,"page":page,"page_size":size,"total":total,"pages":pages}))
+        let mut store = self.store.lock().unwrap();
+        let store = store.as_mut().ok_or("业务数据库尚未初始化")?;
+        store.query_messages(
+            &s,
+            &q,
+            since as i64..=until as i64,
+            ascending,
+            requested as usize,
+            size as usize,
+        )
     }
     pub fn prune_messages(&self) -> Result<(), String> {
         // Archive candidate audit indices must stay stable until commit.
@@ -232,6 +212,7 @@ mod tests {
                 );
             }
         }
+        app.persist().unwrap();
         let a = app
             .query_messages(&json!({"page":1,"page_size":20}))
             .unwrap();
@@ -292,7 +273,7 @@ mod tests {
             assert!(!s.messages.contains_key("older"));
             assert!(!s.analyzed.contains_key("older"));
         }
-        std::fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app.delete_messages(&json!({"ids":["recent"]})).is_err());
         let s = app.state.lock().unwrap();
         assert!(s.messages.contains_key("recent"));

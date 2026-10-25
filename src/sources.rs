@@ -316,7 +316,7 @@ mod tests {
             (1, 1, 0, 0, 2)
         );
         let previous = app.state.lock().unwrap().messages[&first.id].text.clone();
-        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         first.text = "Uncommitted".into();
         assert!(commit(vec![first.clone()]).is_err());
         assert_eq!(app.state.lock().unwrap().messages[&first.id].text, previous);
@@ -364,13 +364,13 @@ mod tests {
         let withdrawn = app.state.lock().unwrap().messages[&m.id].clone();
         assert!(withdrawn.updated_at > edited.updated_at);
         let clock = app.state.lock().unwrap().message_updated_at;
-        std::fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         m.text = "Not committed".into();
         assert!(commit(m).is_err());
         assert_eq!(app.state.lock().unwrap().message_updated_at, clock);
     }
     #[test]
-    fn no_bundled_plugins_and_toggle_uninstall_keep_evidence() {
+    fn no_bundled_plugins_and_uninstall_keeps_evidence() {
         let app = fixture();
         install_fixture(&app, "plugins");
         assert!(plugins::catalog(&app.root).0.is_empty());
@@ -382,22 +382,13 @@ mod tests {
             s.chat_sources.push(source.clone());
             s.messages.insert(message.id.clone(), message.clone());
         }
-        app.plugin_toggle(&json!({"id":"fixture","enabled":false}))
-            .unwrap();
-        assert_eq!(
-            app.plugin_catalog().unwrap()["plugins"][0]["enabled"],
-            false
-        );
-        assert!(app
-            .source_discover(&json!({"plugin_id":"fixture","config":{}}))
-            .unwrap_err()
-            .contains("停用"));
+        assert!(app.plugin_catalog().unwrap()["plugins"][0]
+            .get("enabled")
+            .is_none());
         {
             let _busy = app.plugin_access.read().unwrap();
             assert!(app.plugin_uninstall(&json!({"id":"fixture"})).is_err());
         }
-        app.plugin_toggle(&json!({"id":"fixture","enabled":true}))
-            .unwrap();
         app.plugin_uninstall(&json!({"id":"fixture"})).unwrap();
         assert!(plugins::catalog(&app.root).0.is_empty());
         let restored = App::load(app.root.clone()).unwrap();
@@ -414,10 +405,15 @@ mod tests {
     fn uninstall_failed_save_restores_plugin_and_state() {
         let app = fixture();
         install_fixture(&app, "data/plugins");
-        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        app.state
+            .lock()
+            .unwrap()
+            .chat_sources
+            .push(source("Kept source"));
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app.plugin_uninstall(&json!({"id":"fixture"})).is_err());
         assert!(plugins::find(&app.root, "fixture").is_ok());
-        assert!(app.state.lock().unwrap().disabled_plugins.is_empty());
+        assert!(app.state.lock().unwrap().chat_sources[0].enabled);
     }
     #[test]
     fn plugin_upgrade_and_same_version_repair_preserve_source_state() {
@@ -441,7 +437,6 @@ mod tests {
             let message = row(&source);
             s.messages.insert(message.id.clone(), message);
             s.chat_sources.push(source);
-            s.disabled_plugins.push("fixture".into());
             app.save(&s).unwrap();
         }
         let before = json!(*app.state.lock().unwrap());
@@ -507,21 +502,17 @@ mod tests {
         );
     }
     #[test]
-    fn failed_plugin_upgrade_restores_old_files_and_configuration() {
+    fn plugin_installation_does_not_rewrite_state_and_keeps_undeclared_files() {
         let app = fixture();
         install_fixture(&app, "data/plugins");
         install_fixture(&app, "candidate");
         let candidate = app.root.join("candidate/fixture");
         let installed = app.root.join("data/plugins/fixture");
         fs::write(installed.join("user-note.txt"), b"user data").unwrap();
-        fs::write(candidate.join("fixture.dll"), b"new payload").unwrap();
         let before = json!(*app.state.lock().unwrap());
-        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
         let path = candidate.join("plugin.json");
-        assert!(app
-            .install_plugin(path.to_str().unwrap())
-            .unwrap_err()
-            .contains("已撤销"));
+        fs::remove_file(candidate.join("fixture.dll")).unwrap();
+        assert!(app.install_plugin(path.to_str().unwrap()).is_err());
         assert_eq!(
             fs::read(installed.join("fixture.dll")).unwrap(),
             b"not executable"
@@ -530,17 +521,15 @@ mod tests {
             fs::read(installed.join("user-note.txt")).unwrap(),
             b"user data"
         );
-        assert_eq!(json!(*app.state.lock().unwrap()), before);
-        fs::remove_dir(app.root.join("data/state.next.json")).unwrap();
-        fs::remove_file(candidate.join("fixture.dll")).unwrap();
-        assert!(app.install_plugin(path.to_str().unwrap()).is_err());
-        assert_eq!(
-            fs::read(installed.join("fixture.dll")).unwrap(),
-            b"not executable"
-        );
-        // A successful replacement retains undeclared files in its hidden previous-package directory.
+        // Installing executable files no longer rewrites unrelated application data.
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         fs::write(candidate.join("fixture.dll"), b"new payload").unwrap();
         app.install_plugin(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            fs::read(installed.join("fixture.dll")).unwrap(),
+            b"new payload"
+        );
+        assert_eq!(json!(*app.state.lock().unwrap()), before);
         let backup = fs::read_dir(app.root.join("data/plugins"))
             .unwrap()
             .flatten()
@@ -552,6 +541,72 @@ mod tests {
             b"user data"
         );
         assert!(!backup.join("fixture.dll").exists());
+    }
+    #[test]
+    fn source_toggle_preserves_progress_rejects_stale_writes_and_never_loads_disabled_plugins() {
+        let app = fixture();
+        let mut original = source("Existing");
+        original.cursor = json!({"offset":17});
+        original.last_scan = 123;
+        original.last_error = "last read failed".into();
+        app.state
+            .lock()
+            .unwrap()
+            .chat_sources
+            .push(original.clone());
+        let off = app
+            .source_toggle(&json!({"id":original.id,"updated":original.updated,"enabled":false}))
+            .unwrap();
+        assert_eq!(off["enabled"], false);
+        assert_eq!(off["cursor"], original.cursor);
+        assert_eq!(off["last_scan"], 123);
+        assert_eq!(off["last_error"], original.last_error);
+        assert_eq!(off["config"], original.config);
+        assert!(app
+            .source_toggle(&json!({"id":original.id,"updated":original.updated,"enabled":true}))
+            .unwrap_err()
+            .contains("已变化"));
+        let before = json!(*app.state.lock().unwrap());
+        assert!(app
+            .source_toggle(&json!({"id":original.id,"updated":off["updated"],"enabled":true}))
+            .is_err());
+        assert_eq!(json!(*app.state.lock().unwrap()), before);
+        app.source_toggle(&json!({"id":original.id,"updated":off["updated"],"enabled":false}))
+            .unwrap();
+        assert_eq!(json!(*app.state.lock().unwrap()), before);
+        // No enabled source means even an installed invalid DLL is never called.
+        install_fixture(&app, "data/plugins");
+        assert!(app.scan_data().unwrap_err().contains("启用一个消息来源"));
+        let (_, _, committed) = app
+            .commit_scan(
+                vec![(
+                    original.clone(),
+                    Ok((vec![row(&original)], json!({"offset":18}), now())),
+                )],
+                now(),
+            )
+            .unwrap();
+        assert_eq!(committed, 0);
+        assert_eq!(
+            app.state.lock().unwrap().chat_sources[0].cursor,
+            original.cursor
+        );
+    }
+    #[test]
+    fn source_toggle_save_failure_keeps_previous_state() {
+        let app = fixture();
+        let original = source("Existing");
+        app.state
+            .lock()
+            .unwrap()
+            .chat_sources
+            .push(original.clone());
+        let before = json!(*app.state.lock().unwrap());
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
+        assert!(app
+            .source_toggle(&json!({"id":original.id,"updated":original.updated,"enabled":false}))
+            .is_err());
+        assert_eq!(json!(*app.state.lock().unwrap()), before);
     }
     #[test]
     fn source_namespaces_replies_and_rejects_invalid_messages() {
@@ -590,7 +645,7 @@ mod tests {
         assert_eq!(before.chat_sources[0].cursor, json!({"offset":1}));
         assert_eq!(before.chat_sources[1].last_scan, 0);
         assert!(before.chat_sources[1].cursor.is_null());
-        fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .commit_scan(vec![(a, Ok((vec![], json!({"offset":2}), at + 1)))], at + 1)
             .is_err());
@@ -748,49 +803,6 @@ impl Drop for ScanGuard<'_> {
     }
 }
 impl App {
-    fn require_plugin_enabled(&self, plugin: &str) -> Result<(), String> {
-        if self
-            .state
-            .lock()
-            .unwrap()
-            .disabled_plugins
-            .iter()
-            .any(|p| p == plugin)
-        {
-            return Err("插件已停用，请先开启插件开关".into());
-        }
-        Ok(())
-    }
-    pub fn plugin_toggle(&self, v: &Value) -> Result<Value, String> {
-        let _guard = self
-            .plugin_access
-            .try_write()
-            .map_err(|_| "插件正在读取或配置，请稍后重试")?;
-        let pid = v["id"].as_str().ok_or("缺少插件编号")?;
-        plugins::find(&self.root, pid)?;
-        let enabled = v["enabled"].as_bool().ok_or("缺少开关状态")?;
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        s.disabled_plugins.retain(|p| p != pid);
-        if !enabled {
-            s.disabled_plugins.push(pid.into());
-        }
-        Self::audit(
-            &mut s,
-            "plugin_toggle",
-            "",
-            if enabled {
-                "启用消息插件"
-            } else {
-                "停用消息插件，保留来源配置与读取进度"
-            },
-            Value::Null,
-            json!({"plugin_id":pid,"enabled":enabled}),
-        );
-        self.save(&s)?;
-        *lock = s;
-        Ok(json!(true))
-    }
     pub fn plugin_uninstall(&self, v: &Value) -> Result<Value, String> {
         let _guard = self
             .plugin_access
@@ -811,9 +823,6 @@ impl App {
         let retired = storage.join(id());
         let mut lock = self.state.lock().unwrap();
         let mut s = lock.clone();
-        if !s.disabled_plugins.iter().any(|p| p == pid) {
-            s.disabled_plugins.push(pid.into());
-        }
         for source in s.chat_sources.iter_mut().filter(|s| s.plugin_id == pid) {
             source.enabled = false;
             source.updated = now().max(source.updated + 1);
@@ -869,7 +878,7 @@ impl App {
         let _guard = self.plugin_access.read().map_err(|_| "插件状态不可用")?;
         let (plugins, errors) = plugins::catalog(&self.root);
         Ok(
-            json!({"plugins":plugins.into_iter().map(|p|{let mut v=json!(p.manifest);v["enabled"]=json!(!self.state.lock().unwrap().disabled_plugins.contains(&p.manifest.id));v}).collect::<Vec<_>>(),"errors":errors,"sources":self.state.lock().unwrap().chat_sources}),
+            json!({"plugins":plugins.into_iter().map(|p|p.manifest).collect::<Vec<_>>(),"errors":errors,"sources":self.state.lock().unwrap().chat_sources}),
         )
     }
     pub fn install_plugin(&self, path: &str) -> Result<Value, String> {
@@ -877,17 +886,7 @@ impl App {
             .plugin_access
             .try_write()
             .map_err(|_| "插件正在读取或配置，请稍后重试")?;
-        let installed =
-            plugins::install_with(&self.root, Path::new(path), |manifest, replacing| {
-                let mut lock = self.state.lock().unwrap();
-                let mut s = lock.clone();
-                if !replacing {
-                    s.disabled_plugins.retain(|p| p != &manifest.id);
-                }
-                self.save(&s)?;
-                *lock = s;
-                Ok(())
-            })?;
+        let installed = plugins::install(&self.root, Path::new(path))?;
         let mut result = json!(installed.manifest);
         result["install_status"] = json!(installed.status);
         Ok(result)
@@ -947,8 +946,12 @@ impl App {
     }
     pub fn source_discover(&self, v: &Value) -> Result<Value, String> {
         let _guard = self.plugin_access.read().map_err(|_| "插件状态不可用")?;
-        self.require_plugin_enabled(v["plugin_id"].as_str().unwrap_or(""))?;
         let plugin = plugins::find(&self.root, v["plugin_id"].as_str().ok_or("请选择插件")?)?;
+        if plugin.manifest.settings.is_some() {
+            return Ok(
+                json!({"settings":crate::plugin_settings::begin(self, &plugin, &v["config"])?}),
+            );
+        }
         let work = crate::storage::data_dir(&self.root)
             .join("tmp/discovery")
             .join(id());
@@ -962,9 +965,6 @@ impl App {
             return Err("来源名称应为 1–100 字".into());
         }
         let plugin = plugins::find(&self.root, &source.plugin_id)?;
-        if source.enabled {
-            self.require_plugin_enabled(&source.plugin_id)?;
-        }
         let validated_key = if source.enabled {
             Some(validate(
                 &plugin,
@@ -1029,6 +1029,72 @@ impl App {
         self.save(&state)?;
         *lock = state;
         Ok(json!(source))
+    }
+    /// Disabling remains available without a usable plugin; enabling validates
+    /// the existing account before changing collection state.
+    pub fn source_toggle(&self, value: &Value) -> Result<Value, String> {
+        let _access = self.plugin_access.read().map_err(|_| "插件状态不可用")?;
+        let source_id = value["id"].as_str().ok_or("缺少来源编号")?;
+        let expected = value["updated"].as_i64().ok_or("缺少来源版本")?;
+        let enabled = value["enabled"].as_bool().ok_or("缺少开关状态")?;
+        let before = {
+            let state = self.state.lock().unwrap();
+            let source = state
+                .chat_sources
+                .iter()
+                .find(|s| s.id == source_id)
+                .ok_or("消息来源不存在")?;
+            if source.updated != expected {
+                return Err("消息来源已变化，请刷新后重试".into());
+            }
+            if source.enabled == enabled {
+                return Ok(json!(source));
+            }
+            source.clone()
+        };
+        let account_key = if enabled {
+            let plugin = plugins::find(&self.root, &before.plugin_id)?;
+            Some(validate(
+                &plugin,
+                &before,
+                &crate::storage::data_dir(&self.root)
+                    .join("tmp/validate")
+                    .join(id()),
+            )?)
+        } else {
+            None
+        };
+        let mut lock = self.state.lock().unwrap();
+        let mut state = lock.clone();
+        let source = state
+            .chat_sources
+            .iter_mut()
+            .find(|s| s.id == source_id)
+            .ok_or("消息来源不存在")?;
+        if source.updated != expected {
+            return Err("消息来源已变化，请刷新后重试".into());
+        }
+        source.enabled = enabled;
+        source.updated = now().max(source.updated.saturating_add(1));
+        if let Some(account_key) = account_key {
+            source.account_key = account_key;
+        }
+        let result = json!(source);
+        Self::audit(
+            &mut state,
+            "source_toggle",
+            "",
+            if enabled {
+                "启用消息来源"
+            } else {
+                "停用消息来源，保留配置与读取进度"
+            },
+            json!({"id":before.id,"enabled":before.enabled}),
+            json!({"id":before.id,"enabled":enabled}),
+        );
+        self.save(&state)?;
+        *lock = state;
+        Ok(result)
     }
     pub fn source_remove(&self, v: &Value) -> Result<Value, String> {
         let mut lock = self.state.lock().unwrap();
@@ -1101,11 +1167,11 @@ impl App {
             let sources = s
                 .chat_sources
                 .iter()
-                .filter(|source| source.enabled && !s.disabled_plugins.contains(&source.plugin_id))
+                .filter(|source| source.enabled)
                 .cloned()
                 .collect::<Vec<_>>();
             if sources.is_empty() {
-                return Err("请先在消息来源中安装、配置并启用插件".into());
+                return Err("请先配置并启用一个消息来源".into());
             }
             s.pending_scan = true;
             self.save(&s)?;
@@ -1297,7 +1363,6 @@ impl App {
             .cloned()
             .ok_or("来源不存在")?;
         let plugin = plugins::find(&self.root, &source.plugin_id)?;
-        self.require_plugin_enabled(&source.plugin_id)?;
         let work = crate::storage::data_dir(&self.root)
             .join("tmp/range")
             .join(id());

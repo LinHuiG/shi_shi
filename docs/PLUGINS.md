@@ -23,7 +23,7 @@ plugin.json
 shishi_json_source.dll
 ```
 
-打开拾事“消息来源”，选择或拖入 ZIP。宿主先检查描述、文件与路径；打开配置页面会调用 `discover`，保存时调用 `validate`。确认来源后再启用扫描。
+打开拾事“消息来源”，选择或拖入 ZIP。宿主先检查描述、文件与路径。普通配置表单调用 `discover`；声明自定义页面的插件直接加载其页面，由页面决定何时发现账号。启用来源前由宿主调用 `validate`。插件没有独立启用开关，采集仅由接入源开关控制；没有启用的来源时不启动采集。
 
 ## Manifest
 
@@ -38,6 +38,7 @@ shishi_json_source.dll
 | `files` | 安装资源白名单，包含 DLL 依赖；不复制未声明资源 |
 | `capabilities` | 实现的接口名称 |
 | `config_fields` | 声明表单字段，支持 file、directory、text、password |
+| `settings` | 可选自定义配置页，见下文；未声明时继续使用普通表单 |
 
 禁止绝对路径、上级目录、链接和重解析点。ZIP 可以在根目录或一层目录内包含一个 manifest；不能包含多个插件描述。文件数量、包体积和请求体积均有限制，详见 [协议参考](../PLUGIN_API.txt)。
 
@@ -70,6 +71,70 @@ fn handle(request: Value) -> Result<Value, String> {
 ```
 
 该片段只展示入口；它不是完整可安装插件。完整实现以 JSON 示例为准。
+
+## 页面内配置（1.2.2 起）
+
+在 manifest 中增加以下声明，同时把 `settings.html` 列入 `files`。页面使用内联脚本、样式和 data 图片，不加载网络或外部文件。`config_fields` 可省略；已有声明继续用于完成时的字段检查。
+
+```json
+"settings": {
+  "api_version": 1,
+  "entrypoint": "settings.html",
+  "methods": ["ui_load", "ui_validate"]
+}
+```
+
+宿主把 HTML 放在来源编辑页的沙箱 iframe 内，来源名称与启用状态由宿主管理。1.2.2 起，来源开关放在标题右侧，名称自动生成，不再单独显示名称输入框。打开时直接传入当前配置，新来源可能是空对象；不要依赖宿主先调用 `discover`。页面必须处理自身加载、发现及错误状态。
+
+```js
+const view = await window.shishiPlugin.call('ui_load');
+const validated = await window.shishiPlugin.call('ui_validate', draft);
+await window.shishiPlugin.complete(validated.config);
+// 或离开当前配置页：await window.shishiPlugin.cancel();
+```
+
+`call` 只能调用声明的方法。`complete` 把插件配置与当前来源名称、启用状态一起交给宿主；宿主检查字段、账号一致性并持久保存，成功才 resolve 和关闭页面。保存失败时 reject，页面及输入保留，可直接重试。不要在调用 `complete` 前自行关闭页面。保存中不能取消；其他在途配置调用仍可取消。
+
+`cancel` 直接回到来源列表，放弃宿主尚未保存的编辑。插件在先前 `call` 中明确保存到自己文件的数据不会自动回滚，应在按钮和提示中说明保存对象。
+
+1.2.2 起，插件可用 `await shishiPlugin.suggestSourceName?.(name)` 建议来源名称。名称由插件根据账号生成，须为 1–100 字；返回 `true` 表示已填入草稿，`false` 表示保留现有名称。宿主仅接受空白或插件默认名称，同一编辑期间可更新先前建议；既有自定义名不覆盖。此调用不保存数据，仍由 `complete` 统一提交。可选调用方式兼容旧宿主。
+
+页面还可用 `await shishiPlugin.setDirty?.(boolean)` 报告草稿是否与打开时的持久配置不同。宿主同时检查启用状态，只在未修改时允许点击配置页外关闭；搜索、筛选和滚动不应标记修改。保存中不接受状态更新。插件保存成功但宿主 `complete` 失败时应保持修改标记，供重试；旧插件未提供状态时，宿主根据输入事件保守地保留页面。取消仍不保存宿主草稿。
+
+1.2.2 起，页面可选择以下宿主能力：
+
+```js
+const path = await shishiPlugin.pickPath?.({
+  kind: 'file', // 或 directory
+  title: '程序',
+  defaultPath: draft.program || '',
+  filters: [{ name: '程序', extensions: ['exe'] }],
+});
+if (path != null) draft.program = path;
+// 自然内容高度包含内边距和底部操作；null 恢复填满可用区域。
+await shishiPlugin.setContentHeight?.(240);
+```
+
+路径选择返回字符串或 `null`；取消不应清空输入。宿主仅接受当前 iframe 会话的请求，选择期间保留页面，返回路径不会自动保存。插件应同时允许粘贴路径。
+
+高度上报应根据实际内容计算，并对重复值去重；内容或宽度变化后重新计算，不得依赖 iframe 当前视口高度，避免循环缩放。宿主限制最大高度，较短内容自动收紧，长列表由插件内部滚动。
+
+配置页优先自动发现和校验，只在失败时展开缺失路径；已有有效值、手工输入、勾选和错误重试均应保留。多账号需要明确选择，不能自动换掉已有绑定。普通界面保留保存／取消，技术字段收进高级设置。
+
+配置页使用独立的可取消 ABI，不改变普通消息接口：
+
+```c
+typedef uint32_t (*shishi_cancelled)(uintptr_t context);
+uint8_t *shishi_plugin_settings_call(
+    const uint8_t *input, size_t input_len, size_t *output_len,
+    shishi_cancelled cancelled, uintptr_t context);
+```
+
+输入仍是协议 1 JSON，`config` 在会话开始时固定；`params` 来自页面，`context` 提供 `plugin_dir` 和 90000 毫秒超时。输出沿用信封与 `shishi_plugin_free`。插件应定期检查取消回调，不能把回调或 context 留到函数返回后使用。
+
+宿主在无窗口辅助进程中调用此 ABI；95 秒未退出或用户取消时终止该进程。请求最大 2 MiB，响应最大 32 MiB；HTML 最大 2 MiB，方法最多 32 个。正常退出和取消后清理临时请求与响应；异常关闭仍可能留下文件。进程隔离控制生命周期，不限制 DLL 的本机权限，也不代表来源采集接口已有崩溃隔离。
+
+宿主不向插件导出 SQLite ABI 或共享 `sqlite3.dll`。插件依赖自己需要的数据库引擎及来源客户端格式；宿主的业务数据库不是来源数据库解密接口。
 
 ## 消息模型
 

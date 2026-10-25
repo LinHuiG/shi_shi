@@ -103,6 +103,22 @@ function tagMatches(t) {
     )
   );
 }
+function revealTaskTags(task) {
+  const tags = shownTags(task), filters = tagSelection();
+  let changed = false;
+  for (const [kind, values] of Object.entries(filters)) {
+    if (values.length && !tags.some(tag => tag.kind === kind && values.includes(tag.value))) {
+      delete filters[kind];
+      changed = true;
+    }
+  }
+  const priorities = prioritySelection();
+  if (priorities.length && !tags.some(tag => tag.kind === priorityKind() && priorities.includes(tag.value))) {
+    selectedPriorities = [];
+    changed = true;
+  }
+  return changed;
+}
 function filterGroups() {
   const groups = structuredClone(state.tag_state?.groups || []);
   if (!state.tag_state?.unified) {
@@ -173,6 +189,8 @@ function restoreTagBar(saved) {
     const expanded = tagExpanded.has(group.dataset.filterGroup),
       title = group.querySelector('.tag-group-title'),
       wasExpanded = group.classList.contains('expanded');
+    const slot = group.parentElement;
+    if (expanded && !wasExpanded) slot.style.width = slot.getBoundingClientRect().width + 'px';
     group.classList.toggle('expanded', expanded);
     title.setAttribute('aria-expanded', String(expanded));
     group.querySelector('.tag-chevron').textContent = expanded ? '−' : '＋';
@@ -188,13 +206,31 @@ function restoreTagBar(saved) {
         Math.max(70, Math.min(240, window.innerHeight - rect.top - 65)) + 'px';
       group.querySelector('.tag-options').scrollTop = saved.options;
       if (!wasExpanded) motionAnimate(group, [{ opacity: 0.4 }, { opacity: 1 }]);
-    } else group.removeAttribute('style');
+    } else {
+      group.removeAttribute('style');
+      slot.style.removeProperty('width');
+    }
   }
   if (saved.focus) {
     const el = [...bar.querySelectorAll('button')].find((el) =>
       Object.entries(saved.focus).every(([k, v]) => el.dataset[k] === v),
     );
     el?.focus({ preventScroll: true });
+  }
+  observeTagOverflow();
+}
+function updateTagOverflow(options) {
+  options.classList.toggle('has-more-options', options.scrollWidth - options.clientWidth - options.scrollLeft > 1);
+}
+const tagOverflowObserver = typeof ResizeObserver === 'function'
+  ? new ResizeObserver(entries => entries.forEach(entry => updateTagOverflow(entry.target))) : null;
+function tagOptionsScrolled(event) { updateTagOverflow(event.currentTarget); }
+function observeTagOverflow() {
+  tagOverflowObserver?.disconnect();
+  for (const options of document.querySelectorAll('.tag-options')) {
+    updateTagOverflow(options);
+    tagOverflowObserver?.observe(options);
+    options.addEventListener('scroll', tagOptionsScrolled, { passive: true });
   }
 }
 function collapseTagGroups() {
@@ -207,6 +243,7 @@ function collapseTagGroups() {
       (a, b) => Number(b.classList.contains('selected')) - Number(a.classList.contains('selected')),
     ))
       options.append(b);
+  observeTagOverflow();
 }
 function saveTagFilters() {
   const filters = structuredClone(tagSelection()),
@@ -259,13 +296,18 @@ function extraTagBadges(t) {
     )
     .join('');
 }
-function taskTagEditor(t) {
-  return `<div class="form-group"><label>标签（可留空）</label>${filterGroups()
+function taskTagEditor(t, collapsible = false) {
+  const groups = filterGroups(), tags = taskTags(t),
+    selected = groups.some(g => tags.some(tag => tag.kind === g.name && g.values.includes(tag.value))),
+    fields = `${groups
     .map(
       (g) =>
         `<div class="task-tag-field"><span>${esc(g.name)}</span><div class="row">${g.values.map((v) => `<label class="check"><input type="checkbox" data-edit-tag-kind="${esc(g.name)}" ${g.name === priorityKind() ? 'data-edit-tag-single="1"' : ''} value="${esc(v)}" ${taskTags(t).some((x) => x.kind === g.name && x.value === v) ? 'checked' : ''}>${esc(v)}</label>`).join('')}</div></div>`,
     )
-    .join('')}<div class="helper">新枚举由 AI 从消息学习，在迭代建议中预览并采用。</div></div>`;
+    .join('')}<div class="helper">新枚举由 AI 从消息学习，在迭代建议中预览并采用。</div>`;
+  return collapsible
+    ? `<details class="form-group task-tag-settings" ${selected ? 'open' : ''}><summary>标签（可留空）</summary>${fields}</details>`
+    : `<div class="form-group"><label>标签（可留空）</label>${fields}</div>`;
 }
 function readTaskTags() {
   return [...document.querySelectorAll('[data-edit-tag-kind]:checked')].map((el) => ({

@@ -12,23 +12,6 @@ pub fn decision(r: &Suggestion) -> &str {
         &r.decision
     }
 }
-// Archive-time prompt updates are whole-prompt replacements validated by the
-// prompt review path. Nothing is appended to the current prompt here; enabled
-// rules stay active and are injected into the system segment at request time.
-pub fn sync_handling_prompt(s: &mut State, text: &str, reason: &str) {
-    if let Some(old) = s.handling.versions.last().cloned() {
-        if old.policy.prompt != text {
-            let mut next = old.clone();
-            next.id = id();
-            next.previous = old.id;
-            next.created = now();
-            next.action = "manual".into();
-            next.reason = reason.into();
-            next.policy.prompt = text.into();
-            s.handling.versions.push(next);
-        }
-    }
-}
 fn target(s: &State, kind: &str, id: &str) -> Result<Value, String> {
     let mut value = match kind {
         "rule" => s
@@ -57,7 +40,7 @@ fn target(s: &State, kind: &str, id: &str) -> Result<Value, String> {
     }
     .ok_or("建议已处理或不存在，请刷新".to_string())?;
     value["current_prompt_version"] = json!(if kind == "handling" {
-        s.handling.versions.last().map(|v| v.id.clone())
+        prompts::current(s, "handling").map(|v| v.id.clone())
     } else {
         prompts::current(s, "classify").map(|v| v.id.clone())
     });
@@ -119,7 +102,7 @@ mod tests {
             .unwrap();
         let t = app.task_edit(&json!({"task":{"title":"例子"}})).unwrap();
         let before = json!(*app.state.lock().unwrap());
-        std::fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .archive_task(&json!({"id":t["id"],"updated":t["updated"],"status":"已完成"}))
             .is_err());
@@ -151,7 +134,7 @@ mod tests {
             .finish_advice_feedback("rule", "pending", "过期基准", &updated, result.clone())
             .is_err());
         let latest = target(&app.state.lock().unwrap(), "rule", "pending").unwrap();
-        std::fs::create_dir(app.root.join("data/state.next.json")).unwrap();
+        crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .finish_advice_feedback("rule", "pending", "保存失败", &latest, result)
             .is_err());
@@ -174,28 +157,27 @@ mod tests {
             .clone();
         assert_ne!(initial, edited);
         assert_eq!(
-            app.state
-                .lock()
-                .unwrap()
-                .handling
-                .versions
-                .last()
-                .unwrap()
-                .policy
-                .prompt,
+            prompts::content(&app.state.lock().unwrap().config, "handling"),
             "先核对证据和环境，再提出建议"
         );
         app.rollback_prompt(&initial, &edited).unwrap();
         let s = app.state.lock().unwrap();
         assert_eq!(
-            s.handling.versions.last().unwrap().policy.prompt,
+            prompts::current(&s, "handling").unwrap().content,
             prompts::content(&s.config, "handling")
         );
         assert_eq!(
             prompts::content(&s.config, "prompt_review"),
             "按增量记录审校"
         );
-        assert_eq!(s.handling.versions.len(), 3);
+        assert!(s.handling.versions.is_empty());
+        assert_eq!(
+            s.prompt_versions
+                .iter()
+                .filter(|v| v.target == "handling")
+                .count(),
+            3
+        );
     }
     #[test]
     fn model_profiles_dispatch_independently_and_partial_config_uses_base_model() {
@@ -207,6 +189,7 @@ mod tests {
         };
         assert_eq!(c.for_kind("handling").model, "base-model");
         c.model_profiles = Some(ModelProfiles {
+            legacy_tool_call: None,
             filter: Some(ModelChoice {
                 connection_id: String::new(),
                 model: "filter-model".into(),
@@ -401,14 +384,15 @@ impl App {
                 r.reason = reason.clone();
             }
             "handling" => {
-                let base = s.handling.versions.last().unwrap().id.clone();
+                let base = prompts::current(&s, "handling").unwrap().id.clone();
                 let r = s
                     .handling
                     .proposals
                     .iter_mut()
                     .find(|r| r.id == ident)
                     .unwrap();
-                r.policy.prompt = bounded("prompt", 20000)?;
+                r.prompt = bounded("prompt", 20000)?;
+                r.legacy_policy = None;
                 r.base = base;
                 r.reason = reason.clone();
             }

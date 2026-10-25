@@ -18,6 +18,7 @@ script scripts/logs.js
 script scripts/forms.js
 script scripts/events.js
 script scripts/extensions.js
+script scripts/plugin-settings.js
 script scripts/approval-content.js
 script scripts/handling-reading.js
 script scripts/handling.js
@@ -25,6 +26,7 @@ script scripts/tags.js
 script scripts/model-routes.js
 script scripts/ai-connections.js
 script scripts/inbox.js
+script scripts/tools.js
 script scripts/workflow.js
 script scripts/task-merge.js
 script scripts/work-state.js

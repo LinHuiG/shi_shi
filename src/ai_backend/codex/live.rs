@@ -21,7 +21,6 @@ pub(super) fn publish_thread(
     title: &str,
     stop: &AtomicBool,
     call: &mut dyn FnMut(&str, Value) -> Result<Value, String>,
-    open: &mut dyn FnMut() -> Result<(), String>,
     timeout: Duration,
 ) -> Result<PublishedThread, String> {
     let start = Instant::now();
@@ -39,7 +38,7 @@ pub(super) fn publish_thread(
                 stored = value;
                 break;
             }
-            Ok(_) => return Err("Codex 返回的会话编号不匹配，未打开前台".into()),
+            Ok(_) => return Err("Codex 返回的会话编号不匹配，未关联".into()),
             Err(error) => {
                 let pending =
                     error.contains("no rollout found") || error.contains("thread not loaded");
@@ -73,11 +72,8 @@ pub(super) fn publish_thread(
     if stop.load(Ordering::SeqCst) {
         return Err(crate::ai_control::CANCELLED.into());
     }
-    // Opening the exact CLI-emitted id never depends on optional metadata.
-    // Do not resume, fork or start a turn in this companion app-server.
-    if let Err(error) = open() {
-        issues.push(error);
-    }
+    // Metadata publication is background-only. Opening a desktop window is a
+    // separate, explicit user action.
     if !project.is_empty() && !stored.is_null() {
         for (method, params) in [
             (
@@ -129,7 +125,7 @@ pub(super) fn watch_public_rollout(
     let Some(path) = stored["thread"]["path"].as_str() else {
         return;
     };
-    // The exact id was checked before opening. Refuse paths for other sessions.
+    // The exact id was checked before publication. Refuse paths for other sessions.
     if !std::path::Path::new(path)
         .file_name()
         .is_some_and(|name| name.to_string_lossy().contains(thread))
@@ -180,7 +176,6 @@ mod tests {
     fn visibility_waits_for_rollout_and_never_retries_unknown_errors() {
         let mut methods = vec![];
         let mut reads = 0;
-        let mut opened = false;
         publish_thread(
             "fresh",
             "p",
@@ -200,14 +195,9 @@ mod tests {
                 }
                 Ok(json!({}))
             },
-            &mut || {
-                opened = true;
-                Ok(())
-            },
             Duration::from_secs(1),
         )
         .unwrap();
-        assert!(opened);
         assert_eq!(
             methods,
             [
@@ -228,7 +218,6 @@ mod tests {
                 calls += 1;
                 Err("-32603: Internal error".into())
             },
-            &mut || Ok(()),
             Duration::from_secs(1),
         )
         .unwrap();
@@ -240,14 +229,12 @@ mod tests {
             "t",
             &AtomicBool::new(true),
             &mut |_, _| panic!("cancelled"),
-            &mut || panic!("cancelled"),
             Duration::from_secs(1)
         )
         .is_err());
     }
     #[test]
-    fn unloaded_exec_thread_is_discovered_without_resume_and_metadata_never_blocks_open() {
-        let mut opened = false;
+    fn unloaded_exec_thread_is_discovered_without_resume_and_metadata_failure_is_reported() {
         let mut methods = vec![];
         let published = publish_thread(
             "fresh",
@@ -267,14 +254,9 @@ mod tests {
                     _ => Err("optional metadata unavailable".into()),
                 }
             },
-            &mut || {
-                opened = true;
-                Ok(())
-            },
             Duration::ZERO,
         )
         .unwrap();
-        assert!(opened);
         assert_eq!(published.stored["thread"]["id"], "fresh");
         assert!(published
             .error
@@ -289,28 +271,21 @@ mod tests {
                 "thread/name/set"
             ]
         );
-        let mut fallback_opened = false;
         publish_thread(
             "fresh",
             "p",
             "t",
             &AtomicBool::new(false),
             &mut |_, _| Err("thread not loaded".into()),
-            &mut || {
-                fallback_opened = true;
-                Ok(())
-            },
             Duration::ZERO,
         )
         .unwrap();
-        assert!(fallback_opened);
         assert!(publish_thread(
             "fresh",
             "p",
             "t",
             &AtomicBool::new(false),
             &mut |_, _| Ok(json!({"thread":{"id":"other"}})),
-            &mut || panic!("wrong thread must never open"),
             Duration::ZERO
         )
         .is_err());
