@@ -106,7 +106,7 @@ fn final_value(kind: &str) -> Value {
             json!({"actions":[],"tag_suggestions":[],"image_notes":[],"memory_update":[]})
         }
         "format" => {
-            json!({"tasks":[{"title":"Synthetic task","description":"Synthetic evidence","blocker":"","next_step":"Inspect","due":"","tags":[],"suggested_project_id":"project","suggested_project_reason":"Synthetic directory","tool_call_ids":["synthetic-call"]}],"tag_suggestions":[]})
+            json!({"tasks":[{"title":"Synthetic task","description":"Synthetic evidence","blocker":"","due":"","tags":[],"suggested_project_id":"project","suggested_project_reason":"Synthetic directory","tool_call_ids":["synthetic-call"]}],"tag_suggestions":[]})
         }
         "edit" => {
             json!({"reason":"Synthetic edit","changes":[],"tag_changes":[],"tag_suggestions":[],"suggested_project_id":"project","suggested_project_reason":"Synthetic directory"})

@@ -199,9 +199,10 @@ const handlingRestart = (r) =>
   ['terminated', 'detached', 'ended'].includes(r?.status) ||
   (r?.restartable ?? (r?.status === 'failed' && (r.rounds || []).every((x) => x.not_submitted)));
 const handlingButton = (id) => {
+  if (handlingStarting.has(id)) return 'AI 处置中';
   const r = taskRun(id);
   return r && !handlingRestart(r)
-    ? 'AI 处置 / 追问'
+    ? (handlingActive({...r,status:handlingState(r)}) ? 'AI 处置中' : 'AI 处置 / 追问')
     : taskRuns(id).length
       ? '重新处置'
       : 'AI一键处置';
@@ -209,35 +210,36 @@ const handlingButton = (id) => {
 let handlingProposal = null, handlingProjects = [];
 const handlingDrafts = new Map(),
   handlingErrors = new Map(),
-  handlingComposers = new Set(),
   handlingSending = new Set(),
   handlingStarting = new Set();
+function handlingEndedSummary(t) {
+  const r = taskRun(t.id);
+  return r && ['terminated','detached','ended'].includes(r.status)
+    ? `<section class="handling-terminated"><span class="helper">本次处置已结束，可重新发起。</span><button class="quiet" data-handle="history" data-task-id="${esc(t.id)}">查看上次过程</button></section>` : '';
+}
 function handlingPanel(t) {
   const r = taskRun(t.id);
   if (!r) return '';
-  if (['terminated', 'detached', 'ended'].includes(r.status))
-    return `<section class="handling-terminated"><span class="helper">本次处置已结束，可重新发起。</span><button class="quiet" data-handle="history" data-task-id="${esc(t.id)}">查看上次过程</button></section>`;
   const desktop = handlingDesktop(r),
-    last = r.rounds?.at(-1),
     waiting =
       r.waiting_on === 'approval'
         ? '等待审批，请在 Codex 处理'
         : r.waiting_on === 'input'
           ? '等待你在 Codex 回答'
-          : null;
-  return `<section class="handling-panel">
- <div class="handling-heading"><h3>AI一键处置</h3><span class="helper handling-source">${esc(r.project_name)} · ${esc(aiModelLabel({ model: r.model_reported === false ? '模型未知' : r.model, source: r.connection ? { driver: r.connection.driver, connection_name: r.connection.name } : null }))}</span><span class="badge ${handlingState(r) === 'completed' ? 'green' : 'blue'}">${esc(waiting || handlingLabels[handlingState(r)] || handlingState(r))}</span></div>
- ${r.error ? `<div class="error-box">${esc(r.error)}</div>` : ''}${handlingLivePanel(r)}${handlingConclusion(t.id, r) || (handlingState(r) === 'completed' ? '<p class="helper">本轮结束但没有最终文字结论，可在相应客户端查看或继续追问。</p>' : '')}
- <div class="handling-actions"><div class="handling-actions-left">
- ${r.thread_id && desktop ? `<button data-handle="open" data-task-id="${esc(t.id)}">在 Codex 客户端打开</button>` : ''}
- <button class="quiet" data-handle="history" data-task-id="${esc(t.id)}">过程与上下文查询</button><button data-handle="sync" data-task-id="${esc(t.id)}">同步状态</button>
- ${(!desktop || !r.thread_id) && ['uncertain', 'disconnected', 'starting', 'submitting'].includes(r.status) ? `<button data-handle="reconnect" data-task-id="${esc(t.id)}">恢复同步</button>` : ''}
- ${!desktop && r.requests?.length ? `<button class="primary" data-handle="requests" data-task-id="${esc(t.id)}">处理请求 (${r.requests.length})</button>` : ''}
- </div><div class="handling-actions-right"><button data-handle="terminate" data-task-id="${esc(t.id)}" data-run-id="${esc(r.id)}" ${desktop ? 'title="结束后拾事不再同步，Codex 继续运行"' : ''}>${desktop ? '结束本次处置' : r.status === 'stopping' ? '重试终止' : handlingActive(r) ? '终止 AI 处置' : '结束本次处置'}</button>
- <button data-handle="followup" data-task-id="${esc(t.id)}" aria-expanded="${handlingComposers.has(t.id)}">${handlingComposers.has(t.id) ? '收起追问 ▴' : '↳ 继续追问 ▾'}</button></div></div>
- ${handlingComposer(t.id)}</section>`;
+          : r.waiting_on === 'sync' ? '同步暂不可用' : null,
+    status=waiting||(handlingState(r)==='inProgress'?'':handlingLabels[handlingState(r)]||handlingState(r));
+  return `<section class="handling-panel handling-conversation">
+ <header class="handling-heading"><div class="handling-heading-main"><h3 id="handling-window-title">${esc(t.title)}</h3><span class="helper handling-source">AI 处置 · ${esc(r.project_name)} · ${esc(r.connection?.name || (desktop?'Codex':'来源未记录'))}</span></div><div class="handling-heading-actions">${status?`<span class="handling-state-label" role="status">${esc(status)}</span>`:''}
+ ${r.thread_id&&desktop?`<button class="quiet handling-open" data-handle="open" data-task-id="${esc(t.id)}">在 Codex 打开 ↗</button>`:''}
+ <details class="handling-more"><summary aria-label="更多处置操作">•••</summary><div>
+ <button class="quiet" data-handle="sync" data-task-id="${esc(t.id)}">同步状态</button>
+ ${(!desktop||!r.thread_id)&&['uncertain','disconnected','starting','submitting'].includes(r.status)?`<button class="quiet" data-handle="reconnect" data-task-id="${esc(t.id)}">恢复同步</button>`:''}
+ <button class="quiet" data-handle="terminate" data-task-id="${esc(t.id)}" data-run-id="${esc(r.id)}" ${desktop?'title="结束后拾事不再同步，Codex 继续运行"':''}>${desktop?'结束本次处置':r.status==='stopping'?'重试终止':handlingActive(r)?'终止 AI 处置':'结束本次处置'}</button>
+ </div></details><button class="quiet handling-window-close" data-handling-close aria-label="关闭 AI 处置页面">×</button></div></header>
+ ${!desktop&&r.requests?.length?`<button class="primary" data-handle="requests" data-task-id="${esc(t.id)}">处理请求 (${r.requests.length})</button>`:''}
+ ${r.error?`<div class="error-box">${esc(r.error)}</div>`:''}${r.sync_notice?`<div class="helper handling-sync-notice">${esc(r.sync_notice)}</div>`:''}${handlingLivePanel(r)}<div id="handling-dock" class="handling-dock">${handlingRestart(r)?'<p class="helper">本次处置已结束，可在事项中重新发起。</p>':handlingComposer(t.id)}</div></section>`;
 }
-async function beginHandling(id, choose = false) {
+async function beginHandling(id) {
   if (handlingStarting.has(id)) {
     toast('正在创建处置，请稍候');
     return;
@@ -282,15 +284,24 @@ function handlingComposerHost(id) {
     (el) => el.dataset.composerTask === id,
   );
 }
+function handlingModelCaption(run) {
+  const previous=run?.model_reported===false&&run?.last_reported_model;
+  let model=run?.model_reported===false?(previous||'模型未报告'):run?.model||'模型未报告';
+  try{const route=JSON.parse(model);if(Array.isArray(route)&&route.length===2)model=route.join(' / ');}catch{}
+  const reportedEffort=run?.model_reported===false?(previous?run.last_reported_effort:''):run?.effort;
+  const effort=({none:'无',minimal:'最低',low:'低',medium:'中',high:'高',xhigh:'很高',max:'最高',ultra:'最高'})[reportedEffort]||reportedEffort;
+  return model+(previous?'（上次报告）':'')+(effort?' · '+effort:'');
+}
 function updateHandlingSending(id) {
   const host = handlingComposerHost(id);
   if (!host) return;
   const sending = handlingSending.has(id);
   host.querySelector('textarea').disabled = sending;
+  const button=host.querySelector('[data-handle=send]');
+  if(button)button.disabled=sending||!host.querySelector('textarea').value.trim();
   host.setAttribute('aria-busy', String(sending));
 }
 function handlingComposer(id) {
-  if (!handlingComposers.has(id)) return '';
   const r = taskRun(id),
     sending = handlingSending.has(id),
     savedError = handlingErrors.get(id),
@@ -298,7 +309,7 @@ function handlingComposer(id) {
       savedError?.run_id === r?.id && savedError?.thread_id === r?.thread_id
         ? savedError.message
         : '';
-  return `<div class="handling-composer" data-composer-task="${esc(id)}" data-run-id="${esc(r?.id)}" data-thread-id="${esc(r?.thread_id)}" aria-busy="${sending}"><textarea rows="1" id="handling-question" aria-label="继续追问当前 AI" maxlength="6000" ${sending ? 'disabled' : ''} placeholder="补充线索、纠正判断，或明确要求修复…">${esc(handlingDrafts.get(id) || '')}</textarea><div class="error-box" id="handling-inline-error" ${error ? '' : 'hidden'}>${esc(error)}</div></div>`;
+  return `<div class="handling-composer" data-composer-task="${esc(id)}" data-run-id="${esc(r?.id)}" data-thread-id="${esc(r?.thread_id)}" aria-busy="${sending}"><textarea rows="1" id="handling-question" aria-label="继续追问当前 AI" maxlength="6000" ${sending ? 'disabled' : ''} placeholder="补充线索，或继续追问…">${esc(handlingDrafts.get(id) || '')}</textarea><div class="handling-composer-meta"><span class="handling-composer-model">${esc(handlingModelCaption(r))}</span><button class="handling-send" data-handle="send" data-task-id="${esc(id)}" aria-label="发送追问" title="发送追问" ${sending || !handlingDrafts.get(id)?.trim() ? 'disabled' : ''}>↑</button></div><div class="error-box" id="handling-inline-error" ${error ? '' : 'hidden'}>${esc(error)}</div></div>`;
 }
 async function sendHandlingQuestion(id) {
   if (handlingSending.has(id)) return;
@@ -320,9 +331,11 @@ async function sendHandlingQuestion(id) {
       host.querySelector('.error-box').hidden = true;
       updateHandlingSending(id);
       const reply = await rpc('handling_followup', target);
-      handlingDrafts.delete(id);
-      handlingComposers.delete(id);
-      handlingComposerHost(id)?.remove();
+      const current=handlingComposerHost(id);
+      if (taskRun(id)?.id===identity.run_id && taskRun(id)?.thread_id===identity.thread_id && (handlingDrafts.get(id)||question).trim()===question) {
+        handlingDrafts.delete(id);
+        if(current?.dataset.runId===identity.run_id && current?.dataset.threadId===identity.thread_id) {current.querySelector("textarea").value="";resizeHandlingComposer(current.querySelector("textarea"));}
+      }
       await refreshState(true);
       toast(reply?.steered ? '已插话到当前任务' : '已发送到原会话');
     } finally {
@@ -350,17 +363,14 @@ async function sendHandlingQuestion(id) {
   }
 }
 function handlingFollowup(id) {
-  const r = taskRun(id);
-  if (!r) return;
-  if (handlingComposers.has(id)) handlingComposers.delete(id);
-  else handlingComposers.add(id);
-  renderDetail();
-  if (handlingComposers.has(id)) {
-    const field = $('#handling-question');
-    field?.focus();
-    field?.scrollIntoView({ block: 'nearest' });
-  }
+  openHandlingWindow(id);
 }
+
+document.addEventListener('click',e=>{
+  for(const menu of document.querySelectorAll('.handling-more[open]')) {
+    if(!menu.contains(e.target) || e.target.closest('[data-handle]'))menu.open=false;
+  }
+});
 function resizeHandlingComposer(field) {
   if (!field) return;
   const previous = field.scrollTop;
@@ -368,6 +378,7 @@ function resizeHandlingComposer(field) {
   field.style.height = Math.max(40, Math.min(field.scrollHeight, 160)) + 'px';
   field.style.overflowY = field.scrollHeight > 160 ? 'auto' : 'hidden';
   field.scrollTop = previous;
+
 }
 function resizeHandlingComposers() {
   document.querySelectorAll('#handling-question').forEach(resizeHandlingComposer);
@@ -376,7 +387,9 @@ document.addEventListener('input', (e) => {
   if (e.target.id === 'handling-question') {
     const id = e.target.closest('[data-composer-task]').dataset.composerTask;
     handlingDrafts.set(id, e.target.value);
+    updateHandlingSending(id);
     resizeHandlingComposer(e.target);
+    resizeHandlingStreams();
   }
 });
 document.addEventListener('keydown', (e) => {
@@ -496,16 +509,21 @@ document.addEventListener('click', async (e) => {
           stop_previous: !!$('#handling-stop-previous')?.checked,
         };
         handlingStarting.add(id);
+        if (page === 'tasks' && selected === id) renderDetail();
         closeModal();
         try {
           await rpc('handling_start', params);
           await refreshState(true);
-          toast('已开始调查，持续同步进展');
+          openHandlingWindow(id);
+          toast('已开始调查');
         } finally {
           handlingStarting.delete(id);
         }
         break;
       }
+      case 'send':
+        await sendHandlingQuestion(id);
+        break;
       case 'followup':
         handlingFollowup(id);
         break;
@@ -525,7 +543,7 @@ document.addEventListener('click', async (e) => {
         await rpc('handling_reset_setup', { task_id: id, confirmed_no_thread: true });
         closeModal();
         await refreshState(true);
-        await beginHandling(id, true);
+        await beginHandling(id);
         break;
       case 'attach':
         await rpc('handling_reconnect', { task_id: id, thread_id: $('#handling-thread-id').value });
@@ -546,7 +564,6 @@ document.addEventListener('click', async (e) => {
       case 'terminate':
         try {
           await rpc('handling_terminate', { task_id: id, run_id: b.dataset.runId });
-          handlingComposers.delete(id);
           toast(
             handlingDesktop(taskRun(id))
               ? '本次处置已结束，Codex 继续运行'

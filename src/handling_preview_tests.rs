@@ -31,9 +31,23 @@ fn text_previews_are_live_without_saves_and_terminal_commit_keeps_all_text() {
         .unwrap();
     }
     assert_eq!(app.saves_revision(), saves);
+    let revision = app
+        .handling_preview_revision
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(!app.update_run_inner("run", true, |_| {}).unwrap());
+    assert_eq!(
+        app.handling_preview_revision
+            .load(std::sync::atomic::Ordering::SeqCst),
+        revision
+    );
+    // A durable call must still flush an existing preview even if its closure
+    // changes nothing; only a fully unchanged durable run is a no-op.
+    assert!(app.update_run_inner("run", false, |_| {}).unwrap());
+    assert!(!app.update_run_inner("run", false, |_| {}).unwrap());
+    let saves = app.saves_revision();
     assert_eq!(
         app.state.lock().unwrap().handling.runs[0].rounds[0].steps[0]["text"],
-        ""
+        "First and second"
     );
     let live = app.snapshot_page(Some("tasks"));
     assert_eq!(

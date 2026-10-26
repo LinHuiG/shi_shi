@@ -48,7 +48,7 @@ pub struct HandlingState {
     pub proposals: Vec<Proposal>,
     pub runs: crate::shared::Shared<Vec<Run>>,
 }
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct Round {
     pub not_submitted: bool,
@@ -70,7 +70,7 @@ pub struct Round {
     pub conclusion: String,
     pub created: i64,
 }
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct Supplement {
     pub id: String,
@@ -78,7 +78,7 @@ pub struct Supplement {
     pub accepted: bool,
     pub not_submitted: bool,
 }
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct Run {
     pub model_reported: Option<bool>,
@@ -98,6 +98,9 @@ pub struct Run {
     pub status: String,
     pub progress: String,
     pub error: String,
+    pub sync_notice: String,
+    pub last_reported_model: String,
+    pub last_reported_effort: String,
     pub model: String,
     pub effort: String,
     pub policy_version: String,
@@ -294,7 +297,7 @@ fn apply_usage_event(run: &mut Run, event: &ai_backend::UsageEvent) {
         }
     }
 }
-fn active(r: &Run) -> bool {
+pub(crate) fn active(r: &Run) -> bool {
     matches!(
         r.status.as_str(),
         "starting"
@@ -411,14 +414,14 @@ impl App {
             .ok_or_else(|| "该处置记录缺少连接快照，请重新开始处置".into())
     }
     fn update_run(&self, id: &str, apply: impl FnOnce(&mut Run)) -> Result<(), String> {
-        self.update_run_inner(id, false, apply)
+        self.update_run_inner(id, false, apply).map(|_| ())
     }
     fn update_run_inner(
         &self,
         id: &str,
         preview: bool,
         apply: impl FnOnce(&mut Run),
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut lock = self.state.lock().unwrap();
         let durable = lock
             .handling
@@ -432,6 +435,9 @@ impl App {
         let before = self.preview_run(durable);
         let mut after = before.clone();
         apply(&mut after);
+        if after == before && (preview || after == *durable) {
+            return Ok(false);
+        }
         after.updated = now().max(durable.updated + 1);
         if preview && business_run(&before) == business_run(&after) {
             self.handling_previews.lock().unwrap().insert(
@@ -443,7 +449,7 @@ impl App {
             );
             self.handling_preview_revision
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Ok(());
+            return Ok(true);
         }
         let mut next = lock.clone();
         *next.handling.runs.iter_mut().find(|r| r.id == id).unwrap() = after.clone();
@@ -497,7 +503,7 @@ impl App {
         for (kind, detail) in logs {
             self.log(kind, detail);
         }
-        Ok(())
+        Ok(true)
     }
     fn run(&self, task: &str) -> Result<Run, String> {
         let connection = match self.handling_connection() {
@@ -2018,6 +2024,7 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                 .filter(|v| *v >= 0)
         });
         let previous_steps = std::mem::take(&mut r.steps);
+        let previous_ids: Vec<Value> = previous_steps.iter().map(|s| s["id"].clone()).collect();
         r.steps = turn["items"]
             .as_array()
             .into_iter()
@@ -2025,7 +2032,7 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
             .filter_map(process_step)
             .take(200)
             .collect();
-        if r.status == "inProgress" {
+        if r.status == "inProgress" || turn["_shishi_partial"] == true {
             for previous in previous_steps {
                 if let Some(step) = r.steps.iter_mut().find(|s| s["id"] == previous["id"]) {
                     let old = str_at(&previous, "text");
@@ -2037,6 +2044,14 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                     r.steps.push(previous);
                 }
             }
+        }
+        if turn["_shishi_partial"] == true {
+            r.steps.sort_by_key(|s| {
+                previous_ids
+                    .iter()
+                    .position(|id| *id == s["id"])
+                    .unwrap_or(usize::MAX)
+            });
         }
         if r.status != "completed" {
             r.conclusion.clear();
@@ -2083,12 +2098,18 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                     .join("\n");
             }
             if r.status == "completed" {
-                r.conclusion = items
+                let conclusion = items
                     .iter()
                     .filter(|i| i["type"] == "agentMessage" && i["phase"] != "commentary")
                     .filter_map(|i| i["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n");
+                if turn["_shishi_partial"] != true
+                    || !r.conclusion.starts_with(&conclusion)
+                    || conclusion.len() >= r.conclusion.len()
+                {
+                    r.conclusion = conclusion;
+                }
             }
         }
         if r.learning_fingerprint.is_empty()

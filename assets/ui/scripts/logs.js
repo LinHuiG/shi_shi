@@ -34,7 +34,6 @@ const fieldNames = {
   status: '状态',
   blocker: '阻塞点',
   waiting_for: '等待对象',
-  next_step: '下一步',
   due: '截止时间',
   enabled: '自动扫描',
   interval_minutes: '扫描间隔',

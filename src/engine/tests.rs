@@ -24,7 +24,7 @@ mod change_summary_tests {
             title: "合成验证事项".into(),
             description: "核对合成结果".into(),
             status: "待处理".into(),
-            next_step: "准备验证".into(),
+            waiting_for: "准备验证".into(),
             updated: 10,
             evidence: TaskEvidence {
                 direct: vec!["old".into()],
@@ -39,7 +39,7 @@ mod change_summary_tests {
 
     fn update() -> Value {
         json!({"action":"update","task_id":"task","sources":["new"],"tags":[],
-            "fields":[{"field":"next_step","value":"核对验证结果"}],
+            "fields":[{"field":"waiting_for","value":"核对验证结果"}],
             "reason":"新消息明确下一步","confidence":0.99,"change_summary":"已进入结果核对阶段"})
     }
 
@@ -124,7 +124,7 @@ mod change_summary_tests {
         let mut state = fixture();
         let action = update();
         assert_eq!(apply(&mut state, &[action.clone()]).0, 1);
-        assert_eq!(state.tasks[0].next_step, "核对验证结果");
+        assert_eq!(state.tasks[0].waiting_for, "核对验证结果");
         assert_eq!(state.audit[0].kind, "ai_update");
         assert_eq!(
             state.audit[0].change_summary,
@@ -184,7 +184,7 @@ mod change_summary_tests {
                 .unwrap()
                 .push(json!({"field":field,"value":value}));
             assert_eq!(apply(&mut state, &[action]).0, 1);
-            assert_eq!(state.tasks[0].next_step, "核对验证结果");
+            assert_eq!(state.tasks[0].waiting_for, "核对验证结果");
             assert_eq!(state.tasks[0].status, "待处理");
             assert!(state.tasks[0].due.is_empty());
             assert!(state.audit[0].change_summary.is_empty(), "{field}/{value}");
@@ -242,7 +242,7 @@ mod change_summary_tests {
             }
             let applied = apply(&mut state, &[action]).0;
             assert_eq!(applied, usize::from(source != "old"));
-            assert_eq!(state.tasks[0].next_step, "准备验证");
+            assert_eq!(state.tasks[0].waiting_for, "准备验证");
             assert!(state.audit.iter().all(|row| row.change_summary.is_empty()));
             if source == "older" {
                 assert_eq!(state.audit[0].kind, "ai_evidence");
@@ -271,7 +271,7 @@ mod change_summary_tests {
         action["fields"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"field":"next_step","value":"核对验证结果"}));
+            .push(json!({"field":"waiting_for","value":"核对验证结果"}));
         assert_eq!(apply(&mut state, &[action]).0, 1);
         assert_eq!(state.tasks.len(), 1);
         assert_eq!(state.audit[0].kind, "ai_update");
@@ -639,7 +639,7 @@ mod tests {
             .create_generation(&json!({"text":"新增客户查询需求，并调研缓存优化"}))
             .unwrap();
         assert_eq!(draft.generation, "pending");
-        app.complete_generation(&draft,Ok(json!({"tasks":[{"title":"客户查询需求","category":"新需求","environment":"不适用","steps_changed":true,"steps":[{"id":"s1","title":"确认需求","status":"pending","depends_on":[],"waiting_for":"","next_step":"等待回复"}]},{"title":"缓存优化调研","category":"调研","environment":"不适用"}]}))).unwrap();
+        app.complete_generation(&draft,Ok(json!({"tasks":[{"title":"客户查询需求","category":"新需求","environment":"不适用","steps_changed":true,"steps":[{"id":"s1","title":"确认需求","status":"pending","depends_on":[],"waiting_for":""}]},{"title":"缓存优化调研","category":"调研","environment":"不适用"}]}))).unwrap();
         {
             let s = app.state.lock().unwrap();
             assert_eq!(s.tasks.len(), 2);
@@ -1699,7 +1699,7 @@ mod evidence_identity_tests {
             ..Default::default()
         });
         let allowed = s.messages.clone();
-        let mut action = json!({"action":"create","sources":["old","new"],"completion_evidence":["new"],"fields":[{"field":"title","value":"模型标题"},{"field":"status","value":"已完成"}],"reason":"回复证据","confidence":0.8,"tags":[],"steps_changed":true,"steps":[{"id":"next","title":"下一步","status":"pending","depends_on":["confirmed"],"waiting_for":"","next_step":""}]});
+        let mut action = json!({"action":"create","sources":["old","new"],"completion_evidence":["new"],"fields":[{"field":"title","value":"模型标题"},{"field":"status","value":"已完成"}],"reason":"回复证据","confidence":0.8,"tags":[],"steps_changed":true,"steps":[{"id":"next","title":"下一步","status":"pending","depends_on":["confirmed"],"waiting_for":""}]});
         let versions = BTreeMap::from([("t".into(), 100)]);
         let (applied, retry) =
             App::apply_actions_detailed(&mut s, &[action.clone()], &allowed, &versions, &catalog())

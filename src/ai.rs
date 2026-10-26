@@ -52,13 +52,12 @@ pub fn schema(kind: &str) -> Value {
                 "status",
                 "blocker",
                 "waiting_for",
-                "next_step",
                 "due",
             ] {
                 f["properties"].as_object_mut().unwrap().remove(key);
                 f["required"].as_array_mut().unwrap().retain(|v| v != key);
             }
-            f["properties"]["fields"] = json!({"type":"array","maxItems":12,"items":{"type":"object","additionalProperties":false,"properties":{"field":{"type":"string","enum":["title","description","summary","status","blocker","waiting_for","next_step","due"]},"value":{"type":"string","maxLength":600}},"required":["field","value"]}});
+            f["properties"]["fields"] = json!({"type":"array","maxItems":12,"items":{"type":"object","additionalProperties":false,"properties":{"field":{"type":"string","enum":["title","description","summary","status","blocker","waiting_for","due"]},"value":{"type":"string","maxLength":600}},"required":["field","value"]}});
             f["required"].as_array_mut().unwrap().push(json!("fields"));
             f["properties"]["action"] = json!({"type":"string","enum":["create","update"]});
             f["properties"]["reason"] = json!({"type":"string","maxLength":160});
@@ -138,7 +137,7 @@ fn base_schema(kind: &str) -> Value {
         return json!({"type":"object","additionalProperties":false,"properties":{"improved":{"type":"boolean"},"reason":text(),"proposed_prompt":text(),"evidence_ids":{"type":"array","items":text()}},"required":["improved","reason","proposed_prompt","evidence_ids"]});
     }
     if kind == "edit" {
-        return json!({"type":"object","additionalProperties":false,"properties":{"reason":text(),"changes":{"type":"array","maxItems":11,"items":{"type":"object","additionalProperties":false,"properties":{"field":{"type":"string","enum":["title","description","status","blocker","waiting_for","next_step","due"]},"value":text()},"required":["field","value"]}}},"required":["reason","changes"]});
+        return json!({"type":"object","additionalProperties":false,"properties":{"reason":text(),"changes":{"type":"array","maxItems":11,"items":{"type":"object","additionalProperties":false,"properties":{"field":{"type":"string","enum":["title","description","status","blocker","waiting_for","due"]},"value":text()},"required":["field","value"]}}},"required":["reason","changes"]});
     }
     if kind == "archive" || kind == "schedule" {
         let fields = json!({"title":text(),"description":text(),"frequency":{"type":"string","enum":["daily","weekly",""]},"weekdays":{"type":"array","items":{"type":"integer","minimum":1,"maximum":7}},"time":text()});
@@ -154,7 +153,7 @@ fn base_schema(kind: &str) -> Value {
         return json!({"type":"object","additionalProperties":false,"properties":{"summary":text(),"completed":{"type":"array","items":text()},"attention":{"type":"array","items":text()},"next_steps":{"type":"array","items":text()}},"required":["summary","completed","attention","next_steps"]});
     }
     if kind == "format" {
-        let fields = json!({"title":text(),"description":text(),"blocker":text(),"next_step":text(),"due":text()});
+        let fields = json!({"title":text(),"description":text(),"blocker":text(),"due":text()});
         let required = fields
             .as_object()
             .unwrap()
@@ -166,7 +165,7 @@ fn base_schema(kind: &str) -> Value {
     if kind == "learning" {
         return json!({"type":"object","additionalProperties":false,"properties":{"suggestions":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"suggestion_id":text(),"title":text(),"rule":text(),"evidence":{"type":"array","items":{"type":"integer"}}},"required":["suggestion_id","title","rule","evidence"]}}},"required":["suggestions"]});
     }
-    let props = json!({"action":text(),"task_id":text(),"title":text(),"description":text(),"status":text(),"blocker":text(),"waiting_for":text(),"next_step":text(),"due":text(),"reason":text(),"confidence":{"type":"number"},"sources":{"type":"array","items":text()},"background_evidence":{"type":"array","items":text()},"completion_evidence":{"type":"array","items":text()},"deadline_evidence":{"type":"array","items":text()}});
+    let props = json!({"action":text(),"task_id":text(),"title":text(),"description":text(),"status":text(),"blocker":text(),"waiting_for":text(),"due":text(),"reason":text(),"confidence":{"type":"number"},"sources":{"type":"array","items":text()},"background_evidence":{"type":"array","items":text()},"completion_evidence":{"type":"array","items":text()},"deadline_evidence":{"type":"array","items":text()}});
     let required = props
         .as_object()
         .unwrap()
@@ -351,6 +350,18 @@ fn system_segment(config: &Config, kind: &str, payload: &Value) -> String {
     } else {
         effective_policy(config, kind).trim().to_string()
     };
+    if ["classify", "format", "edit"].contains(&kind) {
+        text = text
+            .replace("，next_step写等待答复或适当跟进", "")
+            .replace("tags、blocker、next_step", "tags、blocker")
+            .replace("未提供日期、阻塞、下一步则留空", "未提供日期、阻塞则留空")
+            .replace(
+                "可把blocker/waiting_for清空并更新下一步",
+                "可把blocker/waiting_for清空",
+            );
+        text.push_str("\n\n");
+        text.push_str(crate::prompt_config::get("task_fields"));
+    }
     if ["classify", "format", "edit", "schedule", "learning"].contains(&kind) {
         text.push_str("\n\n");
         text.push_str(crate::prompt_config::get("tags"));
@@ -1118,6 +1129,16 @@ mod prompt_tests {
         c.classify_prompt = "自定义规则".into();
         assert_eq!(effective_policy(&c, "classify"), "自定义规则");
         assert_eq!(effective_policy(&c, "format"), default_policy("format"));
+        let old_policy = "自定义规则保持。tags、blocker、next_step；未提供日期、阻塞、下一步则留空。可把blocker/waiting_for清空并更新下一步。";
+        c.classify_prompt = old_policy.into();
+        let prepared = system_segment(&c, "classify", &json!({}));
+        assert!(prepared.contains("自定义规则保持。"));
+        assert!(!prepared.contains("tags、blocker、next_step"));
+        assert!(!prepared.contains("未提供日期、阻塞、下一步则留空"));
+        assert!(!prepared.contains("清空并更新下一步"));
+        assert!(prepared.contains(crate::prompt_config::get("task_fields")));
+        assert_eq!(c.classify_prompt, old_policy);
+        assert!(!default_policy("edit").contains("并更新下一步"));
     }
     #[test]
     fn disabled_tracing_writes_no_error_or_trace_files_and_old_traces_are_pruned() {

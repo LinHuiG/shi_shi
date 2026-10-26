@@ -107,6 +107,14 @@ impl App {
         snapshot["build_time"] = json!(crate::updates::build_time());
         snapshot["updates"] = self.updates.snapshot();
         let task_numbers = &s.task_numbers;
+        let mut change_counts = std::collections::BTreeMap::<&str, usize>::new();
+        for row in s
+            .audit
+            .iter()
+            .filter(|a| !a.kind.starts_with("archive_memory"))
+        {
+            *change_counts.entry(&row.task_id).or_default() += 1;
+        }
         let tool_tasks = s
             .tool_runs
             .iter()
@@ -115,6 +123,10 @@ impl App {
             .filter(|id| !id.is_empty())
             .collect::<BTreeSet<_>>();
         for task in snapshot["tasks"].as_array_mut().unwrap() {
+            task["change_count"] = json!(change_counts
+                .get(task["id"].as_str().unwrap_or(""))
+                .copied()
+                .unwrap_or(0));
             task["number"] = json!(task_numbers.get(task["id"].as_str().unwrap_or("")));
             task["has_tool_calls"] = json!(tool_tasks.contains(task["id"].as_str().unwrap_or("")));
         }

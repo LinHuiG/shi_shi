@@ -1,6 +1,50 @@
 use super::*;
 use crate::model::{State, Task};
 
+#[test]
+fn restart_gate_uses_current_local_handling_states_and_excludes_desktop_ownership() {
+    let root = std::env::temp_dir().join(format!("shishi-restart-gate-{}", crate::model::id()));
+    let app = App::load(root.clone()).unwrap();
+    for status in [
+        "starting",
+        "submitting",
+        "inProgress",
+        "waiting",
+        "uncertain",
+        "disconnected",
+        "stopping",
+    ] {
+        let mut run = crate::handling::Run {
+            status: status.into(),
+            connection: Some(crate::ai_backend::Connection {
+                driver: "dsh".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        app.state.lock().unwrap().handling.runs = vec![run.clone()].into();
+        assert!(!app.storage_ready(), "local {status} must block restart");
+        run.stop_requested = true;
+        app.state.lock().unwrap().handling.runs = vec![run.clone()].into();
+        assert!(app.storage_ready());
+        run.stop_requested = false;
+        run.connection.as_mut().unwrap().driver = "codex".into();
+        app.state.lock().unwrap().handling.runs = vec![run.clone()].into();
+        assert!(
+            app.storage_ready(),
+            "desktop {status} does not own a local worker"
+        );
+    }
+    app.state.lock().unwrap().handling.runs = vec![crate::handling::Run {
+        status: "completed".into(),
+        ..Default::default()
+    }]
+    .into();
+    assert!(app.storage_ready());
+    drop(app);
+    fs::remove_dir_all(root).unwrap();
+}
+
 struct Fixture {
     base: PathBuf,
     root: PathBuf,

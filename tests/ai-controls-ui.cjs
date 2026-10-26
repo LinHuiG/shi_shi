@@ -84,7 +84,7 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     await page.waitForFunction(()=>fixture.pending===1);
     await page.locator('#backlog-panel').waitFor({state:'detached'});
     assert.equal(await page.evaluate(()=>fixture.config.analysis_lookback_hours??24),24);
-    await page.evaluate(async()=>{const t={id:'task',title:'筛选测试',description:'正文',status:'待处理',priority:'普通',environment:'不适用',category:'问题排查',sources:[],tags:[],blocker:'等待验证',due:'',waiting_for:'',next_step:'',updated:1,created:1};fixture.tasks=[t];tab='待处理';quickView='blocked';query='筛选';page='tasks';await refreshState(true);});
+    await page.evaluate(async()=>{const t={id:'task',title:'筛选测试',description:'正文',status:'待处理',priority:'普通',environment:'不适用',category:'问题排查',sources:[],tags:[],blocker:'等待验证',due:'',waiting_for:'',updated:1,created:1};fixture.tasks=[t];tab='待处理';quickView='blocked';query='筛选';page='tasks';await refreshState(true);});
     for(const action of ['save-task','ai-edit-task']){
       await page.locator('[data-action="edit"]').click();
       assert.equal(await page.locator('#f-env').count(),0,'environment selector removed');

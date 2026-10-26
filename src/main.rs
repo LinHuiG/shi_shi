@@ -171,6 +171,7 @@ fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
         "connection_delete" => app.delete_connection(p),
         "activity_query" => app.activity_query(p),
         "task_changes" => app.task_changes(p),
+        "evidence_query" => app.evidence_query(p),
         "update_check" => crate::updates::check(app.clone(), false),
         "update_install" => crate::updates::install(app, p["scheduled"].as_str()),
         "about_open" => crate::updates::open_link(p["target"].as_str().unwrap_or("")),

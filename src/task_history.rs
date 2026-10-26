@@ -96,7 +96,6 @@ pub fn matches(row: &Value, terms: &[String]) -> bool {
         ("status", "状态"),
         ("priority", "优先级"),
         ("tags", "标签"),
-        ("next_step", "下一步"),
         ("blocker", "阻塞"),
         ("waiting_for", "等待对象"),
         ("due", "截止时间"),
@@ -114,7 +113,6 @@ pub fn matches(row: &Value, terms: &[String]) -> bool {
         "status",
         "priority",
         "tags",
-        "next_step",
         "blocker",
         "waiting_for",
         "due",
@@ -144,14 +142,48 @@ pub fn matches(row: &Value, terms: &[String]) -> bool {
     })
 }
 impl App {
+    pub fn evidence_query(&self, p: &Value) -> Result<Value, String> {
+        let id = p["id"].as_str().ok_or("缺少事项编号")?;
+        let terms = terms(p)?;
+        let (since, until) = record_range(p)?;
+        let ascending = record_ascending(p)?;
+        if !self.state.lock().unwrap().tasks.iter().any(|t| t.id == id) {
+            return Err("事项不存在".into());
+        }
+        let mut rows = self.evidence(id).as_array().cloned().unwrap_or_default();
+        let all = rows.len();
+        rows.retain(|m| {
+            let time = m["time"].as_i64().unwrap_or(0);
+            let text = ["text", "sender", "group", "chat", "source_name"]
+                .iter()
+                .filter_map(|k| m[*k].as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase();
+            time >= since && time <= until && terms.iter().all(|t| text.contains(t))
+        });
+        rows.sort_by(|a, b| {
+            let order = a["time"]
+                .as_i64()
+                .cmp(&b["time"].as_i64())
+                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()));
+            if ascending {
+                order
+            } else {
+                order.reverse()
+            }
+        });
+        let total = rows.len();
+        let pages = total.div_ceil(50).max(1);
+        let page = (p["page"].as_u64().unwrap_or(1) as usize).clamp(1, pages);
+        let rows: Vec<_> = rows.into_iter().skip((page - 1) * 50).take(50).collect();
+        Ok(json!({"rows":rows,"all":all,"total":total,"page":page,"pages":pages}))
+    }
     pub fn task_changes(&self, p: &Value) -> Result<Value, String> {
         let id = p["id"].as_str().ok_or("缺少事项编号")?;
         let terms = terms(p)?;
-        let ascending = match p["sort"].as_str().unwrap_or("desc") {
-            "asc" => true,
-            "desc" => false,
-            _ => return Err("时间排序无效".into()),
-        };
+        let ascending = record_ascending(p)?;
+        let range = record_range(p)?;
         let s = self.state.lock().unwrap();
         if !s.tasks.iter().any(|t| t.id == id) {
             return Err("事项不存在".into());
@@ -164,9 +196,37 @@ impl App {
                 id,
                 terms,
                 ascending,
+                range,
                 p["page"].as_u64().unwrap_or(1).max(1) as usize,
             )
     }
+}
+
+fn record_ascending(p: &Value) -> Result<bool, String> {
+    let sort = match p.get("sort") {
+        None | Some(Value::Null) => "desc",
+        Some(value) => value.as_str().ok_or("时间排序无效")?,
+    };
+    match sort {
+        "asc" => Ok(true),
+        "desc" => Ok(false),
+        _ => Err("时间排序无效".into()),
+    }
+}
+fn record_range(p: &Value) -> Result<(i64, i64), String> {
+    let endpoint = |key: &str, default: i64| match p.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_i64()
+            .filter(|v| *v >= 0)
+            .ok_or("时间区间无效".to_string()),
+    };
+    let since = endpoint("since", 0)?;
+    let until = endpoint("until", i64::MAX)?;
+    if since > until {
+        return Err("开始时间不能晚于结束时间".into());
+    }
+    Ok((since, until))
 }
 
 #[cfg(test)]
@@ -256,6 +316,80 @@ mod tests {
         assert_eq!(rows["total"], 1);
         assert_eq!(rows["rows"][0]["time"], 124);
         assert!(app.task_changes(&json!({"id":"missing"})).is_err());
+        let range = app
+            .task_changes(
+                &json!({"id":"a","since":100,"until":104,"query":"synthetic","sort":"asc"}),
+            )
+            .unwrap();
+        assert_eq!(range["total"], 3);
+        assert_eq!(range["rows"][0]["time"], 100);
+        assert_eq!(range["rows"][2]["time"], 104);
+        assert_eq!(range["all"], 63);
+        for invalid in [
+            json!({"since":12,"until":11}),
+            json!({"since":"bad"}),
+            json!({"until":-1}),
+        ] {
+            let mut request = invalid;
+            request["id"] = json!("a");
+            assert!(app.task_changes(&request).is_err());
+            assert!(app.evidence_query(&request).is_err());
+        }
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn evidence_window_is_scoped_filtered_bounded_and_inclusive() {
+        let root =
+            std::env::temp_dir().join(format!("shishi-record-window-{}", crate::model::id()));
+        let app = App::load(root.clone()).unwrap();
+        {
+            let mut s = app.state.lock().unwrap();
+            let mut task = Task {
+                id: "task".into(),
+                ..Default::default()
+            };
+            for index in 0..120 {
+                let id = format!("message-{index:03}");
+                task.evidence.direct.push(id.clone());
+                task.evidence.background.push(id.clone());
+                s.messages.insert(
+                    id.clone(),
+                    crate::model::Message {
+                        id,
+                        text: "Synthetic needle".into(),
+                        time: index,
+                        withdrawn: index == 10,
+                        ..Default::default()
+                    },
+                );
+            }
+            s.messages.insert(
+                "other".into(),
+                crate::model::Message {
+                    id: "other".into(),
+                    text: "Synthetic needle".into(),
+                    time: 15,
+                    ..Default::default()
+                },
+            );
+            s.tasks.push(task);
+        }
+        let all = app
+            .evidence_query(&json!({"id":"task","sort":"asc"}))
+            .unwrap();
+        assert_eq!(all["all"], 119);
+        assert_eq!(all["rows"].as_array().unwrap().len(), 50);
+        let rows = app
+            .evidence_query(
+                &json!({"id":"task","since":10,"until":12,"query":"SYNTHETIC needle","sort":"asc"}),
+            )
+            .unwrap();
+        assert_eq!(rows["total"], 2);
+        assert_eq!(rows["rows"][0]["time"], 11);
+        assert_eq!(rows["rows"][1]["time"], 12);
+        assert!(app.evidence_query(&json!({"id":"other"})).is_err());
         drop(app);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -228,51 +228,32 @@ impl App {
             let result = self
                 .run_connection(&run)
                 .and_then(|c| self.desktop(&c).read(&run.thread_id));
-            // Read before write; update_run rechecks the durable local end flag.
-            match result {
-                Ok(snapshot) => {
-                    let mut candidate = run.clone();
-                    candidate.error.clear();
-                    apply_desktop_snapshot(&mut candidate, &snapshot);
-                    if json!([
-                        candidate.status,
-                        candidate.model,
-                        candidate.model_reported,
-                        candidate.effort,
-                        candidate.progress,
-                        candidate.rounds,
-                        candidate.waiting_on
-                    ]) != json!([
-                        run.status,
-                        run.model,
-                        run.model_reported,
-                        run.effort,
-                        run.progress,
-                        run.rounds,
-                        run.waiting_on
-                    ]) || !run.error.is_empty()
+            // Success and failure share the same stale-read boundary. Applying
+            // once under the state lock preserves concurrent edits to the run.
+            changed |= self
+                .update_run_inner(&run.id, false, |r| {
+                    if r.input_revision != run.input_revision
+                        || r.thread_id != run.thread_id
+                        || r.status == "submitting"
                     {
-                        let saved = self.update_run(&run.id, |r| {
-                            if r.input_revision == run.input_revision {
-                                r.error.clear();
-                                apply_desktop_snapshot(r, &snapshot);
+                        return;
+                    }
+                    match result {
+                        Ok(snapshot) => {
+                            let before = r.clone();
+                            r.error.clear();
+                            apply_desktop_snapshot(r, &snapshot);
+                            if *r != before {
                                 r.synced = now();
                             }
-                        });
-                        changed |= saved.is_ok();
+                        }
+                        Err(error) => {
+                            r.error = error;
+                            r.waiting_on = "sync".into();
+                        }
                     }
-                }
-                Err(error) => {
-                    if run.error != error {
-                        changed |= self
-                            .update_run(&run.id, |r| {
-                                r.error = error;
-                                r.waiting_on = "sync".into();
-                            })
-                            .is_ok();
-                    }
-                }
-            }
+                })
+                .unwrap_or(false);
             self.desktop_reading.lock().unwrap().remove(&run.id);
         }
         changed
@@ -352,10 +333,26 @@ fn apply_desktop_snapshot(run: &mut Run, snapshot: &Value) {
             }
         }
     }
+    if run.model_reported == Some(true) && run.last_reported_model.is_empty() {
+        run.last_reported_model = run.model.clone();
+        run.last_reported_effort = run.effort.clone();
+    }
     apply_history(run, &turns, &snapshot["thread"]);
+    run.sync_notice = snapshot["read_notice"].as_str().unwrap_or("").into();
     run.rounds
         .sort_by_key(|r| r.started_at.unwrap_or(r.created));
-    run.model_reported = Some(snapshot["thread"]["model"].is_string());
+    let model = snapshot["thread"]["model"]
+        .as_str()
+        .filter(|v| !v.trim().is_empty());
+    let effort = snapshot["thread"]["reasoningEffort"]
+        .as_str()
+        .or_else(|| snapshot["thread"]["effort"].as_str())
+        .unwrap_or("");
+    run.model_reported = Some(model.is_some());
+    if let Some(model) = model {
+        run.last_reported_model = model.into();
+        run.last_reported_effort = effort.into();
+    }
     run.waiting_on = if snapshot["thread"]["status"]["activeFlags"]
         .as_array()
         .is_some_and(|v| v.iter().any(|f| f == "waitingOnApproval"))
@@ -373,12 +370,7 @@ fn apply_desktop_snapshot(run: &mut Run, snapshot: &Value) {
     if !run.waiting_on.is_empty() {
         run.status = "waiting".into();
     }
-    if let Some(effort) = snapshot["thread"]["reasoningEffort"]
-        .as_str()
-        .or_else(|| snapshot["thread"]["effort"].as_str())
-    {
-        run.effort = effort.into();
-    }
+    run.effort = effort.into();
     run.desktop_status = run.status.clone();
 }
 

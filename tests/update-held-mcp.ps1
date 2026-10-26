@@ -45,8 +45,12 @@ try {
     New-Item -ItemType Directory -Path $taskCache -Force | Out-Null
     $taskSentinel=Join-Path $taskData 'synthetic-preserved.txt'
     [IO.File]::WriteAllText($taskSentinel,'Synthetic upgrade preservation')
-    $taskState=Get-Content -LiteralPath (Join-Path $taskData 'state.json') -Raw | ConvertFrom-Json
-    $taskExpectedConfig=$taskState.config | ConvertTo-Json -Depth 50 -Compress
+    $taskFixtureReader=Join-Path $PSScriptRoot 'upgrade-fixture-state.py'
+    $taskExpectedConfig=& python $taskFixtureReader config $taskData
+    if($LASTEXITCODE -ne 0){throw 'Could not read isolated saved configuration'}
+    [IO.File]::WriteAllText((Join-Path $taskRoot 'expected-config.json'),$taskExpectedConfig)
+    & python $taskFixtureReader seed $taskData
+    if($LASTEXITCODE -ne 0){throw 'Could not seed isolated legacy task fields'}
     # The test owner keeps stdin open. These servers are outside the desktop's
     # owned process jobs, as with an external Codex client.
     $taskMcp=Start-Mcp $taskInstall
@@ -95,8 +99,12 @@ try {
     }
     if(!(Test-Path -LiteralPath $taskSmoke) -or !(Get-Content -LiteralPath $taskSmoke -Raw | ConvertFrom-Json).ok){throw 'Updated desktop did not restart successfully'}
     if((Get-Content -LiteralPath $taskSentinel -Raw) -ne 'Synthetic upgrade preservation'){throw 'Saved data changed'}
-    $taskAfter=(Get-Content -LiteralPath (Join-Path $taskData 'state.json') -Raw | ConvertFrom-Json).config | ConvertTo-Json -Depth 50 -Compress
+    $taskAfter=& python $taskFixtureReader config $taskData
+    if($LASTEXITCODE -ne 0){throw 'Could not read upgraded saved configuration'}
+    [IO.File]::WriteAllText((Join-Path $taskRoot 'actual-config.json'),$taskAfter)
     if($taskAfter -ne $taskExpectedConfig){throw 'Saved configuration changed'}
+    & python $taskFixtureReader verify $taskData
+    if($LASTEXITCODE -ne 0){throw 'Legacy task field cleanup or preservation failed'}
     $taskResult=@{target_version=$TargetVersion;held_external_mcp='released';reopened_desktop='blocked without stopping desktop or helpers';unrelated_installation_mcp='still serving';external_owner='preserved';upgrade='passed';saved_data='preserved';saved_configuration='preserved';restart='passed';directory=$taskRoot}
     $taskResult | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Report -Encoding utf8
     $taskResult | ConvertTo-Json -Depth 5

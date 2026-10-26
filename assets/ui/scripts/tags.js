@@ -150,7 +150,7 @@ function tagFilterBar() {
     {
       name: '事项范围',
       key: 'view',
-      values: ['今日事项', '待处理', '已完成', '归档'],
+      values: ['待处理', '已完成', '归档'],
       selected: tab === '全部' ? [] : [tab],
     },
     ...filterGroups().map((g) => ({

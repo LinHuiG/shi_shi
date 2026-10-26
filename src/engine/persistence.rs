@@ -26,7 +26,7 @@ impl App {
                 !run.desktop_control
                     && run.connection.as_ref().is_none_or(|c| c.driver != "codex")
                     && !run.stop_requested
-                    && ["starting", "running", "waiting", "stopping"].contains(&run.status.as_str())
+                    && crate::handling::active(run)
             })
     }
     pub(crate) fn save(&self, s: &State) -> Result<(), String> {

@@ -34,6 +34,7 @@ npm install --prefix <dependency-directory> playwright
 $env:NODE_PATH='<dependency-directory>\node_modules'
 node tests/tool-calling-ui.cjs
 node tests/task-status-menu-ui.cjs
+node tests/task-experience-ui.cjs
 python tests/tool-bridge-native.py --binary target/release/shishi.exe --output build/tool-bridge-native
 node tests/ai-controls-ui.cjs
 node tests/ui-regression.cjs
@@ -61,6 +62,7 @@ node tests/backlog-ui.cjs
 node tests/approval-desktop-ui.cjs
 node tests/handling-reading-ui.cjs
 node tests/reading-motion-ui.cjs
+node tests/handling-tool-groups-ui.cjs
 node tests/todo-refinements-ui.cjs
 node tests/connection-followup-ui.cjs
 node tests/storage-settings-ui.cjs
@@ -84,7 +86,7 @@ UI 测试使用合成数据和模拟 IPC，浏览器无头运行，输出写入�
 
 `tool-calling-ui.cjs` 覆盖全局工具启用、兼容复制及手动复制兜底、受保护的编辑页、记录列表的多关键词搜索／分页、准确条目详情和逐层返回。`task-status-menu-ui.cjs` 覆盖完成按钮的悬停菜单、原状态请求、鼠标间隙、键盘、宽窄布局及减少动态效果。Codex 适配器的合成 CLI 用例只运行本机临时夹具，验证声明工具通过、未声明工具拒绝及工具运行环境错误中止，不调用真实 CLI 模型。
 
-`about-history-ui.cjs` 覆盖关于我们、三个外部入口、标题行更新控件、固定发布于标签及旧安装/更新时间隐藏、检查加载与重复点击、准备完成后的确认与稍后处理、固定事项编号、变更记录查询与排序、空依据禁用、长记录底部收起、宽窄窗口的数据目录布局、系统日志搜索请求和记忆副标题。原生更新助手的隔离验证边界见 [版本更新](UPDATES.md)。
+`about-history-ui.cjs` 覆盖关于我们、三个外部入口、标题行更新控件、固定发布于标签及旧安装/更新时间隐藏、检查加载与重复点击、准备完成后的确认与稍后处理、固定事项编号、浮窗中的变更记录查询和搜索状态保留、宽窄窗口的数据目录布局、系统日志搜索请求和记忆副标题。空记录、排序、固定筛选与内容滚动由 `task-experience-ui.cjs` 覆盖。原生更新助手的隔离验证边界见 [版本更新](UPDATES.md)。
 
 `update-schedule-ui.cjs` 使用合成安装包状态和可控时钟验证每日提醒、立即／稍后选择、凌晨独立安装请求、开关关闭、请求过期与失败去重。Rust 时钟用例另验证边界跨越、日期持久去重、启动／休眠不补执行以及缓存缺失或损坏；不修改系统时间，不下载真实发布包。
 
@@ -166,6 +168,8 @@ DSH 缺少 ACP profile 时可显式确认初始化：`dsh_initialize_acp` 要求
 
 状态维护约定：`engine/persistence.rs` 负责持久化提交，编辑、页面投影与报表分别放在 `engine/` 的对应模块；原回归组独立保存于 `engine/tests.rs`。业务共享状态采用候选状态保存成功后发布，公开流式预览、取消与运行失败反馈不冒充业务提交。报表状态是提交依据，旁路报表文件失败记录日志。
 
+SS-216：桌面同步使用受控通道夹具验证迟到成功／失败、提交中同步、重复读取不保存和保存失败后的恢复。更新判断直接比较处置结构，流式预览仍在必要时持久化。记录浮窗用延迟 IPC 验证请求期间的滚动／展开及筛选重置，工具组检查历史补入和首条移除后的节点保留；存储测试覆盖本地与桌面处置的重启边界。
+
 日志由 `log_writer.rs` 的有界队列和一个消费线程独占追加与轮转；查询、数据迁移和正常退出使用屏障排空此前提交的记录。各生产线程不直接操作日志文件。处置文本预览绑定持久化版本，审批、用量和生命周期变化立即提交并吸收此前预览。预览文字在意外退出前尚未进入业务保存时可能缺少末段；已有保存的步骤与终态继续恢复。
 
 `ui_refresh.rs` 在业务 revision 未变化时只返回运行态；前端保留原页面、草稿和光标，忽略旧页面的迟到响应。`runtime-refresh-ui.cjs` 验证这些边界。JS 按清单顺序保留共享作用域，模型路由、接入、消息、合并、工作状态和帮助已分文件，暂不引入新的状态框架。
@@ -177,3 +181,11 @@ DSH 缺少 ACP profile 时可显式确认初始化：`dsh_initialize_acp` 要求
 SS-191：`tool-calling-ui.cjs` 使用模拟 IPC 验证独立提示词类型、单层工具列表、草稿保存失败、开关、测试取消、制作提示词复制、预览和 API 用途路由。`tool_calling_tests.rs` 通过自建临时合成 EXE、CMD 包装命令和解释器脚本校验实际实参、双路有界输出、编码、退出状态、超时与进程树取消；API 使用内存模拟 Transport，不访问供应商。运行边界及首版 CMD 参数规则见 [工具调用](TOOL_CALLING.md)。
 
 SS-199—SS-205：工具记录回归覆盖逐调用事项关联、固定范围下的搜索／分页／详情、旧批次归属不猜测和保存失败保留。非处置的 Codex/DSH 使用模型文本适配层，复用 API 的 SS 工具循环；合成 CLI 检查补查、命令执行、参数拒绝、取消、总期限、跨轮用量和图片原生内容。`codex-tool-native.py` 用真实 CLI 与本地合成上游验证文本请求 → SS 执行 → 结果续轮，没有模型侧业务工具 MCP；`tool-bridge-native.py` 检查处置的通用 ss_tool 与既有凭证。UI 覆盖精简入口、详情分区、空／失败／未知结果、不可信长字符串、360px 窄窗口、系统日志用途合并、插件对齐及标签默认开合与收起保存。命令见 [回归规范](LIVE_AI_REGRESSION.md)，真实模型只在用户明确授权的范围内运行。
+
+SS-207—SS-212：`task-experience-ui.cjs` 验证连续处置对话、结论去重、工具折叠、历史立即可读、拖选时暂停刷新、跨事项追问结果隔离、更多菜单和常驻输入框；记录浮窗覆盖固定顶部、搜索／排序／北京时间区间、分页与状态恢复、外点／Escape、软件外失焦、拖选、迟到响应、失败重试及窄窗。定时卡片检查开关尺寸、重复提交防护和失败回退，待处理范围检查未完成、未归档、未合并及未推迟条件。原有锚点和动效套件沿用统一阅读框验证。事项 `next_step` 仅保留只读兼容；报表 `next_steps` 不属于删除范围。
+
+`tests/update-held-mcp.ps1` 只在全新隔离目录安装和升级，使用 `upgrade-fixture-state.py` 读取 SQLite 引用的配置代次，兼容旧 JSON 存储。夹具必须带合成标记；测试注入带旧字段的事项与步骤，再核对升级后其余字段和历史保留。旧版本缺少的空工具默认项可补充，已有配置仍严格比较。脚本将前后配置快照和验证报告留在隔离目录，失败时便于定位；这些合成产物不提交。
+
+桌面桥接只对明确的返回大小超限缩小只读请求；合成单元测试验证四档上限、非大小错误不重试、旧页失败保留最新页和游标，以及精简响应不清空已保存内容。
+
+AI 处置使用 `handling-window.js` 的独立非模态页面，运行时查询跟随弹页所属事项，不随底层事项选择变化。整体阅读框的紧凑／展开模式已移除，相关用例改为完整对话几何边界与工具展开测试：`handling-reading-ui.cjs` 验证固定标题／输入、单一滚动区和窗口尺寸；`reading-motion-ui.cjs` 逐帧检查贴底、非贴底、连续开关及新增进展；`reading-modal-fixes-ui.cjs` 检查失焦、重开草稿／阅读位置、子弹窗和模型标记。`handling-window-fixture.cjs` 只提供合成资料。模型元数据每次回溯最多 4 MiB，并以 64 KiB 重叠避免漏掉跨页记录；严格核对指定会话和轮次，缺失时的“上次报告”仅来自已核实记录。

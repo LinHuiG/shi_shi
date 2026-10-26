@@ -5,6 +5,7 @@ style styles/base.css
 style styles/design.css
 style styles/experience.css
 style styles/motion.css
+style styles/task-experience.css
 script scripts/motion.js
 script scripts/core.js
 script scripts/detail-panels.js
@@ -22,6 +23,7 @@ script scripts/plugin-settings.js
 script scripts/approval-content.js
 script scripts/handling-reading.js
 script scripts/handling.js
+script scripts/handling-window.js
 script scripts/tags.js
 script scripts/model-routes.js
 script scripts/ai-connections.js

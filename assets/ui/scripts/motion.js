@@ -110,7 +110,6 @@ function motionKey(el) {
     'data-composer-task',
     'data-filter-group',
     'data-ai-connection',
-    'data-recent',
     'data-view',
     'data-page',
     'data-handle',
@@ -242,6 +241,7 @@ document.addEventListener(
       'summary,[data-handle="followup"],[data-advice-reply],.tag-group-title',
     );
     if (!trigger) return;
+    if (trigger.closest('.record-range,.handling-more,.handling-stream-detail')) return;
     const box = trigger.closest('details,.handling-panel,.advice-card,.tag-group');
     if (!box) return;
     const height = box.getBoundingClientRect().height;

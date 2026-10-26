@@ -34,17 +34,7 @@ function status() {
       new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' });
   setHtml(
     '#sidebar-context',
-    `<div class="side-section-label">关注</div><button class="side-view" data-view="daily">今日事项<span>${state.tasks.filter((t) => t.today).length}</span></button><button class="side-view" data-view="blocked">被阻塞<span>${current.filter((t) => t.blocker).length}</span></button><button class="side-view" data-view="today">今日到期<span>${current.filter(dueToday).length}</span></button><div class="side-section-label">最近事项</div>${
-      current
-        .slice()
-        .sort((a, b) => b.updated - a.updated)
-        .slice(0, 5)
-        .map(
-          (t) =>
-            `<button class="recent-item" data-recent="${t.id}" title="${esc(t.title)}"><span class="recent-dot ${t.generation === 'pending' ? 'pulse' : ''}"></span>${esc(t.title)}</button>`,
-        )
-        .join('') || '<span class="side-empty">暂无事项</span>'
-    }`,
+    `<div class="side-section-label">关注</div><button class="side-view" data-view="pending">待处理<span>${n}</span></button><button class="side-view" data-view="blocked">被阻塞<span>${current.filter((t) => t.blocker).length}</span></button><button class="side-view" data-view="today">今日到期<span>${current.filter(dueToday).length}</span></button>`,
   );
   motionText($('#nav-count'), n || '');
   setHtml(
@@ -74,6 +64,7 @@ function status() {
 }
 
 function render() {
+  syncTaskRecordPanel();
   if (!state) return;
   if (state._page && state._page !== page) {
     void refreshState(true);
@@ -159,11 +150,9 @@ function statusBadge(t) {
   return `<span class="task-status state-${s.key}"><i></i>${s.label}</span>`;
 }
 function taskScopeMatches(t, scope = tab) {
-  return scope === '今日事项'
-    ? t.today
-    : scope === '归档'
+  return scope === '归档'
       ? t.archived
-      : !t.archived && (scope === '全部' || (t.status === scope && !t.deferred));
+      : !t.archived && (scope === '全部' || (t.status === scope && !t.deferred && (scope !== '待处理' || !t.merged_into)));
 }
 function taskQuickViewMatches(t, view = quickView) {
   return !view || (view === 'blocked'
@@ -187,7 +176,6 @@ function visibleTasks() {
     )
     .sort(
       (a, b) =>
-        (tab === '今日事项' ? Number(a.status !== '待处理') - Number(b.status !== '待处理') : 0) ||
         taskRank(a) - taskRank(b) ||
         b.updated - a.updated,
     );
@@ -247,6 +235,7 @@ window.openNotifiedTask = async function (id) {
   }
 };
 function renderTasks() {
+  syncTaskRecordPanel();
   const savedTagBar = rememberTagBar();
   const composingField =
       document.activeElement?.id === 'handling-question' ? document.activeElement : null,
@@ -274,9 +263,10 @@ function renderTasks() {
     offset = anchor ? anchor.getBoundingClientRect().top - pane.getBoundingClientRect().top : 0;
   const list = visibleTasks();
   if (!list.some((t) => t.id === selected)) selected = list[0]?.id || '';
+  syncTaskRecordPanel();
   setHtml(
     '#view',
-    `${tagFilterBar()}${tab === '今日事项' ? `<div class="daily-summary"><span>今日 · ${new Date().toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'long', day: 'numeric' })}</span><span class="daily-pending">${list.filter((t) => t.status === '待处理').length} 待处理</span><span class="daily-complete">${list.filter((t) => t.status === '已完成').length} 已完成</span><small>含之前未完成的事项</small></div>` : ''}${list.length ? `<div class="split"><div class="task-list">${list.map((t, index) => `<button class="task-row state-${taskState(t).key} ${selected === t.id ? 'selected' : ''}" data-task="${t.id}"><div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${t.manual ? '<span class="tiny">手动修改过</span>' : ''}</div><div class="task-title"><span class="task-number" aria-label="事项编号 ${taskNumber(t)}">#${taskNumber(t)}</span>${esc(t.title)}</div>${t.deferred ? `<div class="tiny">明日处理 · ${esc(date(t.deferred_until))} 恢复</div>` : ''}<div class="tiny" style="color:${t.due && new Date(t.due) < new Date() ? 'var(--red)' : 'var(--sub)'}">${esc(dueLabel(t))}</div><div class="task-meta"><span>${statusBadge(t)} ${handlingBadge(t.id)}${t.status === '待处理' && t.blocker ? ' ' + esc(t.blocker) : ''}${t.status === '已完成' && t.status_changed_at ? ' · ' + esc(new Date(t.status_changed_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })) : ''}</span><span>${evidenceCount(t)} 条依据</span></div></button>`).join('')}</div><div class="detail" id="task-detail" data-ui-key="detail-${esc(selected)}" data-task-id="${esc(selected)}" data-preserve-content></div></div>` : empty(Object.keys(tagSelection()).length || prioritySelection().length ? '没有匹配的事项' : '暂无事项', Object.keys(tagSelection()).length || prioritySelection().length ? '可调整标签，或点击“全部”清空标签筛选。' : state.ai_busy ? '消息已读取，AI 正在整理。完成后事项会自动显示。' : state.pending ? `还有 ${state.pending} 条相关消息等待分析。可在消息收件箱继续分析。` : state.config.enabled ? '暂时没有需要处理的新事项。' : '可以开启自动扫描，或手动新建事项。', state.pending ? '<button data-action="analyze">分析待处理消息</button>' : '<button data-page="settings">打开设置</button>')}`,
+    `${tagFilterBar()}${tab === '待处理' ? `<div class="daily-summary"><span>待处理</span><span class="daily-pending">${list.length} 项</span></div>` : ''}${list.length ? `<div class="split"><div class="task-list">${list.map((t, index) => `<button class="task-row state-${taskState(t).key} ${selected === t.id ? 'selected' : ''}" data-task="${t.id}"><div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${t.manual ? '<span class="tiny">手动修改过</span>' : ''}</div><div class="task-title"><span class="task-number" aria-label="事项编号 ${taskNumber(t)}">#${taskNumber(t)}</span>${esc(t.title)}</div>${t.deferred ? `<div class="tiny">明日处理 · ${esc(date(t.deferred_until))} 恢复</div>` : ''}<div class="tiny" style="color:${t.due && new Date(t.due) < new Date() ? 'var(--red)' : 'var(--sub)'}">${esc(dueLabel(t))}</div><div class="task-meta"><span>${statusBadge(t)} ${handlingBadge(t.id)}${t.status === '待处理' && t.blocker ? ' ' + esc(t.blocker) : ''}${t.status === '已完成' && t.status_changed_at ? ' · ' + esc(new Date(t.status_changed_at).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit' })) : ''}</span><span>${evidenceCount(t)} 条依据</span></div></button>`).join('')}</div><div class="detail" id="task-detail" data-ui-key="detail-${esc(selected)}" data-task-id="${esc(selected)}" data-preserve-content></div></div>` : empty(Object.keys(tagSelection()).length || prioritySelection().length ? '没有匹配的事项' : '暂无事项', Object.keys(tagSelection()).length || prioritySelection().length ? '可调整标签，或点击“全部”清空标签筛选。' : state.ai_busy ? '消息已读取，AI 正在整理。完成后事项会自动显示。' : state.pending ? `还有 ${state.pending} 条相关消息等待分析。可在消息收件箱继续分析。` : state.config.enabled ? '暂时没有需要处理的新事项。' : '可以开启自动扫描，或手动新建事项。', state.pending ? '<button data-action="analyze">分析待处理消息</button>' : '<button data-page="settings">打开设置</button>')}`,
   );
   restoreTagBar(savedTagBar);
   if (selected) renderDetail();
@@ -296,7 +286,6 @@ function renderTasks() {
     nextDetail.dataset.taskId = selected;
     nextDetail.scrollTop = detailTop;
   }
-  measureHandlingReadings();
   updateHandlingLive();
   if (composerCaret && $('#handling-question')) {
     $('#handling-question').focus({ preventScroll: true });
@@ -390,6 +379,7 @@ document.addEventListener('keydown', e => {
   }
 });
 async function renderDetail() {
+  syncTaskRecordPanel();
   const t = selectedTask();
   if (!t || !$('#task-detail')) return;
   if ($('#task-detail').dataset.taskId !== t.id) {
@@ -406,147 +396,12 @@ async function renderDetail() {
   }
   setHtml(
     '#task-detail',
-    `<div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${statusBadge(t)}</div><h2><span class="detail-task-number">#${taskNumber(t)}</span>${esc(t.title)}</h2><div class="task-times"><span>生成于 ${esc(t.created ? date(t.created) : '未记录')}</span><span>上次变更 ${esc(t.updated ? date(t.updated) : '未记录')}</span></div><div class="reason">${esc(t.reason || '手动创建的事项')}</div><div class="detail-actions"><button class="ai-dispose" data-handle="start" data-task-id="${esc(t.id)}"><span class="ai-mark" aria-hidden="true">✦</span>${handlingButton(t.id)}</button>${taskStatusActions(t)}<button data-action="edit">编辑</button><button data-action="merge">合并</button>${t.has_tool_calls ? `<button data-tool-run-history="${esc(t.id)}">工具调用记录</button>` : ''}</div>${t.deferred ? `<div class="deferred-note">已安排明日处理，${esc(date(t.deferred_until))} 自动恢复到今日事项。</div>` : ''}${t.schedule_id ? `<div class="helper">定时事项 · ${esc(t.scheduled_for)} 生成</div>` : ''}${t.blocker ? `<div class="block">有阻塞 · ${esc(t.blocker)}${t.waiting_for ? `<div class="muted">等待 ${esc(t.waiting_for)}</div>` : ''}</div>` : ''}${t.waiting_for && !t.blocker ? `<div class="waiting-note">等待 ${esc(t.waiting_for)} 的回复或处理结果</div>` : ''}${t.archive_note ? `<section class="archive-note"><h3>归档备注</h3><div class="description">${esc(t.archive_note)}</div><div class="helper">${esc(date(t.archived_at))} · 会作为后续汇总与建议的参考</div></section>` : ''}${t.description ? `<section class="detail-panel task-description"><h3>事项描述</h3><div class="description">${esc(t.description)}</div></section>` : ''}${t.due ? `<section><h3>截止时间</h3>${esc(dueLabel(t))}<div class="helper">后续对话有明确新证据时可自动更新期限</div></section>` : ''}${handlingPanel(t)}<details class="evidence-disclosure detail-panel"><summary>消息依据 <span data-evidence-count>${evidenceCount(t)} 条</span></summary><div id="evidence" data-preserve-content><div class="muted">读取中…</div></div>${detailCollapseFooter('消息依据')}</details>${taskChangesSection(t)}<section><h3>下一步</h3><div class="advice"><p>${esc(t.next_step || '尚无建议，可以先补充问题现象和预期结果。')}</p><button data-action="prompt">复制排查提示词</button></div></section>`,
+    `<div class="row">${t.generation === 'pending' ? '<span class="badge blue"><span class="spin"></span>正在生成</span>' : t.generation === 'interrupted' ? '<span class="badge">已中断</span>' : t.generation === 'failed' ? '<span class="badge urgent">生成失败</span>' : ''}${extraTagBadges(t)}${statusBadge(t)}</div><h2><span class="detail-task-number">#${taskNumber(t)}</span>${esc(t.title)}</h2><div class="task-times"><span>生成于 ${esc(t.created ? date(t.created) : '未记录')}</span><span>上次变更 ${esc(t.updated ? date(t.updated) : '未记录')}</span></div><div class="reason">${esc(t.reason || '手动创建的事项')}</div><div class="detail-actions"><button class="ai-dispose" data-handle="start" data-task-id="${esc(t.id)}"><span class="ai-mark" aria-hidden="true">✦</span>${handlingButton(t.id)}</button>${taskStatusActions(t)}<button data-action="edit">编辑</button><button data-action="merge">合并</button>${t.has_tool_calls ? `<button data-tool-run-history="${esc(t.id)}">工具调用记录</button>` : ''}</div>${t.deferred ? `<div class="deferred-note">已安排明日处理，${esc(date(t.deferred_until))} 自动恢复到待处理。</div>` : ''}${t.schedule_id ? `<div class="helper">定时事项 · ${esc(t.scheduled_for)} 生成</div>` : ''}${t.blocker ? `<div class="block">有阻塞 · ${esc(t.blocker)}${t.waiting_for ? `<div class="muted">等待 ${esc(t.waiting_for)}</div>` : ''}</div>` : ''}${t.waiting_for && !t.blocker ? `<div class="waiting-note">等待 ${esc(t.waiting_for)} 的回复或处理结果</div>` : ''}${t.archive_note ? `<section class="archive-note"><h3>归档备注</h3><div class="description">${esc(t.archive_note)}</div><div class="helper">${esc(date(t.archived_at))} · 会作为后续汇总与建议的参考</div></section>` : ''}${t.description ? `<section class="detail-panel task-description"><h3>事项描述</h3><div class="description">${esc(t.description)}</div></section>` : ''}${t.due ? `<section><h3>截止时间</h3>${esc(dueLabel(t))}<div class="helper">后续对话有明确新证据时可自动更新期限</div></section>` : ''}${handlingEndedSummary(t)}${taskRecordButtons(t)}`,
   );
   const statusMenu=$('[data-task-status].is-open');
   if (statusMenu) setTaskStatusMenu(statusMenu,true);
-  if (taskChangeView(t.id).open) void renderTaskChanges(t.id);
-  const host = $('#evidence'),
-    disclosure = host.closest('details');
-  const view = evidenceView(t.id);
-  setEvidenceAvailability(disclosure, evidenceCount(t));
-  disclosure.open = view.open;
-  try {
-    const rows = await rpc('evidence', { id: t.id });
-    if (selected !== t.id || $('#evidence') !== host) return;
-    evidenceCache[t.id] = [
-      ...new Map(rows.filter((m) => !m.withdrawn).map((m) => [m.id, m])).values(),
-    ];
-    t.evidence_count = evidenceCache[t.id].length;
-    setHtml(
-      host,
-      `<div class="evidence-tools"><input id="evidence-search" aria-label="搜索消息依据" maxlength="200" placeholder="搜索消息、发送人或来源" value="${esc(view.query)}"><button data-evidence-sort></button><span class="tiny" id="evidence-summary" role="status"></span></div><div id="evidence-retries"></div><div id="evidence-list"></div>`,
-    );
-    renderEvidence(t.id);
-    const retries = [
-      ...new Set([
-        ...(t.evidence?.direct || []),
-        ...(t.evidence?.background || []),
-        ...(t.evidence?.completion || []),
-      ]),
-    ].filter((id) => state.analysis_retries?.[id]);
-    if (retries.length)
-      $('#evidence-retries').innerHTML =
-        `<div class="box error-box"><b>${retries.length} 条依据待重试</b><p>${esc(state.analysis_retries[retries[0]])}</p><p class="helper">冲突解决后会在下一次完整分析中处理；多次冲突会停止自动重试并保留消息，可人工处理。</p></div>`;
-  } catch (e) {
-    if ($('#evidence') === host) host.textContent = e.message;
-  }
+  syncTaskRecordPanel();
 }
-const evidenceViews = new Map();
-function evidenceView(id) {
-  if (!evidenceViews.has(id)) evidenceViews.set(id, { query: '', sort: 'desc', open: false });
-  return evidenceViews.get(id);
-}
-function setEvidenceAvailability(disclosure, total) {
-  const summary = disclosure.querySelector('summary'),
-    empty = total === 0;
-  summary.setAttribute('aria-disabled', String(empty));
-  summary.tabIndex = empty ? -1 : 0;
-  if (empty) {
-    evidenceView(selected).open = false;
-    disclosure.open = false;
-  }
-}
-function renderEvidence(id) {
-  if (selected !== id || !$('#evidence-list')) return;
-  const view = evidenceView(id),
-    all = evidenceCache[id] || [],
-    terms = view.query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
-  const rows = all
-    .filter((m) =>
-      terms.every((term) =>
-        [m.text, m.sender, m.group, m.chat, m.source_name]
-          .join(' ')
-          .toLocaleLowerCase()
-          .includes(term),
-      ),
-    )
-    .slice()
-    .sort((a, b) => {
-      const cmp = Number(a.time) - Number(b.time) || String(a.id).localeCompare(String(b.id));
-      return view.sort === 'asc' ? cmp : -cmp;
-    });
-  setEvidenceAvailability($('#evidence').closest('details'), all.length);
-  $('[data-evidence-count]').textContent = all.length + ' 条';
-  $('#evidence-summary').textContent = terms.length
-    ? `匹配 ${rows.length} / 共 ${all.length} 条`
-    : `共 ${all.length} 条`;
-  $('[data-evidence-sort]').textContent = view.sort === 'asc' ? '时间 ↑ 正序' : '时间 ↓ 倒序';
-  $('[data-evidence-sort]').setAttribute(
-    'aria-label',
-    '消息依据' + (view.sort === 'asc' ? '按时间正序，切换倒序' : '按时间倒序，切换正序'),
-  );
-  setHtml(
-    '#evidence-list',
-    rows.length
-      ? rows
-          .map(
-            (m) =>
-              `<div class="source" data-ui-key="evidence-${esc(m.id)}"><div class="tiny">${esc(m.source_name || '历史来源')} · ${esc(m.group)} · ${esc(m.sender)} · ${esc(date(m.time))}</div>${messageBody(m.text || '[' + m.kind + ']')}${messageImages(m)}</div>`,
-          )
-          .join('')
-      : `<div class="evidence-empty muted">${all.length ? '没有匹配的消息，试试其他关键词。' : '无消息来源，或来源已撤回。'}</div>`,
-  );
-}
-document.addEventListener('input', (e) => {
-  if (e.target.id === 'evidence-search' && !e.isComposing) {
-    evidenceView(selected).query = e.target.value;
-    renderEvidence(selected);
-  }
-});
-document.addEventListener('compositionend', (e) => {
-  if (e.target.id === 'evidence-search') {
-    evidenceView(selected).query = e.target.value;
-    renderEvidence(selected);
-  }
-});
-document.addEventListener('click', (e) => {
-  if (e.target.closest('[data-evidence-sort]')) {
-    const v = evidenceView(selected);
-    v.sort = v.sort === 'asc' ? 'desc' : 'asc';
-    renderEvidence(selected);
-  }
-});
-document.addEventListener(
-  'click',
-  (e) => {
-    if (e.target.closest('.evidence-disclosure>summary[aria-disabled="true"]')) e.preventDefault();
-  },
-  true,
-);
-document.addEventListener(
-  'keydown',
-  (e) => {
-    if (
-      ['Enter', ' '].includes(e.key) &&
-      e.target.matches('.evidence-disclosure>summary[aria-disabled="true"]')
-    )
-      e.preventDefault();
-  },
-  true,
-);
-document.addEventListener(
-  'toggle',
-  (e) => {
-    if (e.target.matches('.evidence-disclosure')) {
-      if (e.target.querySelector('summary').getAttribute('aria-disabled') === 'true')
-        e.target.open = false;
-      evidenceView(selected).open = e.target.open;
-    }
-  },
-  true,
-);
-let promptDefaults = null;
 let backlogPreview = null,
   backlogSequence = 0,
   backlogTimer = null;

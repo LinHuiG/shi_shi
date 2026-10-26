@@ -233,7 +233,7 @@ const date = (t) =>
 let state = null,
   page = 'tasks',
   selected = '',
-  tab = '今日事项',
+  tab = '待处理',
   query = '',
   inboxQuery = '',
   settingsDirty = false,
@@ -476,7 +476,7 @@ window.refreshState = function (force = false) {
         const requestPage = page;
         const next = await rpc('state', {
           page: requestPage,
-          task: selected || undefined,
+          task: handlingWindow?.id || selected || undefined,
           core_revision: !forced && state?._page === requestPage ? state.core_revision : undefined,
         });
         if (page !== requestPage) {
@@ -500,8 +500,10 @@ window.refreshState = function (force = false) {
           });
         }
         status();
+        syncHandlingWindow();
         updateHandlingLive();
         syncHandlingApproval();
+        syncTaskRecordPanel();
         syncUpdateNotice();
         const active = document.activeElement,
           editing =

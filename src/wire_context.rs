@@ -74,7 +74,6 @@ impl IdMap {
                         "title",
                         "description",
                         "summary",
-                        "next_step",
                         "blocker",
                         "waiting_for",
                         "reason",

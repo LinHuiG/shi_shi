@@ -69,6 +69,7 @@ pub struct Desktop {
     source: Mutex<Option<String>>,
     endpoint: Mutex<Option<PathBuf>>,
     settings: Mutex<BTreeMap<String, (String, Value, Instant)>>,
+    settings_scan: Mutex<BTreeMap<String, (PathBuf, String, Option<u64>)>>,
     history_cursors: Mutex<BTreeMap<String, Value>>,
     latest_turns: Mutex<BTreeMap<String, Vec<String>>>,
 }
@@ -80,6 +81,7 @@ impl Desktop {
             source: Mutex::new(None),
             endpoint: Mutex::new(None),
             settings: Mutex::new(BTreeMap::new()),
+            settings_scan: Mutex::new(BTreeMap::new()),
             history_cursors: Mutex::new(BTreeMap::new()),
             latest_turns: Mutex::new(BTreeMap::new()),
         }
@@ -293,6 +295,65 @@ impl Desktop {
         result?;
         closed
     }
+    fn read_pages(
+        &self,
+        thread: &str,
+        mut call: impl FnMut(Value) -> Result<Value, String>,
+    ) -> Result<Value, String> {
+        let mut snapshot = read_page(thread, &Value::Null, &mut call)?;
+        let ids: Vec<String> = snapshot["turns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v["id"].as_str().map(str::to_owned))
+            .collect();
+        let previous = self
+            .latest_turns
+            .lock()
+            .unwrap()
+            .insert(thread.into(), ids.clone())
+            .unwrap_or_default();
+        if previous.is_empty() || !ids.iter().any(|id| previous.contains(id)) {
+            self.history_cursors
+                .lock()
+                .unwrap()
+                .insert(thread.into(), snapshot["page"]["nextCursor"].clone());
+        }
+        let cursor = self
+            .history_cursors
+            .lock()
+            .unwrap()
+            .get(thread)
+            .cloned()
+            .unwrap_or(Value::Null);
+        if !cursor.is_null() {
+            match read_page(thread, &cursor, &mut call) {
+                Ok(older) => {
+                    if let Some(rows) = snapshot["turns"].as_array_mut() {
+                        for turn in older["turns"].as_array().into_iter().flatten() {
+                            if !rows.iter().any(|v| v["id"] == turn["id"]) {
+                                rows.push(turn.clone());
+                            }
+                        }
+                    }
+                    self.history_cursors
+                        .lock()
+                        .unwrap()
+                        .insert(thread.into(), older["page"]["nextCursor"].clone());
+                    if older["read_notice"].is_string() && !snapshot["read_notice"].is_string() {
+                        snapshot["read_notice"] = older["read_notice"].clone();
+                    }
+                }
+                Err(_) => {
+                    let notice = snapshot["read_notice"].as_str().unwrap_or("");
+                    snapshot["read_notice"] = json!(format!(
+                        "{notice}较早记录暂未读取，已保留历史并同步最新进展。"
+                    ));
+                }
+            }
+        }
+        Ok(snapshot)
+    }
     fn observed_settings(&self, thread: &str, turn: &str) -> Value {
         if let Some((_, value, _)) =
             self.settings
@@ -320,7 +381,18 @@ impl Desktop {
             let path = meta["thread"]["path"]
                 .as_str()
                 .ok_or("未提供会话记录路径")?;
-            read_settings(Path::new(path), thread, turn).ok_or("未提供当前轮次模型信息".into())
+            let path = Path::new(path);
+            let mut scans = self.settings_scan.lock().unwrap();
+            let scan = scans
+                .entry(thread.into())
+                .or_insert_with(|| (path.into(), turn.into(), None));
+            if scan.0 != path || scan.1 != turn {
+                *scan = (path.into(), turn.into(), None);
+            }
+            let (value, before) =
+                read_settings_page(path, thread, turn, scan.2).ok_or("会话元数据不可读")?;
+            scan.2 = before;
+            value.ok_or("未提供当前轮次模型信息".into())
         })();
         let value = result.unwrap_or(Value::Null);
         self.settings
@@ -362,46 +434,7 @@ impl DesktopApi for Desktop {
         self.call("send_message_to_thread", args, true)
     }
     fn read(&self, thread: &str) -> Result<Value, String> {
-        let mut snapshot=self.call("read_thread", json!({"threadId":thread,"hostId":"local","turnLimit":10,"includeOutputs":true,"maxOutputCharsPerItem":20000}), false)?;
-        let ids: Vec<String> = snapshot["turns"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|v| v["id"].as_str().map(str::to_owned))
-            .collect();
-        let previous = self
-            .latest_turns
-            .lock()
-            .unwrap()
-            .insert(thread.into(), ids.clone())
-            .unwrap_or_default();
-        if previous.is_empty() || !ids.iter().any(|id| previous.contains(id)) {
-            self.history_cursors
-                .lock()
-                .unwrap()
-                .insert(thread.into(), snapshot["page"]["nextCursor"].clone());
-        }
-        let cursor = self
-            .history_cursors
-            .lock()
-            .unwrap()
-            .get(thread)
-            .cloned()
-            .unwrap_or(Value::Null);
-        if !cursor.is_null() {
-            let older=self.call("read_thread",json!({"threadId":thread,"hostId":"local","turnLimit":10,"includeOutputs":true,"maxOutputCharsPerItem":20000,"cursor":cursor}),false)?;
-            if let Some(rows) = snapshot["turns"].as_array_mut() {
-                for turn in older["turns"].as_array().into_iter().flatten() {
-                    if !rows.iter().any(|v| v["id"] == turn["id"]) {
-                        rows.push(turn.clone());
-                    }
-                }
-            }
-            self.history_cursors
-                .lock()
-                .unwrap()
-                .insert(thread.into(), older["page"]["nextCursor"].clone());
-        }
+        let mut snapshot = self.read_pages(thread, |args| self.call("read_thread", args, false))?;
         if let Some(turn) = snapshot["turns"]
             .as_array()
             .and_then(|v| v.first())
@@ -419,28 +452,104 @@ impl DesktopApi for Desktop {
     }
 }
 
+fn response_too_large(error: &str) -> bool {
+    error
+        .to_ascii_lowercase()
+        .contains("tool response exceeds the size limit")
+        || error.contains("桌面响应超过大小限制")
+}
+
+/// Read-only fallback: never retries a mutation or an unrelated error.
+fn read_page(
+    thread: &str,
+    cursor: &Value,
+    call: &mut impl FnMut(Value) -> Result<Value, String>,
+) -> Result<Value, String> {
+    for (index, (turns, outputs, chars)) in [
+        (10, true, 20000),
+        (3, true, 4000),
+        (1, true, 1000),
+        (1, false, 1000),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut args = json!({"threadId":thread,"hostId":"local","turnLimit":turns,"includeOutputs":outputs,"maxOutputCharsPerItem":chars});
+        if !cursor.is_null() {
+            args["cursor"] = cursor.clone();
+        }
+        match call(args) {
+            Ok(mut snapshot) => {
+                if index > 0 {
+                    for turn in snapshot["turns"].as_array_mut().into_iter().flatten() {
+                        turn["_shishi_partial"] = json!(true);
+                    }
+                    snapshot["read_notice"] =
+                        json!("会话较长，已精简记录以继续同步；完整内容可在 Codex 查看。 ");
+                }
+                return Ok(snapshot);
+            }
+            Err(error) if response_too_large(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(
+        "Codex 会话内容超过单次读取上限，暂时无法同步。已保留现有记录，可在 Codex 查看完整会话。"
+            .into(),
+    )
+}
+
 /// Only return settings from the exact thread/turn named by desktop metadata.
 /// This bounded fallback never reads or displays reasoning text.
-fn read_settings(path: &Path, thread: &str, turn: &str) -> Option<Value> {
+const SETTINGS_PAGE_BYTES: u64 = 4 * 1024 * 1024;
+const SETTINGS_RECORD_BYTES: u64 = 64 * 1024;
+// Only the named session is scanned, at most 4 MiB per synchronization. A
+// cursor continues backward on the next read, so long tool output cannot hide
+// the turn context forever. The overlap admits a bounded metadata line split
+// across page boundaries; oversized tool lines are never deserialized.
+fn read_settings_page(
+    path: &Path,
+    thread: &str,
+    turn: &str,
+    before: Option<u64>,
+) -> Option<(Option<Value>, Option<u64>)> {
     let mut file = fs::File::open(path).ok()?;
     let mut header = String::new();
-    BufReader::new((&mut file).take(65536))
+    BufReader::new((&mut file).take(SETTINGS_RECORD_BYTES))
         .read_line(&mut header)
         .ok()?;
     let meta: Value = serde_json::from_str(&header).ok()?;
     if meta["type"] != "session_meta" || meta["payload"]["id"] != thread {
         return None;
     }
-    let start = file.metadata().ok()?.len().saturating_sub(256 * 1024);
+    let length = file.metadata().ok()?.len();
+    let end = before.unwrap_or(length).min(length);
+    let start = end.saturating_sub(SETTINGS_PAGE_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = vec![];
-    file.take(256 * 1024).read_to_end(&mut bytes).ok()?;
-    String::from_utf8_lossy(&bytes)
+    file.take(end - start).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let value = text
         .lines()
+        .rev()
+        .filter(|line| {
+            line.len() <= SETTINGS_RECORD_BYTES as usize && line.contains("\"turn_context\"")
+        })
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|v| v["type"] == "turn_context" && v["payload"]["turn_id"] == turn)
-        .last()
-        .map(|v| json!({"model":v["payload"]["model"],"effort":v["payload"]["effort"]}))
+        .find(|v| {
+            v["type"] == "turn_context"
+                && v["payload"]["turn_id"] == turn
+                && v["payload"]["model"]
+                    .as_str()
+                    .is_some_and(|m| !m.trim().is_empty())
+        })
+        .map(|v| json!({"model":v["payload"]["model"],"effort":v["payload"]["effort"]}));
+    let next = (value.is_none() && start > 0).then_some(start + SETTINGS_RECORD_BYTES);
+    Some((value, next))
+}
+#[cfg(test)]
+fn read_settings(path: &Path, thread: &str, turn: &str) -> Option<Value> {
+    read_settings_page(path, thread, turn, None)?.0
 }
 
 /// Explicit local diagnostics: no target prompt, turn, resume or interruption.
@@ -582,6 +691,89 @@ fn pipe_rpc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    const OVERSIZED: &str = "Tool response exceeds the size limit. Request fewer turns or omit outputs. A single oversized turn cannot be returned by this tool.";
+    #[test]
+    fn oversized_pages_reduce_payload_without_changing_thread_or_cursor() {
+        let mut calls = vec![];
+        let snapshot = read_page("synthetic-thread", &json!("older-page"), &mut |args| {
+            calls.push(args.clone());
+            if args["includeOutputs"] == true { return Err(OVERSIZED.into()); }
+            Ok(json!({"thread":{"id":"synthetic-thread"},"turns":[{"id":"turn"}],"page":{"nextCursor":"next"}}))
+        }).unwrap();
+        assert_eq!(calls.len(), 4);
+        assert_eq!(
+            calls
+                .iter()
+                .map(|v| v["turnLimit"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![10, 3, 1, 1]
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .map(|v| v["maxOutputCharsPerItem"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![20000, 4000, 1000, 1000]
+        );
+        assert!(calls
+            .iter()
+            .all(|v| v["threadId"] == "synthetic-thread" && v["cursor"] == "older-page"));
+        assert_eq!(snapshot["turns"][0]["_shishi_partial"], true);
+        assert_eq!(snapshot["page"]["nextCursor"], "next");
+        assert!(snapshot["read_notice"].as_str().unwrap().contains("精简"));
+    }
+    #[test]
+    fn read_fallback_is_bounded_and_does_not_retry_unrelated_errors() {
+        let mut calls = 0;
+        let error = read_page("thread", &Value::Null, &mut |_| {
+            calls += 1;
+            Err("Disconnected synthetic endpoint".into())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(error, "Disconnected synthetic endpoint");
+        calls = 0;
+        let error = read_page("thread", &Value::Null, &mut |_| {
+            calls += 1;
+            Err(OVERSIZED.into())
+        })
+        .unwrap_err();
+        assert_eq!(calls, 4);
+        assert!(error.contains("暂时无法同步") && error.contains("已保留"));
+    }
+    #[test]
+    fn failed_history_page_preserves_latest_and_retries_the_same_cursor() {
+        let desktop = Desktop::new(PathBuf::new(), String::new());
+        let latest = json!({"thread":{"id":"thread"},"turns":[{"id":"latest"}],"page":{"nextCursor":"older"}});
+        let snapshot = desktop
+            .read_pages("thread", |args| {
+                if args["cursor"].is_null() {
+                    Ok(latest.clone())
+                } else {
+                    Err("Synthetic history unavailable".into())
+                }
+            })
+            .unwrap();
+        assert_eq!(snapshot["turns"][0]["id"], "latest");
+        assert!(snapshot["read_notice"]
+            .as_str()
+            .unwrap()
+            .contains("最新进展"));
+        assert_eq!(desktop.history_cursors.lock().unwrap()["thread"], "older");
+        let snapshot = desktop
+            .read_pages("thread", |args| {
+                if args["cursor"].is_null() {
+                    Ok(latest.clone())
+                } else {
+                    assert_eq!(args["cursor"], "older");
+                    Ok(json!({"turns":[{"id":"old-turn"}],"page":{"nextCursor":null}}))
+                }
+            })
+            .unwrap();
+        assert_eq!(snapshot["turns"].as_array().unwrap().len(), 2);
+        assert!(snapshot["read_notice"].is_null());
+        assert!(desktop.history_cursors.lock().unwrap()["thread"].is_null());
+    }
     #[test]
     fn optional_overrides_never_reset_desktop_settings() {
         let mut args = json!({});
@@ -605,6 +797,55 @@ mod tests {
         assert_eq!(
             read_settings(&file, "thread", "current").unwrap()["model"],
             "current-model"
+        );
+        fs::remove_file(file).unwrap();
+    }
+    #[test]
+    fn model_metadata_survives_long_output_and_continues_bounded_pages() {
+        let file = std::env::temp_dir().join(format!("shishi-model-pages-{}.jsonl", id()));
+        let context = json!({"type":"turn_context","payload":{"turn_id":"current","model":"verified-model","effort":"high"}});
+        let text = format!(
+            "{}\n{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":"thread"}}),
+            context,
+            "x".repeat(5 * 1024 * 1024)
+        );
+        fs::write(&file, text).unwrap();
+        let (value, cursor) = read_settings_page(&file, "thread", "current", None).unwrap();
+        assert!(value.is_none() && cursor.is_some());
+        let (value, cursor) = read_settings_page(&file, "thread", "current", cursor).unwrap();
+        assert_eq!(value.unwrap()["model"], "verified-model");
+        assert!(cursor.is_none());
+        assert!(read_settings_page(&file, "other-thread", "current", None).is_none());
+        let (_, cursor) = read_settings_page(&file, "thread", "other-turn", None).unwrap();
+        assert!(read_settings_page(&file, "thread", "other-turn", cursor)
+            .unwrap()
+            .0
+            .is_none());
+        fs::remove_file(file).unwrap();
+    }
+    #[test]
+    fn model_metadata_split_across_page_boundary_is_not_skipped() {
+        let file = std::env::temp_dir().join(format!("shishi-model-boundary-{}.jsonl", id()));
+        let header = format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":"thread"}})
+        );
+        let context = format!(
+            "{}\n",
+            json!({"type":"turn_context","payload":{"turn_id":"current","model":"boundary-model"}})
+        );
+        let text =
+            header + &context + &"x".repeat(SETTINGS_PAGE_BYTES as usize - context.len() / 2);
+        fs::write(&file, text).unwrap();
+        let (value, cursor) = read_settings_page(&file, "thread", "current", None).unwrap();
+        assert!(value.is_none());
+        assert_eq!(
+            read_settings_page(&file, "thread", "current", cursor)
+                .unwrap()
+                .0
+                .unwrap()["model"],
+            "boundary-model"
         );
         fs::remove_file(file).unwrap();
     }

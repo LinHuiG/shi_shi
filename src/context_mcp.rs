@@ -85,7 +85,7 @@ pub fn issue(root: &Path, state: &State, task: &Task, run: &str) -> Result<PathB
     Ok(path)
 }
 fn brief_task(t: &Task) -> Value {
-    json!({"id":t.id,"title":t.title,"description":t.description,"tags":t.tags,"status":t.status,"blocker":t.blocker,"next_step":t.next_step,"due":t.due,"updated":t.updated})
+    json!({"id":t.id,"title":t.title,"description":t.description,"tags":t.tags,"status":t.status,"blocker":t.blocker,"due":t.due,"updated":t.updated})
 }
 fn query(ticket: &Ticket, state: &State, name: &str, a: &Value) -> Result<Value, String> {
     if ticket.expires < now() {

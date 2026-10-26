@@ -71,11 +71,11 @@ const mock = `window.fixture=${JSON.stringify(fixture)};window.requests=[];windo
       assert.deepEqual(await filters(), { tab: scope, quickView: '', query: '合成事项', tags: { 提出者: ['甲'] }, priorities: [] });
       assert.equal(await page.evaluate(() => JSON.stringify(fixture.tasks)), before, 'navigation must not change business data');
     }
-    await configure({ tab: '今日事项', quickView: 'today', query: 'target', tags: { 事项类型: ['检查'] } });
+    await configure({ tab: '待处理', quickView: 'today', query: 'target', tags: { 事项类型: ['检查'] } });
     assert.equal(await open('target'), true);
     assert.equal((await filters()).quickView, 'today');
     assert.equal(await open('clear'), true);
-    assert.deepEqual(await filters(), { tab: '全部', quickView: '', query: '', tags: { 事项类型: ['检查'] }, priorities: [] });
+    assert.deepEqual(await filters(), { tab: '待处理', quickView: '', query: '', tags: { 事项类型: ['检查'] }, priorities: [] });
 
     for (const id of ['deleted', 'merged']) {
       const before = await filters();

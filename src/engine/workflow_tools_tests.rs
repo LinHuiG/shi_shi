@@ -134,7 +134,7 @@ fn one_sentence_edit_saves_the_project_in_the_same_transaction_and_stale_edits_d
             .unwrap(),
     )
     .unwrap();
-    let result = json!({"changes":[{"field":"next_step","value":"Inspect synthetic evidence"}],"tag_changes":[],"reason":"Synthetic edit","suggested_project_id":"synthetic-project","suggested_project_reason":"Matching directory"});
+    let result = json!({"changes":[{"field":"description","value":"Inspect synthetic evidence"}],"tag_changes":[],"reason":"Synthetic edit","suggested_project_id":"synthetic-project","suggested_project_reason":"Matching directory"});
     let edit_audit = app.state.lock().unwrap().audit.len();
     crate::test_support::persistence_failure(&root, true).unwrap();
     assert!(app

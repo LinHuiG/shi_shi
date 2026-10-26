@@ -300,7 +300,13 @@ pub struct TaskStep {
     pub status: String,
     pub depends_on: Vec<String>,
     pub waiting_for: String,
-    pub next_step: String,
+    /// Read-only compatibility with the retired task field. Never written back.
+    #[serde(
+        rename = "next_step",
+        skip_serializing,
+        deserialize_with = "discard_retired_task_field"
+    )]
+    pub retired_next_step: (),
     pub confirmed: bool,
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -337,7 +343,13 @@ pub struct Task {
     pub status: String,
     pub blocker: String,
     pub waiting_for: String,
-    pub next_step: String,
+    /// Read-only compatibility with the retired task field. Never written back.
+    #[serde(
+        rename = "next_step",
+        skip_serializing,
+        deserialize_with = "discard_retired_task_field"
+    )]
+    pub retired_next_step: (),
     pub due: String,
     pub created: i64,
     pub updated: i64,
@@ -1015,5 +1027,29 @@ mod tests {
             crate::tags::effective_tags(&t, &catalog, "等级", at)[0].value,
             "优先"
         );
+    }
+}
+
+fn discard_retired_task_field<'de, D: serde::Deserializer<'de>>(d: D) -> Result<(), D::Error> {
+    serde::de::IgnoredAny::deserialize(d).map(|_| ())
+}
+
+#[cfg(test)]
+mod retired_task_field_tests {
+    use super::*;
+    #[test]
+    fn legacy_field_is_read_and_discarded_without_relaxing_the_task_schema() {
+        let task: Task = serde_json::from_value(serde_json::json!({"id":"legacy","title":"Synthetic title","description":"Keep this","next_step":"Retired text","steps":[{"id":"old-step","title":"Keep history","next_step":"Retired step"}]})).unwrap();
+        let saved = serde_json::to_value(task).unwrap();
+        assert!(saved.get("next_step").is_none());
+        assert!(saved["steps"][0].get("next_step").is_none());
+        assert_eq!(saved["description"], "Keep this");
+        assert_eq!(saved["steps"][0]["title"], "Keep history");
+        assert!(
+            serde_json::from_value::<Task>(serde_json::json!({"unrecognized_field":true})).is_err()
+        );
+        for kind in ["classify", "format", "edit"] {
+            assert!(!crate::ai::schema(kind).to_string().contains("next_step"));
+        }
     }
 }

@@ -14,8 +14,8 @@ use tao::{
 };
 use wry::{WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 const LIFETIME: Duration = Duration::from_secs(300);
-const WIDTH: f64 = 350.;
-const HEIGHT: f64 = 178.;
+const WIDTH: f64 = 320.;
+const HEIGHT: f64 = 140.;
 const MAX_VISIBLE: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -149,8 +149,6 @@ fn changes(audits: &[Audit]) -> Vec<Notice> {
                 .into()
             } else if changed("due") {
                 "截止时间已调整".into()
-            } else if changed("next_step") {
-                "下一步已更新".into()
             } else if changed("tags") || changed("priority") {
                 "事项标签已调整".into()
             } else if changed("waiting_for") {
@@ -485,8 +483,8 @@ mod tests {
     fn summaries_are_short_and_only_meaningful_ai_changes_notify() {
         let mut accepted = audit(
             "a",
-            json!({"title":"Test","next_step":"old"}),
-            json!({"title":"Test","next_step":"new"}),
+            json!({"title":"Test","description":"old"}),
+            json!({"title":"Test","description":"new"}),
         );
         accepted.change_summary = "方案已确认，等待执行".into();
         assert_eq!(
@@ -494,7 +492,7 @@ mod tests {
             "方案已确认，等待执行"
         );
         accepted.change_summary = "长".repeat(31);
-        assert_eq!(changes(&[accepted.clone()])[0].summary, "下一步已更新");
+        assert_eq!(changes(&[accepted.clone()])[0].summary, "事项内容已更新");
         accepted.kind = "manual_edit".into();
         assert!(changes(&[accepted]).is_empty());
         assert!(changes(&[audit("a", json!({"updated":1}), json!({"updated":2}))]).is_empty());

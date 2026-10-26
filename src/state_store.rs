@@ -56,6 +56,7 @@ impl Store {
         id: &str,
         terms: Vec<String>,
         ascending: bool,
+        range: (i64, i64),
         requested: usize,
     ) -> Result<Value, String> {
         let searching = !terms.is_empty();
@@ -83,31 +84,30 @@ impl Store {
             )
             .map_err(error)?;
         let predicate = format!(
-            "{scope}{}",
+            "{scope} AND time>=?2 AND time<=?3{}",
             if searching {
                 " AND audit_matches(payload)"
             } else {
                 ""
             }
         );
-        let total: i64 = if searching {
+        let total: i64 = {
             tx.query_row(
                 &format!("SELECT count(*) FROM audit WHERE {predicate}"),
-                [id],
+                params![id, range.0, range.1],
                 |r| r.get(0),
             )
             .map_err(error)?
-        } else {
-            all
         };
         let pages = (total as usize).div_ceil(50).max(1);
         let page = requested.max(1).min(pages);
         let direction = if ascending { "ASC" } else { "DESC" };
-        let mut statement = tx.prepare(&format!("SELECT ordinal,payload FROM audit WHERE {predicate} ORDER BY time {direction},ordinal {direction} LIMIT 50 OFFSET ?2")).map_err(error)?;
+        let mut statement = tx.prepare(&format!("SELECT ordinal,payload FROM audit WHERE {predicate} ORDER BY time {direction},ordinal {direction} LIMIT 50 OFFSET ?4")).map_err(error)?;
         let rows = statement
-            .query_map(params![id, ((page - 1) * 50) as i64], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })
+            .query_map(
+                params![id, range.0, range.1, ((page - 1) * 50) as i64],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
             .map_err(error)?;
         let rows = rows
             .map(|row| {

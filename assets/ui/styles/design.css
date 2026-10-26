@@ -13,7 +13,6 @@ body {
 button,
 .nav,
 .side-view,
-.recent-item,
 .task-row,
 .tag-option,
 .tag-all,
@@ -113,12 +112,10 @@ input[type='radio'] {
 .nav.active .glyph {
   color: var(--accent);
 }
-.side-view,
-.recent-item {
+.side-view{
   border-radius: var(--r-sm);
 }
-.side-view:hover,
-.recent-item:hover {
+.side-view:hover{
   background: var(--surface-raised);
 }
 .top {

@@ -1,4 +1,18 @@
 let modalSchedule = null;
+const scheduleSaving = new Set(), scheduleSaveErrors = new Map();
+async function toggleSchedule(id) {
+  if (scheduleSaving.has(id)) return;
+  const s=state.schedules.find(s=>s.id===id);
+  if (!s) return;
+  scheduleSaving.add(id);scheduleSaveErrors.delete(id);renderSchedules();
+  try {
+    const saved=await rpc("schedule_edit", {schedule:{...s, enabled:!s.enabled}});
+    const index=state.schedules.findIndex(s=>s.id===id);
+    if(saved?.id===id && index>=0 && saved.updated>=state.schedules[index].updated)state.schedules[index]={...state.schedules[index],...saved};
+    await refreshState(true);
+  } catch (error) { scheduleSaveErrors.set(id,error.message); }
+  finally { scheduleSaving.delete(id);if(page==="schedules")renderSchedules(); }
+}
 const weekdayNames = ['一', '二', '三', '四', '五', '六', '日'];
 function scheduleLabel(s) {
   return (
@@ -13,7 +27,7 @@ function renderSchedules() {
   const schedules = state.schedules || [];
   setHtml(
     '#view',
-    `<div class="page schedule-page"><div class="schedule-intro">定时生成事项${help('应用运行时生效；重新打开只补当天已到点的事项，不补往日。')}</div>${schedules.length ? schedules.map((s) => `<article class="schedule-card ${s.enabled ? '' : 'paused'}"><div class="schedule-heading"><h2>${esc(s.title)}</h2><span class="badge ${s.enabled ? 'normal' : ''}">${s.enabled ? '已启用' : '已暂停'}</span></div><div class="schedule-timing">${esc(scheduleLabel(s))} </div>${s.description ? `<div class="description">${esc(s.description)}</div>` : ''}<div class="row">${extraTagBadges(s)}</div><div class="helper" style="margin-top:10px">${s.enabled ? (s.next_at ? '下次生成 ' + esc(date(s.next_at)) : '等待下次生成时间') : '暂停期间不生成事项'}${s.last_generated_on ? ' · 上次生成 ' + esc(s.last_generated_on) : ''}</div><div class="schedule-actions"><button data-schedule-edit="${s.id}">编辑</button><button data-schedule-toggle="${s.id}">${s.enabled ? '暂停' : '启用'}</button><button class="quiet" data-schedule-remove="${s.id}">删除</button></div></article>`).join('') : empty('暂无定时事项', '自己填写规则，或输入“每个工作日 9:00 整理本周计划”。', '<button class="primary" data-action="new-schedule">新建定时事项</button>')}</div>`,
+    `<div class="page schedule-page"><div class="schedule-intro">定时生成事项${help('应用运行时生效；重新打开只补当天已到点的事项，不补往日。')}</div>${schedules.length ? schedules.map((s) => `<article class="schedule-card ${s.enabled ? '' : 'paused'}"><div class="schedule-heading"><h2>${esc(s.title)}</h2><button class="mini-switch schedule-switch ${s.enabled ? 'on' : ''}" role="switch" aria-label="${esc(s.title)}：${s.enabled ? '暂停' : '启用'}定时生成" aria-checked="${!!s.enabled}" aria-busy="${scheduleSaving.has(s.id)}" title="${scheduleSaving.has(s.id) ? '正在保存…' : s.enabled ? '已启用，点击暂停' : '已暂停，点击启用'}" data-schedule-toggle="${s.id}" ${scheduleSaving.has(s.id) ? 'disabled' : ''}><i></i></button></div><div class="schedule-timing">${esc(scheduleLabel(s))} </div>${s.description ? `<div class="description">${esc(s.description)}</div>` : ''}<div class="row">${extraTagBadges(s)}</div><div class="helper" style="margin-top:10px">${s.enabled ? (s.next_at ? '下次生成 ' + esc(date(s.next_at)) : '等待下次生成时间') : '暂停期间不生成事项'}${s.last_generated_on ? ' · 上次生成 ' + esc(s.last_generated_on) : ''}</div><div class="schedule-actions"><button data-schedule-edit="${s.id}">编辑</button><button class="quiet" data-schedule-remove="${s.id}">删除</button></div>${scheduleSaveErrors.has(s.id) ? `<p class="schedule-save-error error-box" role="alert">${esc(scheduleSaveErrors.get(s.id))}<button class="quiet" data-schedule-toggle="${s.id}">重试</button></p>` : ''}</article>`).join('') : empty('暂无定时事项', '自己填写规则，或输入“每个工作日 9:00 整理本周计划”。', '<button class="primary" data-action="new-schedule">新建定时事项</button>')}</div>`,
   );
 }
 function scheduleForm(
@@ -68,7 +82,7 @@ function newModal(text = '', sources = []) {
 function formModal(t) {
   modalTask = structuredClone(t);
   setModal(
-    `<h2>${t.id ? '编辑事项' : '新建事项'}</h2>${t.id ? `<div class="schedule-natural"><label for="edit-instruction">一句话修改</label><textarea id="edit-instruction" maxlength="6000" rows="3" placeholder="例如：问题已定位，现在等测试验证，优先级改为高，截止时间延到明天17点。"></textarea><button data-action="ai-edit-task">AI 分析并更新</button>${help('仅修改当前事项，未涉及的内容保留；下方仍可手动编辑。')}</div>` : ''}<div class="form-group"><label>标题</label><input id="f-title" value="${esc(t.title)}"></div><div class="form-group"><label>描述</label><textarea id="f-description">${esc(t.description)}</textarea></div>${taskTagEditor(t, true)}<div class="cols"><div class="form-group"><label>状态</label><select id="f-status">${['待处理', '已完成', '无需处理', '已取消'].map((p) => `<option ${p === t.status ? 'selected' : ''}>${p}</option>`).join('')}</select></div></div><details class="task-other-settings" ${t.id && (t.due || t.blocker?.trim() || t.waiting_for?.trim() || t.next_step?.trim()) ? 'open' : ''}><summary>其他设置</summary><div class="form-group"><label>截止时间</label><input id="f-due" type="datetime-local" value="${esc(localDue(t.due))}"></div><div class="form-group"><label>阻塞点</label><input id="f-blocker" value="${esc(t.blocker)}"></div><div class="form-group"><label>等待谁</label><input id="f-wait" value="${esc(t.waiting_for)}"></div><div class="form-group"><label>下一步</label><input id="f-next" value="${esc(t.next_step)}"></div></details><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="save-task">保存事项</button></div>`,
+    `<h2>${t.id ? '编辑事项' : '新建事项'}</h2>${t.id ? `<div class="schedule-natural"><label for="edit-instruction">一句话修改</label><textarea id="edit-instruction" maxlength="6000" rows="3" placeholder="例如：问题已定位，现在等测试验证，优先级改为高，截止时间延到明天17点。"></textarea><button data-action="ai-edit-task">AI 分析并更新</button>${help('仅修改当前事项，未涉及的内容保留；下方仍可手动编辑。')}</div>` : ''}<div class="form-group"><label>标题</label><input id="f-title" value="${esc(t.title)}"></div><div class="form-group"><label>描述</label><textarea id="f-description">${esc(t.description)}</textarea></div>${taskTagEditor(t, true)}<div class="cols"><div class="form-group"><label>状态</label><select id="f-status">${['待处理', '已完成', '无需处理', '已取消'].map((p) => `<option ${p === t.status ? 'selected' : ''}>${p}</option>`).join('')}</select></div></div><details class="task-other-settings" ${t.id && (t.due || t.blocker?.trim() || t.waiting_for?.trim()) ? 'open' : ''}><summary>其他设置</summary><div class="form-group"><label>截止时间</label><input id="f-due" type="datetime-local" value="${esc(localDue(t.due))}"></div><div class="form-group"><label>阻塞点</label><input id="f-blocker" value="${esc(t.blocker)}"></div><div class="form-group"><label>等待谁</label><input id="f-wait" value="${esc(t.waiting_for)}"></div></details><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="save-task">保存事项</button></div>`,
   );
 }
 function readTaskForm() {
@@ -85,7 +99,6 @@ function readTaskForm() {
     follow_deadline: true,
     blocker: $('#f-blocker').value,
     waiting_for: $('#f-wait').value,
-    next_step: $('#f-next').value,
   };
 }
 function blankTask() {
@@ -99,7 +112,6 @@ function blankTask() {
     status: '待处理',
     blocker: '',
     waiting_for: '',
-    next_step: '',
     due: '',
     evidence: { direct: manualSources, background: [], completion: [] },
     updated: 0,

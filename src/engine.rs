@@ -2439,6 +2439,7 @@ fn task_from_ui(value: &Value) -> Result<Task, String> {
         for key in [
             "number",
             "evidence_count",
+            "change_count",
             "has_tool_calls",
             "effective_priority",
             "effective_tags",
@@ -2453,20 +2454,19 @@ fn task_from_ui(value: &Value) -> Result<Task, String> {
     serde_json::from_value(value).map_err(|e| e.to_string())
 }
 
-const EDIT_FIELDS: [&str; 7] = [
+const EDIT_FIELDS: [&str; 6] = [
     "title",
     "description",
     "status",
     "blocker",
     "waiting_for",
-    "next_step",
     "due",
 ];
 fn validate_edit(t: &Task) -> Result<(), String> {
     if t.title.trim().is_empty() || t.title.chars().count() > 200 {
         return Err("标题需要1–200字".into());
     }
-    if [&t.description, &t.blocker, &t.waiting_for, &t.next_step]
+    if [&t.description, &t.blocker, &t.waiting_for]
         .iter()
         .any(|s| s.chars().count() > 6000)
     {

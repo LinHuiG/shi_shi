@@ -248,7 +248,7 @@ document.addEventListener(
       }, 0);
       return;
     }
-    if (e.target.closest('[data-page],[data-recent],[data-view],[data-prompt-section]')) return;
+    if (e.target.closest('[data-page],[data-view],[data-prompt-section]')) return;
     if (!e.target.closest('[data-ai-add],[data-ai-edit],[data-ai-remove]')) {
       dismissUnchangedConnectionEditor();
       return;

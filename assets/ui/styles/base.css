@@ -865,8 +865,7 @@ h3 {
   padding: 0 11px;
   margin: 18px 0 8px;
 }
-.side-view,
-.recent-item {
+.side-view{
   display: flex;
   align-items: center;
   width: 100%;
@@ -883,24 +882,6 @@ h3 {
 .side-view span {
   margin-left: auto;
   color: var(--g10);
-}
-.recent-item {
-  font-size: var(--fs-caption);
-  display: block;
-}
-.recent-dot {
-  display: inline-block;
-  width: 5px;
-  height: 5px;
-  background: var(--g9);
-  border-radius: 50%;
-  margin-right: 8px;
-  vertical-align: middle;
-}
-.side-empty {
-  font-size: var(--fs-caption);
-  color: var(--g9);
-  margin-left: 12px;
 }
 .detail-actions {
   border: 0;
@@ -1891,8 +1872,7 @@ select {
   margin-top: 13px;
   margin-bottom: 5px;
 }
-.side-view,
-.recent-item {
+.side-view{
   padding: 4px 10px;
 }
 .sidebar .bottom {

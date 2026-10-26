@@ -195,7 +195,6 @@ pub fn materialize(action: &Value, tasks: &[Task]) -> Result<Task, String> {
             "status",
             "blocker",
             "waiting_for",
-            "next_step",
             "due",
             "summary",
         ]
@@ -284,7 +283,6 @@ pub fn task_value(t: &Value) -> Value {
             "due",
             "blocker",
             "waiting_for",
-            "next_step",
             "manual",
         ],
         180,
@@ -391,7 +389,6 @@ pub fn audit_value(a: &Value) -> Value {
         "status",
         "blocker",
         "waiting_for",
-        "next_step",
         "due",
         "archive_note",
         "archived",

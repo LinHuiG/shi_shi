@@ -11,6 +11,7 @@ const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.
     const trigger=page.locator('[data-task-status-trigger]'),menu=page.locator('.task-status-popover');
     const openMenu=async()=>{await page.locator('#task-search').hover();await trigger.hover();await menu.waitFor({state:'visible'});};
     await trigger.waitFor();
+    await page.evaluate(()=>{tab="全部";renderTasks();});
     assert.equal(await trigger.innerText(),'标记完成');
     assert.equal(await page.locator('.detail-actions > [data-action="tomorrow"],.detail-actions > [data-action="dismiss"],.detail-actions > [data-action="archive-note"]').count(),0);
     assert.equal(await page.locator('.detail-actions > [data-handle="start"]').count(),1);

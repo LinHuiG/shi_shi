@@ -90,7 +90,7 @@ fn task_update_kind(a: &Audit) -> bool {
 
 /// Only fields that exist in the current task schema may enter a derived update
 /// snapshot. General settings, prompt bodies, logs and credentials never do.
-const TASK_UPDATE_FIELDS: [&str; 36] = [
+const TASK_UPDATE_FIELDS: [&str; 35] = [
     "decision_context",
     "suggested_project_id",
     "suggested_project_reason",
@@ -111,7 +111,6 @@ const TASK_UPDATE_FIELDS: [&str; 36] = [
     "status",
     "blocker",
     "waiting_for",
-    "next_step",
     "due",
     "created",
     "updated",

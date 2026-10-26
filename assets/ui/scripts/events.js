@@ -24,17 +24,7 @@ document.addEventListener('click', async (e) => {
       return;
     }
     if (b.dataset.scheduleToggle) {
-      const s = state.schedules.find((s) => s.id === b.dataset.scheduleToggle);
-      b.disabled = true;
-      try {
-        await perform(
-          'schedule_edit',
-          { schedule: { ...s, enabled: !s.enabled } },
-          s.enabled ? '已暂停定时事项' : '已启用定时事项',
-        );
-      } finally {
-        b.disabled = false;
-      }
+      await toggleSchedule(b.dataset.scheduleToggle);
       return;
     }
     if (b.dataset.scheduleRemove) {
@@ -45,19 +35,11 @@ document.addEventListener('click', async (e) => {
       );
       return;
     }
-    if ((b.dataset.recent || b.dataset.view) && !(await leaveSettings())) return;
-    if (b.dataset.recent) {
-      page = 'tasks';
-      tab = '全部';
-      quickView = '';
-      selected = b.dataset.recent;
-      render();
-      return;
-    }
+    if (b.dataset.view && !(await leaveSettings())) return;
     if (b.dataset.view) {
       page = 'tasks';
-      tab = b.dataset.view === 'daily' ? '今日事项' : '待处理';
-      quickView = b.dataset.view === 'daily' ? '' : b.dataset.view;
+      tab = '待处理';
+      quickView = b.dataset.view === 'pending' ? '' : b.dataset.view;
       render();
       return;
     }
@@ -234,7 +216,7 @@ document.addEventListener('click', async (e) => {
             'action',
             { id: t.id, action: action === 'tomorrow' ? 'tomorrow' : 'resume_today' },
             action === 'tomorrow'
-              ? '已移至明日，明天自动回到今日事项；可在“全部”中提前恢复'
+              ? '已移至明日，明天自动回到待处理；可在“全部”中提前恢复'
               : '已恢复今日处理',
           );
         } finally {
@@ -366,25 +348,6 @@ document.addEventListener('click', async (e) => {
         break;
       case 'apply-merge':
         await applyMerge();
-        break;
-      case 'prompt': {
-        const sources = await rpc('evidence', { id: t.id });
-        const prompt = `请协助排查：${t.title}\n问题描述：${t.description}\n当前阻塞：${t.blocker || '无'}\n\n相关对话：\n${sources.map((m) => `${m.group} / ${m.sender} / ${date(m.time)}\n${readableMessage(m.text).text}`).join('\n\n')}\n\n建议起点：${t.next_step || '先确认现象和复现步骤'}\n请先只读排查，区分事实与推测；缺少资料时明确列出。任何变更操作先说明具体内容。`;
-        setModal(
-          '<h2>排查提示词</h2><div class="subtitle">复制到所选 AI 工具使用，事项状态保持不变。</div><div class="form-group"><textarea id="prompt-text" class="prompt"></textarea></div><div class="dialog-foot"><button data-action="close">关闭</button><button class="primary" data-action="copy">复制</button></div>',
-        );
-        $('#prompt-text').value = prompt;
-        break;
-      }
-      case 'copy':
-        $('#prompt-text').select();
-        try {
-          await navigator.clipboard.writeText($('#prompt-text').value);
-          toast('已复制');
-        } catch {
-          document.execCommand('copy');
-          toast('已选中提示词，可按 Ctrl+C 复制');
-        }
         break;
       case 'open-guide': {
         if (!(await leaveSettings())) break;

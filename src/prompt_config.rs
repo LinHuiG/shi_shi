@@ -32,6 +32,7 @@ fn merge(base: &mut Catalog, text: &str) -> Result<(), String> {
             "images",
             "concise",
             "wire_format",
+            "task_fields",
         ]
         .contains(&key.as_str())
             || key.starts_with("handling_frame_")

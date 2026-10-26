@@ -18,40 +18,13 @@ window.receive({id,ok:!error,data,error});},method==='update_check'?80:5);}};`;
  const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));
  await page.locator('#task-detail h2').waitFor();assert((await page.locator('#task-detail h2').innerText()).startsWith('#42'));
- assert.equal(await page.locator('.task-description.detail-panel').count(),1);assert.equal(await page.locator('.evidence-disclosure.detail-panel').count(),1);
-
- const evidence=page.locator('.evidence-disclosure'),pane=page.locator('.detail');await page.locator('[data-evidence-count]').filter({hasText:'80 条'}).waitFor();
- assert(await page.evaluate(()=>getComputedStyle(document.querySelector('.detail-panel')).backgroundColor===getComputedStyle(document.querySelector('.advice')).backgroundColor));
- async function checkBottomControl(panel){
-  await panel.evaluate(el=>{const pane=el.closest('.detail');pane.scrollTop+=el.getBoundingClientRect().top-pane.getBoundingClientRect().top+180;});
-  await page.waitForTimeout(180);
-  const button=await panel.locator('[data-detail-collapse]').boundingBox(),bounds=await pane.boundingBox();
-  assert(button.y>=bounds.y&&button.y+button.height<=bounds.y+bounds.height+1,'collapse is inside the actual visible scrollport');
-  assert(bounds.y+bounds.height-button.y-button.height<12,'collapse floats at the visible lower edge');
-  assert(await panel.evaluate(el=>!['#evidence','#task-changes'].some(selector=>{const body=el.querySelector(selector);return body&&body.clientHeight<body.scrollHeight-1;})),'record bodies expand fully');
-  await panel.locator('[data-detail-collapse]').click();await page.waitForTimeout(180);assert.equal(await panel.getAttribute('open'),null);
-  const summary=await panel.locator(':scope > summary').boundingBox();assert(summary.y>=bounds.y&&summary.y+summary.height<=bounds.y+bounds.height+1,'collapsed header remains reachable');
- }
- for(const size of [{width:1280,height:900},{width:760,height:700},{width:1280,height:540}]){
-  await page.setViewportSize(size);await evidence.locator('summary').click();await checkBottomControl(evidence);
- }
- await page.setViewportSize({width:1280,height:900});await evidence.locator('summary').click();
- await page.locator('#evidence-search').fill('未匹配的合成关键词');assert.equal(await evidence.getAttribute('open'),'');assert.equal(await evidence.locator('summary').getAttribute('aria-disabled'),'false');
- await page.evaluate(async()=>{window.retainedEvidence=evidenceRows;evidenceRows=[];fixture.tasks[0].evidence_count=0;await refreshState(true);});
- await page.waitForFunction(()=>document.querySelector('.evidence-disclosure>summary').getAttribute('aria-disabled')==='true');
- assert.equal(await evidence.getAttribute('open'),null);await evidence.locator('summary').click();assert.equal(await evidence.getAttribute('open'),null);
- await evidence.locator('summary').evaluate(el=>el.focus());await page.keyboard.press('Enter');await page.keyboard.press('Space');assert.equal(await evidence.getAttribute('open'),null);
- assert(await page.evaluate(()=>evidenceView('first').open===false));
- await page.evaluate(async()=>{evidenceRows=retainedEvidence;fixture.tasks[0].evidence_count=evidenceRows.length;await refreshState(true);});
- await page.waitForFunction(()=>document.querySelector('.evidence-disclosure>summary').getAttribute('aria-disabled')==='false');assert.equal(await evidence.getAttribute('open'),null);
- const history=page.locator('.task-changes-disclosure');await history.locator(':scope > summary').click();await page.getByText('共 75 条',{exact:true}).waitFor();
- await checkBottomControl(history);await history.locator(':scope > summary').click();await page.getByText('共 75 条',{exact:true}).waitFor();
- assert.equal(await page.locator('.task-change-row').count(),50);assert((await page.locator('.task-change-row').first().innerText()).includes('Unicode'));
- await page.locator('[data-task-changes-sort]').click();await page.waitForFunction(()=>document.querySelector('.task-change-row')?.textContent.includes('合成修改 0'));
- await page.locator('#task-changes-search').fill('unicode');await page.getByText('匹配 1 / 共 75 条').waitFor();assert.equal(await page.locator('.task-change-row').count(),1);
- await page.locator('#task-changes-search').evaluate(el=>{el.value='中文';el.dispatchEvent(new CompositionEvent('compositionend',{bubbles:true,data:'中文'}));});await page.getByText('匹配 0 / 共 75 条').waitFor();
- await page.locator('#task-changes-search').fill('unicode');await page.getByText('匹配 1 / 共 75 条').waitFor();await page.evaluate(()=>refreshState(true));assert.equal(await page.locator('#task-changes-search').inputValue(),'unicode');assert.equal(await history.getAttribute('open'),'');
- await page.evaluate(()=>Promise.allSettled(document.getAnimations().map(a=>a.finished)));await page.screenshot({path:path.join(out,'task-history.png')});
+ assert.equal(await page.locator('.task-description.detail-panel').count(),1);
+ assert.equal(await page.locator('[data-task-record]').count(),2);
+ await page.locator('[data-task-record="changes"]').click();await page.waitForFunction(()=>document.querySelectorAll('#task-record-window .event').length===50);
+ assert((await page.locator('#task-record-window .event').first().innerText()).includes('Unicode'));
+ await page.locator('#task-record-search').fill('unicode');await page.waitForFunction(()=>document.querySelectorAll('#task-record-window .event').length===1);
+ await page.evaluate(()=>refreshState(true));assert.equal(await page.locator('#task-record-search').inputValue(),'unicode');
+ await page.keyboard.press('Escape');assert.equal(await page.locator('#task-record-window').count(),0);
  await page.locator('[data-page="settings"]').first().click();await page.locator('#settings-about').waitFor();assert(await page.locator('#cfg-auto-update').isChecked());assert((await page.locator('#settings-about').innerText()).includes('版本 1.1.17'));assert(!(await page.locator('.about-description').innerText()).includes('LinHuiG'));
 
  const buildLabel=await page.locator('#version-build-time').innerText();assert(buildLabel.startsWith('发布于 '));assert.equal(await page.locator('#update-history').count(),0);assert.equal(await page.locator('.about-head>.about-version + #version-build-time').count(),1);
