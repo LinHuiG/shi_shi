@@ -5,6 +5,41 @@ pub fn tomorrow_start(at: i64) -> i64 {
     ((at + 8 * 3_600_000).div_euclid(86_400_000) + 1) * 86_400_000 - 8 * 3_600_000
 }
 
+/// Explicit deferrals use Shanghai calendar time, independent of workday gates.
+pub fn defer_until(choice: &str, work_start: &str, at: i64) -> Result<i64, String> {
+    if choice == "hour" {
+        return Ok(at + 3_600_000);
+    }
+    let day = shanghai_day(at).ok_or("当前时间无效")?;
+    let (day, time) = match choice {
+        "afternoon" => (day, NaiveTime::from_hms_opt(13, 0, 0).unwrap()),
+        "evening" => (day, NaiveTime::from_hms_opt(17, 0, 0).unwrap()),
+        "tomorrow" | "next_week" => {
+            let days = if choice == "tomorrow" {
+                1
+            } else {
+                8 - day.weekday().number_from_monday()
+            };
+            (
+                day + Duration::days(days as i64),
+                NaiveTime::parse_from_str(work_start, "%H:%M")
+                    .map_err(|_| "上班时间无效，请检查设置")?,
+            )
+        }
+        _ => return Err("延后时间选项无效".into()),
+    };
+    let until = FixedOffset::east_opt(8 * 3600)
+        .unwrap()
+        .from_local_datetime(&day.and_time(time))
+        .single()
+        .ok_or("延后时间无效")?
+        .timestamp_millis();
+    if until <= at {
+        return Err("该延后时刻已过，请重新选择".into());
+    }
+    Ok(until)
+}
+
 pub fn validate(s: &mut Schedule) -> Result<(), String> {
     s.title = s.title.trim().into();
     if s.title.is_empty() || s.title.chars().count() > 200 {
@@ -85,6 +120,30 @@ mod tests {
     use crate::model::deadline_ms;
     fn at(s: &str) -> i64 {
         deadline_ms(s).unwrap()
+    }
+    #[test]
+    fn deferral_calendar_and_expired_choices() {
+        let now = at("2026-10-28T12:30:00+08:00");
+        for (choice, expected) in [
+            ("hour", "2026-10-28T13:30:00+08:00"),
+            ("afternoon", "2026-10-28T13:00:00+08:00"),
+            ("evening", "2026-10-28T17:00:00+08:00"),
+            ("tomorrow", "2026-10-29T08:45:00+08:00"),
+            ("next_week", "2026-11-02T08:45:00+08:00"),
+        ] {
+            assert_eq!(defer_until(choice, "08:45", now).unwrap(), at(expected));
+        }
+        assert!(defer_until("afternoon", "08:45", at("2026-10-28T13:00:00+08:00")).is_err());
+        assert!(defer_until("evening", "08:45", at("2026-10-28T17:00:00+08:00")).is_err());
+        assert_eq!(
+            defer_until("next_week", "09:00", at("2026-11-02T08:00:00+08:00")).unwrap(),
+            at("2026-11-09T09:00:00+08:00")
+        );
+        assert_eq!(
+            defer_until("tomorrow", "09:00", at("2026-12-31T23:59:00+08:00")).unwrap(),
+            at("2027-01-01T09:00:00+08:00")
+        );
+        assert!(defer_until("tomorrow", "invalid", now).is_err());
     }
     fn daily() -> Schedule {
         Schedule {

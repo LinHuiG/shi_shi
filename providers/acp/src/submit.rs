@@ -45,14 +45,6 @@ pub struct SubmitResultFile {
 }
 
 #[derive(Debug, Clone)]
-pub struct AcceptedSubmission {
-    pub request_id: String,
-    pub kind: String,
-    pub schema_hash: String,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone)]
 pub struct SubmitPaths {
     pub directory: PathBuf,
     pub ticket_path: PathBuf,
@@ -61,34 +53,25 @@ pub struct SubmitPaths {
     pub state_path: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum SubmitError {
+    #[error("submit store I/O error: {0}")]
     Io(String),
+    #[error("invalid submit path: {0}")]
     InvalidPath(String),
+    #[error("invalid submit ticket: {0}")]
     InvalidTicket(String),
+    #[error("no accepted submit_analysis result")]
     Missing,
+    #[error("submit_analysis is closed: {0}")]
     Closed(String),
+    #[error("duplicate submit_analysis call")]
     Duplicate,
+    #[error("submit_analysis schema invalid: {0:?}")]
     Schema(Vec<String>),
+    #[error("submit_analysis protocol error: {0}")]
     Protocol(String),
 }
-
-impl std::fmt::Display for SubmitError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(message) => write!(f, "submit store I/O error: {message}"),
-            Self::InvalidPath(message) => write!(f, "invalid submit path: {message}"),
-            Self::InvalidTicket(message) => write!(f, "invalid submit ticket: {message}"),
-            Self::Missing => f.write_str("no accepted submit_analysis result"),
-            Self::Closed(reason) => write!(f, "submit_analysis is closed: {reason}"),
-            Self::Duplicate => f.write_str("duplicate submit_analysis call"),
-            Self::Schema(errors) => write!(f, "submit_analysis schema invalid: {errors:?}"),
-            Self::Protocol(message) => write!(f, "submit_analysis protocol error: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for SubmitError {}
 
 impl SubmitPaths {
     pub fn create(
@@ -181,7 +164,7 @@ impl SubmitPaths {
         expected_request_id: &str,
         expected_kind: &str,
         expected_schema: &Value,
-    ) -> Result<AcceptedSubmission, SubmitError> {
+    ) -> Result<Value, SubmitError> {
         if self.failure_path.is_file() {
             let reason = fs::read_to_string(&self.failure_path)
                 .unwrap_or_default()
@@ -211,12 +194,7 @@ impl SubmitPaths {
             ));
         }
         schema_validate::validate(expected_schema, &result.value).map_err(SubmitError::Schema)?;
-        Ok(AcceptedSubmission {
-            request_id: result.request_id,
-            kind: result.kind,
-            schema_hash: result.schema_hash,
-            value: result.value,
-        })
+        Ok(result.value)
     }
 
     pub fn submit(&self, ticket: &SubmitTicket, arguments: &Value) -> Result<Value, SubmitError> {
@@ -372,10 +350,8 @@ pub fn serve(ticket_path: &Path) -> Result<(), SubmitError> {
     let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    loop {
-        let Some(line) = read_mcp_line(&mut reader)? else {
-            return Ok(());
-        };
+    let mut line = Vec::new();
+    while read_mcp_line(&mut reader, &mut line)? {
         if line.is_empty() {
             continue;
         }
@@ -480,40 +456,13 @@ pub fn serve(ticket_path: &Path) -> Result<(), SubmitError> {
             )?,
         }
     }
+    Ok(())
 }
 
-fn read_mcp_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, SubmitError> {
-    let mut line = Vec::new();
-    let mut too_long = false;
-    loop {
-        let available = reader
-            .fill_buf()
-            .map_err(|error| SubmitError::Io(error.to_string()))?;
-        if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
-            }
-            break;
-        }
-        if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
-            let take = position + 1;
-            if line.len() + take > MAX_MCP_LINE + 2 {
-                too_long = true;
-            } else {
-                line.extend_from_slice(&available[..take]);
-            }
-            reader.consume(take);
-            break;
-        }
-        if line.len() + available.len() > MAX_MCP_LINE + 2 {
-            too_long = true;
-        } else {
-            line.extend_from_slice(available);
-        }
-        let consumed = available.len();
-        reader.consume(consumed);
-    }
-    if too_long {
+fn read_mcp_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<bool, SubmitError> {
+    let bytes = crate::jsonrpc::read_line(reader, line, MAX_MCP_LINE + 2)
+        .map_err(|error| SubmitError::Io(error.to_string()))?;
+    if bytes > MAX_MCP_LINE + 2 {
         return Err(SubmitError::Protocol("MCP line is too long".into()));
     }
     while line
@@ -522,7 +471,7 @@ fn read_mcp_line(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, SubmitErr
     {
         line.pop();
     }
-    Ok(Some(line))
+    Ok(bytes != 0)
 }
 
 fn write_line(out: &mut impl Write, value: &Value) -> Result<(), SubmitError> {
@@ -536,6 +485,24 @@ fn write_line(out: &mut impl Write, value: &Value) -> Result<(), SubmitError> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn mcp_frames_keep_empty_lines_tails_and_the_existing_size_boundary() {
+        let mut reader = &b"\r\n{}\n[]"[..];
+        let mut line = Vec::with_capacity(MAX_MCP_LINE + 2);
+        let allocated = line.as_ptr();
+        for expected in [b"".as_slice(), b"{}", b"[]"] {
+            assert!(read_mcp_line(&mut reader, &mut line).unwrap());
+            assert_eq!(line, expected);
+            assert_eq!(line.as_ptr(), allocated);
+        }
+        assert!(!read_mcp_line(&mut reader, &mut line).unwrap());
+        for size in [MAX_MCP_LINE + 2, MAX_MCP_LINE + 3] {
+            let input = vec![b'x'; size];
+            let result = read_mcp_line(&mut input.as_slice(), &mut line);
+            assert_eq!(result.is_ok(), size == MAX_MCP_LINE + 2);
+        }
+    }
+
     fn schema() -> Value {
         json!({
             "type": "object",
@@ -548,16 +515,7 @@ mod tests {
         })
     }
 
-    fn temp_dir(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "shishi-submit-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ))
-    }
+    use crate::test_path as temp_dir;
 
     #[test]
     fn accepts_one_valid_result_and_rejects_duplicate() {
@@ -568,7 +526,7 @@ mod tests {
             .unwrap();
         assert_eq!(result["isError"], false);
         let accepted = paths.read_accepted("req-1", "edit", &schema()).unwrap();
-        assert_eq!(accepted.value["reason"], "ok");
+        assert_eq!(accepted["reason"], "ok");
         assert!(matches!(
             paths.submit(&ticket, &json!({"reason": "ok", "changes": []})),
             Err(SubmitError::Duplicate)
@@ -597,7 +555,7 @@ mod tests {
             false
         );
         let accepted = paths.read_accepted("req-default", "edit", &schema).unwrap();
-        assert_eq!(accepted.value["summary"], "");
+        assert_eq!(accepted["summary"], "");
         assert_eq!(read_invalid_count(&paths.state_path), 0);
         let _ = fs::remove_dir_all(base);
     }
@@ -650,14 +608,47 @@ mod tests {
     }
 
     #[test]
-    fn ticket_hash_and_expected_request_are_enforced() {
+    fn accepted_result_identity_and_schema_are_enforced() {
         let base = temp_dir("hash");
-        let (paths, _ticket) = SubmitPaths::create(&base, "req-5", "edit", schema()).unwrap();
+        let (paths, ticket) = SubmitPaths::create(&base, "req-5", "edit", schema()).unwrap();
+        let value = json!({"reason":"ok","changes":[]});
+        paths.submit(&ticket, &value).unwrap();
+        assert_eq!(
+            paths.read_accepted("req-5", "edit", &schema()).unwrap(),
+            value
+        );
         let mut modified = schema();
         modified["properties"]["reason"]["maxLength"] = json!(20);
-        assert!(paths.read_accepted("req-5", "edit", &modified).is_err());
-        assert!(paths.read_accepted("other", "edit", &schema()).is_err());
-        assert!(paths.ticket_path.is_file());
+        assert!(
+            matches!(paths.read_accepted("req-5", "edit", &modified), Err(SubmitError::Protocol(error)) if error.contains("schema hash"))
+        );
+        assert!(
+            matches!(paths.read_accepted("other", "edit", &schema()), Err(SubmitError::Protocol(error)) if error.contains("id/kind"))
+        );
+        let saved: Value = serde_json::from_slice(&fs::read(&paths.result_path).unwrap()).unwrap();
+        for (field, replacement, expected) in [
+            ("version", json!(2), "version"),
+            ("request_id", json!("other"), "id/kind"),
+            ("kind", json!("other"), "id/kind"),
+            ("schema_hash", json!("bad"), "schema hash"),
+            ("value", json!({"reason":"ok"}), "schema"),
+            (
+                "value",
+                json!({"reason":"ok","changes":[],"extra":true}),
+                "schema",
+            ),
+        ] {
+            let mut tampered = saved.clone();
+            tampered[field] = replacement;
+            fs::write(&paths.result_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
+            match paths.read_accepted("req-5", "edit", &schema()).unwrap_err() {
+                SubmitError::Protocol(message) => {
+                    assert!(message.contains(expected), "{field}: {message}")
+                }
+                SubmitError::Schema(_) => assert_eq!(expected, "schema"),
+                other => panic!("wrong validation for {field}: {other:?}"),
+            }
+        }
         let _ = fs::remove_dir_all(base);
     }
 

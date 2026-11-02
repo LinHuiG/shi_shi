@@ -48,8 +48,6 @@
   --ease: cubic-bezier(0, 0, 0, 1);
   --line: var(--hairline-strong);
   --amber: var(--amber-fg);
-}
-:root {
   color-scheme: dark;
   --bg: var(--g3);
   --sidebar: var(--g2);
@@ -59,9 +57,7 @@
   --text: var(--g14);
   --sub: var(--g11);
   --dim: var(--g10);
-}
-/* Semantic aliases by role (cf. Radix 12-step usage). New rules use these, not ramp steps. */
-:root {
+  /* Semantic aliases by role (cf. Radix 12-step usage). New rules use these, not ramp steps. */
   --surface-layer: #272727;
   --surface-sunken: var(--g2);
   --surface: var(--g3);
@@ -72,9 +68,7 @@
   --line-hover: var(--g8);
   --text-muted: var(--g11);
   --text-secondary: var(--g12);
-}
-/* Fluent type ramp (Caption 12/16, Body 14/20, Body Large 18/24, Subtitle 20/28, Title 28/36) and motion (83/167/250 ms). */
-:root {
+  /* Fluent type ramp (Caption 12/16, Body 14/20, Body Large 18/24, Subtitle 20/28, Title 28/36) and motion (83/167/250 ms). */
   --mica-guard: rgba(32, 32, 32, 0.9);
   --mica-content: rgba(39, 39, 39, 0.96);
   --handling-bg: #191919;
@@ -89,15 +83,11 @@
   --handling-shadow: #0008;
   --handling-tool-border: #393939;
   --handling-tool-bg: #222;
-}
-:root {
   --fs-caption: 12px;
   --fs-body: 14px;
   --fs-body-large: 18px;
   --fs-subtitle: 20px;
   --fs-title: 28px;
   --dur-faster: 83ms;
-  --dur-fast: 167ms;
-  --dur-normal: 250ms;
   --ease-exit: cubic-bezier(1, 0, 1, 1);
 }

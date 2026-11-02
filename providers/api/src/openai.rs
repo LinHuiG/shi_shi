@@ -14,18 +14,21 @@
 //! that `response_format` is explicitly unsupported, the request is retried once
 //! without it and the schema is placed in the user message so strict local
 //! validation still has a contract. A received output that fails local JSON or
-//! schema validation gets one bounded correction. Known read-only tool argument
-//! errors get one separate correction without executing the invalid batch.
+//! schema validation gets one bounded correction. Recoverable tool rejections
+//! share one separate correction without executing an invalid batch.
 //! Other failures are never retried.
 //!
 //! The tool loop supports any caller-advertised tools (including
 //! `read_context`/`read_image`), validates names and arguments against those
 //! definitions, and calls only the caller's handler. It stops on the overall
-//! deadline, cancellation, or a repeated no-progress tool query. There is no
-//! cumulative RAG round or token budget.
+//! deadline or cancellation. Tool exhaustion or lack of progress closes tools
+//! for one final answer using the evidence already received. Initial input and
+//! shared continuation text have separate caller-supplied allowances.
 
 use crate::endpoint::{Endpoint, EndpointError};
-use crate::schema_validate::{self, ValidationError};
+pub use crate::json::canonical_json;
+use crate::json::chars as json_chars;
+use crate::schema_validate::{CheckedSchema, ValidationError};
 use crate::streaming::{ApiEvent, StreamCollector};
 use crate::transport::{
     HttpMethod, SystemTransport, Transport, TransportError, TransportErrorKind, TransportRequest,
@@ -47,6 +50,8 @@ pub const MODELS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const MAX_MODELS: usize = 500;
 pub const MAX_TOOLS: usize = 32;
 pub const MAX_TOOL_CALLS_PER_RESPONSE: usize = 16;
+/// A bounded oversized reply can still receive a refusal for every call.
+pub const MAX_TOOL_CALLS_IN_RESPONSE: usize = 128;
 pub const MAX_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
 pub const MAX_TOOL_RESULT_BYTES: usize = 256 * 1024;
 pub const MAX_PROMPT_BYTES: usize = 4 * 1024 * 1024;
@@ -55,7 +60,6 @@ pub const MAX_CREDENTIAL_BYTES: usize = 4096;
 pub const MAX_MODEL_CHARS: usize = 256;
 pub const MAX_TOOL_NAME_CHARS: usize = 64;
 pub const MAX_TOOL_DESCRIPTION_CHARS: usize = 1024;
-pub const MAX_FALLBACK_SCHEMA_BYTES: usize = 1024 * 1024;
 
 const RESPONSE_FORMAT_NAME: &str = "shishi_analysis";
 const MAX_CORRECTION_PATH_CHARS: usize = 80;
@@ -94,6 +98,7 @@ pub enum ApiErrorKind {
 #[derive(Clone, Debug)]
 pub struct ApiError {
     usage: Option<UsageAggregate>,
+    partial_usage: Option<Value>,
     parameter: Option<&'static str>,
     kind: ApiErrorKind,
     status: Option<u16>,
@@ -103,9 +108,10 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn simple(kind: ApiErrorKind) -> Self {
+    pub fn simple(kind: ApiErrorKind) -> Self {
         Self {
             usage: None,
+            partial_usage: None,
             parameter: None,
             kind,
             status: None,
@@ -168,18 +174,6 @@ impl ApiError {
     pub fn status(&self) -> Option<u16> {
         self.status
     }
-
-    pub fn schema_error(&self) -> Option<&ValidationError> {
-        self.schema.as_ref()
-    }
-
-    pub fn endpoint_error(&self) -> Option<EndpointError> {
-        self.endpoint
-    }
-
-    pub fn transport_error(&self) -> Option<TransportErrorKind> {
-        self.transport
-    }
 }
 
 impl fmt::Display for ApiError {
@@ -207,7 +201,7 @@ impl fmt::Display for ApiError {
             ApiErrorKind::ResponseTooLarge => {
                 f.write_str("provider response exceeded the size limit")
             }
-            ApiErrorKind::InputLimit => f.write_str("tool-loop input exceeded the character budget; completed commands were not replayed"),
+            ApiErrorKind::InputLimit => f.write_str("initial input exceeded the character budget"),
             ApiErrorKind::EmptyResponse => f.write_str("provider returned no final content"),
             ApiErrorKind::Refusal => f.write_str("provider refused or filtered the response"),
             ApiErrorKind::Truncated => f.write_str("provider output was truncated"),
@@ -267,22 +261,16 @@ struct Usage {
     cached_tokens: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct FieldSum {
-    seen: bool,
-    complete: bool,
-    sum: u64,
+crate::default_struct! {
+    #[derive(Clone, Copy, Debug)]
+    struct FieldSum {
+        seen: bool,
+        complete: bool = true,
+        sum: u64,
+    }
 }
 
 impl FieldSum {
-    fn new() -> Self {
-        Self {
-            seen: false,
-            complete: true,
-            sum: 0,
-        }
-    }
-
     fn add(&mut self, value: Option<u64>) {
         self.seen = true;
         match value {
@@ -303,7 +291,7 @@ impl FieldSum {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct UsageAggregator {
     prompt: FieldSum,
     completion: FieldSum,
@@ -311,19 +299,6 @@ struct UsageAggregator {
     cached: FieldSum,
     responses: usize,
     reported: usize,
-}
-
-impl Default for UsageAggregator {
-    fn default() -> Self {
-        Self {
-            prompt: FieldSum::new(),
-            completion: FieldSum::new(),
-            total: FieldSum::new(),
-            cached: FieldSum::new(),
-            responses: 0,
-            reported: 0,
-        }
-    }
 }
 
 impl UsageAggregator {
@@ -461,21 +436,55 @@ pub fn tool_definitions_from_mcp(value: &Value) -> Result<Vec<ToolDefinition>, A
 pub enum ToolFailureKind {
     Unavailable,
     Denied,
+    InvalidArguments,
+    BudgetExhausted,
+    UnsafeReplay,
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ToolFailure {
     kind: ToolFailureKind,
+    message: Option<String>,
 }
 
 impl ToolFailure {
     pub fn new(kind: ToolFailureKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            message: None,
+        }
     }
 
-    pub fn kind(self) -> ToolFailureKind {
+    /// A host-authored diagnostic for the model, never included in safe errors.
+    pub fn with_message(kind: ToolFailureKind, message: impl AsRef<str>) -> Self {
+        Self {
+            kind,
+            message: Some(message.as_ref().chars().take(512).collect()),
+        }
+    }
+
+    pub fn kind(&self) -> ToolFailureKind {
         self.kind
+    }
+
+    fn feedback(&self) -> &str {
+        self.message.as_deref().unwrap_or(match self.kind {
+            ToolFailureKind::Unavailable => "This tool is currently unavailable. The operation was not executed.",
+            ToolFailureKind::Denied => "This tool request was denied. The operation was not executed.",
+            ToolFailureKind::InvalidArguments => "The arguments could not be used safely. The operation was not executed. Correct them against the advertised tool schema.",
+            ToolFailureKind::BudgetExhausted => "The shared continuation budget is exhausted. The operation was not executed.",
+            ToolFailureKind::UnsafeReplay => "A prior execution of this operation has an uncertain outcome. Do not repeat it; finish using the evidence already received.",
+            ToolFailureKind::Failed => "The tool failed and its result cannot be safely accepted.",
+        })
+    }
+}
+
+impl fmt::Debug for ToolFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ToolFailure")
+            .field("kind", &self.kind)
+            .finish_non_exhaustive()
     }
 }
 
@@ -518,13 +527,42 @@ impl fmt::Debug for ToolInvocation<'_> {
 /// provider-supplied paths.
 pub trait ToolHandler {
     fn invoke(&mut self, invocation: &ToolInvocation<'_>) -> Result<ToolResult, ToolFailure>;
-    /// Query adapters keep signature deduplication. Action adapters opt in to
-    /// repeated arguments under distinct IDs; IDs themselves never replay.
-    fn allows_repeated_arguments(&self) -> bool {
+    /// Cross-field business constraints share the existing single correction.
+    /// May normalize an accepted value, but must not commit state or execute tools.
+    fn validate_output(
+        &mut self,
+        _value: &mut Value,
+        _corrected: bool,
+    ) -> Result<(), ValidationError> {
+        Ok(())
+    }
+    /// A handler may opt individual actions into repeated arguments under
+    /// distinct IDs; IDs never replay. Metered queries use query_progress.
+    fn allows_repeated_arguments(&self, _name: &str) -> bool {
         false
     }
     fn input_char_limit(&self) -> Option<usize> {
         None
+    }
+    /// Shared allowance for model continuations and all delivered tool results.
+    /// Host-authored bounded refusals and correction prompts are not charged.
+    fn continuation_char_limit(&self) -> Option<usize> {
+        None
+    }
+    /// The revision changes only when a query delivers new evidence. It permits
+    /// repeated arguments for pagination without permitting a no-progress loop.
+    fn query_progress(&self, _name: &str) -> Option<usize> {
+        None
+    }
+    fn input_chars(&self, body: &Value, serialized_chars: usize) -> usize {
+        serialized_chars.saturating_sub(
+            body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(image_data_chars)
+                .sum(),
+        )
     }
     fn validate_batch(&mut self, _calls: &[ToolInvocation<'_>]) -> Result<(), ToolFailure> {
         Ok(())
@@ -534,18 +572,65 @@ pub trait ToolHandler {
         invocation: &ToolInvocation<'_>,
         _cancel: &AtomicBool,
         _deadline: Instant,
+        _result_budget: Option<usize>,
     ) -> Result<ToolResult, ToolFailure> {
         self.invoke(invocation)
     }
 }
 
+fn image_data_chars(message: &Value) -> usize {
+    message["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| part["type"] == "image_url")
+        .filter_map(|part| part["image_url"]["url"].as_str())
+        .filter_map(|url| url.strip_prefix("data:")?.split_once(";base64,"))
+        .map(|(_, data)| data.len())
+        .sum()
+}
+
+/// JSON message framing counts; native image pixels have their own limit.
+pub fn message_input_chars(message: &Value) -> usize {
+    json_chars(message).saturating_sub(image_data_chars(message))
+}
+
+fn empty_tool_message(call_id: &str) -> Value {
+    json!({"role":"tool","tool_call_id":call_id,"content":""})
+}
+
+fn retain_continuation(
+    messages: &mut Vec<Value>,
+    message: &Value,
+    used: &mut usize,
+    limit: Option<usize>,
+) -> bool {
+    let chars = message_input_chars(message) + 1;
+    if limit.is_some_and(|limit| chars > limit.saturating_sub(*used)) {
+        return false;
+    }
+    *used = used.saturating_add(chars);
+    messages.push(message.clone());
+    true
+}
+
+fn tool_feedback(call_id: &str, reason: &str) -> Value {
+    json!({"role":"tool","tool_call_id":call_id,"content":reason})
+}
+
+fn finish_without_tools(messages: &mut Vec<Value>, reason: &str) {
+    messages.push(json!({"role":"user","content":format!("{reason} No further tools are available for this analysis. Return the final JSON required by the schema using the information already provided. State any missing evidence honestly; do not invent results or repeat operations.")}));
+}
+
 /// Images are explicit local tool output, never provider-supplied URLs. Keep
 /// their bytes out of Debug and ordinary text messages.
+#[derive(Clone)]
 pub enum ToolResult {
     Text(String),
     Content(Vec<ToolContent>),
 }
 
+#[derive(Clone)]
 pub enum ToolContent {
     Text(String),
     Image { mime_type: String, data: String },
@@ -580,7 +665,8 @@ impl ToolResult {
         Ok(Self::Content(result))
     }
 
-    fn messages(self, call_id: &str) -> Result<(Value, Vec<Value>), ApiError> {
+    /// Exact protocol messages, also used by hosts before committing read coverage.
+    pub fn messages(self, call_id: &str) -> Result<(Value, Vec<Value>), ApiError> {
         let parts = match self {
             Self::Text(text) => vec![ToolContent::Text(text)],
             Self::Content(parts) => parts,
@@ -673,10 +759,7 @@ pub fn initial_input_chars(
     schema: &Value,
     tools: &[ToolDefinition],
 ) -> usize {
-    initial_request_body(model, effort, prompt, schema, tools)
-        .to_string()
-        .chars()
-        .count()
+    json_chars(&initial_request_body(model, effort, prompt, schema, tools))
 }
 
 /// Credential-free request assembly, also used by local plain-model adapters.
@@ -687,14 +770,7 @@ pub fn initial_request_body(
     schema: &Value,
     tools: &[ToolDefinition],
 ) -> Value {
-    let messages = vec![
-        json!({"role":"system","content":prompt}),
-        json!({"role":"user","content":format!("{USER_INSTRUCTION}\n\nRequired JSON Schema (authoritative):\n{schema}")}),
-    ];
-    let mut body = build_chat_body(model, &messages, schema, tools, true);
-    if let Some(effort) = effort {
-        body["reasoning_effort"] = json!(effort);
-    }
+    let mut body = build_chat_body(model, effort, prompt, schema, tools);
     body["stream"] = json!(true);
     body["stream_options"] = json!({"include_usage":true});
     body
@@ -763,387 +839,13 @@ impl<'a> ChatCompletionsClient<'a> {
         stream: bool,
         event: &mut dyn FnMut(ApiEvent),
     ) -> Result<AnalysisOutput, ApiError> {
-        let mut usage = UsageAggregator::default();
-        self.analyze_inner(request, &mut usage, stream, event)
-            .map_err(|mut error| {
-                error.usage = Some(usage.finish());
-                error
-            })
-    }
-    fn analyze_inner(
-        &self,
-        request: AnalyzeRequest<'_, '_>,
-        usage: &mut UsageAggregator,
-        stream: bool,
-        event: &mut dyn FnMut(ApiEvent),
-    ) -> Result<AnalysisOutput, ApiError> {
-        validate_timeout(request.timeout)?;
         validate_credential(request.credential)?;
-        validate_model(request.model)?;
-        if request.reasoning_effort.is_some_and(|v| {
-            v.is_empty()
-                || v.len() > 64
-                || !v
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        }) {
-            return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
-        }
-        if request.prompt.len() > MAX_PROMPT_BYTES {
-            return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
-        }
-        schema_validate::check_schema(request.schema)
-            .map_err(|error| ApiError::with_schema(ApiErrorKind::InvalidConfig, error))?;
-        validate_tool_definitions(request.tools)?;
-        if !request.tools.is_empty() && request.tool_handler.is_none() {
-            return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
-        }
-        check_cancel(request.cancel)?;
-
-        let deadline = Instant::now()
-            .checked_add(request.timeout)
-            .ok_or_else(|| ApiError::simple(ApiErrorKind::Timeout))?;
-        let mut messages = vec![
-            json!({"role":"system","content":request.prompt}),
-            json!({"role":"user","content":format!("{USER_INSTRUCTION}\n\nRequired JSON Schema (authoritative):\n{}",request.schema)}),
-        ];
-        let mut use_response_format = true;
-        let mut fallback_used = false;
-        let mut schema_in_user = true;
-        let mut correction_used = false;
-        let mut tool_correction_used = false;
-        let mut requests = 0usize;
-        let mut tool_calls = 0usize;
-        let mut seen_calls = BTreeSet::<String>::new();
-        let mut seen_ids = BTreeSet::<String>::new();
-        let mut tool_handler = request.tool_handler;
-
-        loop {
-            check_cancel(request.cancel)?;
-            let remaining = remaining_time(deadline)?;
-            let mut body = build_chat_body(
-                request.model,
-                &messages,
-                request.schema,
-                request.tools,
-                use_response_format,
-            );
-            if let Some(effort) = request.reasoning_effort {
-                body["reasoning_effort"] = json!(effort);
-            }
-            body["stream"] = json!(stream);
-            if stream {
-                body["stream_options"] = json!({"include_usage":true});
-            }
-            let body_text = serde_json::to_string(&body)
-                .map_err(|_| ApiError::simple(ApiErrorKind::InvalidConfig))?;
-            if body_text.len() > MAX_REQUEST_BYTES {
-                return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
-            }
-            if let Some(limit) = tool_handler.as_ref().and_then(|h| h.input_char_limit()) {
-                // Native images have their own byte limits. Only their JSON
-                // framing, not base64 pixels, consumes the text budget.
-                let image_chars: usize = messages
-                    .iter()
-                    .filter_map(|message| message["content"].as_array())
-                    .flatten()
-                    .filter(|part| part["type"] == "image_url")
-                    .filter_map(|part| part["image_url"]["url"].as_str())
-                    .filter_map(|url| url.strip_prefix("data:")?.split_once(";base64,"))
-                    .map(|(_, data)| data.len())
-                    .sum();
-                if body_text.chars().count().saturating_sub(image_chars) > limit {
-                    return Err(ApiError::simple(ApiErrorKind::InputLimit));
-                }
-            }
-            let url = self.endpoint.chat_completions_url();
-            requests += 1;
-            event(ApiEvent::Phase("等待首包"));
-            let wire_request = TransportRequest::new(
-                HttpMethod::Post,
-                &url,
-                request.credential,
-                Some(body_text.as_bytes()),
-                self.max_response_bytes,
-            );
-            let output_base = if usage.responses == 0 {
-                Some(0)
-            } else {
-                usage.clone().finish().completion_tokens
-            };
-            let mut collector = StreamCollector::with_output_base(output_base);
-            let mut stream_invalid = false;
-            let response = if stream {
-                self.transport.send_stream(
-                    &wire_request,
-                    remaining,
-                    request.cancel,
-                    &mut |status, bytes| {
-                        if (200..300).contains(&status)
-                            && !stream_invalid
-                            && collector.push(bytes, event).is_err()
-                        {
-                            stream_invalid = true;
-                        }
-                    },
-                )
-            } else {
-                self.transport
-                    .send(&wire_request, remaining, request.cancel)
-            }
-            .map_err(|error| {
-                if let Some(u) = collector.usage() {
-                    usage.record(Some(u));
-                }
-                ApiError::from_transport(error)
-            })?;
-
-            check_cancel(request.cancel)?;
-            remaining_time(deadline)?;
-
-            let status = response.status();
-            if !(200..300).contains(&status) {
-                event(ApiEvent::Response(
-                    json!({"http_status":status,"body":String::from_utf8_lossy(response.body())}),
-                ));
-                if use_response_format
-                    && !fallback_used
-                    && matches!(status, 400 | 422)
-                    && explicit_unsupported_response_format(response.body())
-                {
-                    fallback_used = true;
-                    use_response_format = false;
-                    if !schema_in_user {
-                        let schema_text = request.schema.to_string();
-                        if schema_text.len() > MAX_FALLBACK_SCHEMA_BYTES {
-                            return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
-                        }
-                        let content = format!(
-                            "{USER_INSTRUCTION}\n\nRequired JSON Schema (authoritative):\n{schema_text}"
-                        );
-                        messages[1] = json!({"role":"user","content":content});
-                        schema_in_user = true;
-                    }
-                    continue;
-                }
-                let mut error = ApiError::http_status(status);
-                if let Ok(value) = serde_json::from_slice::<Value>(response.body()) {
-                    let param = value["error"]["param"].as_str().unwrap_or("");
-                    error.parameter = [
-                        "model",
-                        "reasoning_effort",
-                        "response_format",
-                        "tools",
-                        "messages",
-                        "max_tokens",
-                    ]
-                    .into_iter()
-                    .find(|name| *name == param);
-                }
-                return Err(error);
-            }
-
-            if response.body().len() > self.max_response_bytes {
-                return Err(ApiError::simple(ApiErrorKind::ResponseTooLarge));
-            }
-            let wire = if stream {
-                if stream_invalid {
-                    if let Some(u) = collector.usage() {
-                        usage.record(Some(u));
-                    }
-                    return Err(ApiError::simple(ApiErrorKind::MalformedResponse));
-                }
-                let partial_usage = collector.usage().cloned();
-                collector.finish(event).map_err(|_| {
-                    if let Some(u) = partial_usage.as_ref() {
-                        usage.record(Some(u));
-                    }
-                    ApiError::simple(ApiErrorKind::Truncated)
-                })?
-            } else {
-                let v: Value = serde_json::from_slice(response.body())
-                    .map_err(|_| ApiError::simple(ApiErrorKind::MalformedResponse))?;
-                event(ApiEvent::Response(v.clone()));
-                v
-            };
-            let parsed = parse_chat_response(&serde_json::to_vec(&wire).unwrap())?;
-            usage.record(parsed.usage.as_ref());
-
-            if parsed.refusal {
-                return Err(ApiError::simple(ApiErrorKind::Refusal));
-            }
-            if matches!(
-                parsed.finish_reason.as_deref(),
-                Some("content_filter" | "refusal")
-            ) {
-                return Err(ApiError::simple(ApiErrorKind::Refusal));
-            }
-            if parsed.finish_reason.as_deref() == Some("length") {
-                return Err(ApiError::simple(ApiErrorKind::Truncated));
-            }
-
-            if !parsed.tool_calls.is_empty() {
-                tool_calls = tool_calls.saturating_add(parsed.tool_calls.len());
-                let validated = match validate_tool_calls(&parsed.tool_calls, request.tools) {
-                    Ok(calls) => calls,
-                    Err(error)
-                        if error.kind() == ApiErrorKind::InvalidToolArguments
-                            && !tool_handler
-                                .as_ref()
-                                .is_some_and(|h| h.allows_repeated_arguments())
-                            && !tool_correction_used
-                            && parsed.tool_calls.iter().all(|call| {
-                                matches!(call.name.as_str(), "read_context" | "read_image")
-                                    && request.tools.iter().any(|t| t.name == call.name)
-                            }) =>
-                    {
-                        event(ApiEvent::ToolRejected(
-                            json!({"response":parsed.message,"error":error.to_string(),"correction":1}),
-                        ));
-                        tool_correction_used = true;
-                        event(ApiEvent::Phase("工具参数格式错误，正在纠正（1/1）"));
-                        messages.push(parsed.message.clone());
-                        for call in &parsed.tool_calls {
-                            messages.push(json!({"role":"tool","tool_call_id":call.id,"content":format!("No tools in this reply were executed. Tool argument validation failed: {error}. Correct the arguments against the advertised schema. Extra properties are forbidden. This is the only tool-argument correction opportunity.")}));
-                        }
-                        continue;
-                    }
-                    Err(error) => {
-                        event(ApiEvent::ToolRejected(
-                            json!({"response":parsed.message,"error":error.to_string(),"correction_used":tool_correction_used}),
-                        ));
-                        return Err(error);
-                    }
-                };
-                // Reject a duplicate query before invoking any handler in this
-                // response, so two identical calls cannot both run. The same
-                // signature repeated in a later response is also no progress.
-                let mut response_signatures = BTreeSet::new();
-                let mut response_ids = BTreeSet::new();
-                let allow_repeated = tool_handler
-                    .as_ref()
-                    .is_some_and(|h| h.allows_repeated_arguments());
-                for call in &validated {
-                    if !response_ids.insert(call.id.clone())
-                        || seen_ids.contains(&call.id)
-                        || !allow_repeated
-                            && (!response_signatures.insert(call.signature.clone())
-                                || seen_calls.contains(&call.signature))
-                    {
-                        return Err(ApiError::simple(ApiErrorKind::NoProgress));
-                    }
-                }
-                tool_handler
-                    .as_mut()
-                    .ok_or_else(|| ApiError::simple(ApiErrorKind::InvalidConfig))?
-                    .validate_batch(
-                        &validated
-                            .iter()
-                            .map(|call| ToolInvocation {
-                                call_id: &call.id,
-                                name: &call.name,
-                                arguments: &call.arguments,
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(|_| ApiError::simple(ApiErrorKind::InvalidToolArguments))?;
-                // Preserve provider-published reasoning and replay metadata on tool rounds.
-                messages.push(parsed.message.clone());
-                let mut image_messages = Vec::new();
-                for call in validated {
-                    check_cancel(request.cancel)?;
-                    remaining_time(deadline)?;
-                    seen_calls.insert(call.signature.clone());
-                    seen_ids.insert(call.id.clone());
-                    let handler = tool_handler
-                        .as_mut()
-                        .ok_or_else(|| ApiError::simple(ApiErrorKind::InvalidConfig))?;
-                    event(ApiEvent::Phase(if allow_repeated {
-                        "执行工具"
-                    } else if call.name == "read_context" {
-                        "读取上下文"
-                    } else if call.name == "read_image" {
-                        "读取图片"
-                    } else {
-                        "执行工具"
-                    }));
-                    let result = handler
-                        .invoke_guarded(
-                            &ToolInvocation {
-                                call_id: &call.id,
-                                name: &call.name,
-                                arguments: &call.arguments,
-                            },
-                            request.cancel,
-                            deadline,
-                        )
-                        .map_err(|_| ApiError::simple(ApiErrorKind::ToolFailed))?;
-                    check_cancel(request.cancel)?;
-                    remaining_time(deadline)?;
-                    let (tool_message, images) = result.messages(&call.id)?;
-                    messages.push(tool_message);
-                    if !images.is_empty() {
-                        image_messages.push(json!({"role":"user", "content":images}));
-                    }
-                }
-                // Complete every tool_call_id before adding multimodal input.
-                messages.extend(image_messages);
-                continue;
-            }
-
-            let Some(content) = parsed.content else {
-                return Err(ApiError::simple(ApiErrorKind::EmptyResponse));
-            };
-            event(ApiEvent::Phase("校验结果"));
-            match serde_json::from_str::<Value>(content.trim()) {
-                Ok(value) => match schema_validate::validate_output(request.schema, value) {
-                    Ok(value) => {
-                        check_cancel(request.cancel)?;
-                        remaining_time(deadline)?;
-                        return Ok(AnalysisOutput {
-                            value,
-                            usage: usage.clone().finish(),
-                            requests,
-                            tool_calls,
-                            response_format_fallback: fallback_used,
-                            correction_used,
-                        });
-                    }
-                    Err(error) => {
-                        check_cancel(request.cancel)?;
-                        if !correction_used {
-                            if Instant::now() >= deadline {
-                                return Err(ApiError::simple(ApiErrorKind::Timeout));
-                            }
-                            correction_used = true;
-                            messages.push(parsed.message.clone());
-                            messages.push(json!({
-                                "role":"user",
-                                "content": correction_schema_text(&error),
-                            }));
-                            continue;
-                        }
-                        return Err(ApiError::with_schema(ApiErrorKind::SchemaInvalid, error));
-                    }
-                },
-                Err(_) => {
-                    check_cancel(request.cancel)?;
-                    if !correction_used {
-                        if Instant::now() >= deadline {
-                            return Err(ApiError::simple(ApiErrorKind::Timeout));
-                        }
-                        correction_used = true;
-                        messages.push(parsed.message.clone());
-                        messages.push(json!({
-                            "role":"user",
-                            "content": "The previous reply was not a single valid JSON value. Return only the JSON value required by the system message. Do not include prose, Markdown fences, or comments.",
-                        }));
-                        continue;
-                    }
-                    return Err(ApiError::simple(ApiErrorKind::InvalidJson));
-                }
-            }
-        }
+        let mut model = HttpModel {
+            client: self,
+            credential: request.credential,
+            stream,
+        };
+        analyze_with_model(request, &mut model, event)
     }
 
     /// Discovery-only `/models` GET. It never issues a completion or health
@@ -1213,15 +915,17 @@ fn validate_model(model: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn validate_tool_definitions(tools: &[ToolDefinition]) -> Result<(), ApiError> {
+fn validate_tool_definitions(
+    tools: &[ToolDefinition],
+) -> Result<BTreeMap<&str, CheckedSchema<'_>>, ApiError> {
     if tools.len() > MAX_TOOLS {
         return Err(ApiError::simple(ApiErrorKind::ToolDefinitionInvalid));
     }
-    let mut names = BTreeSet::new();
+    let mut schemas = BTreeMap::new();
     for tool in tools {
         if !valid_tool_name(&tool.name)
             || tool.description.chars().count() > MAX_TOOL_DESCRIPTION_CHARS
-            || !names.insert(tool.name.as_str())
+            || schemas.contains_key(tool.name.as_str())
         {
             return Err(ApiError::simple(ApiErrorKind::ToolDefinitionInvalid));
         }
@@ -1230,10 +934,11 @@ fn validate_tool_definitions(tools: &[ToolDefinition]) -> Result<(), ApiError> {
         {
             return Err(ApiError::simple(ApiErrorKind::ToolDefinitionInvalid));
         }
-        schema_validate::check_schema(&tool.parameters)
+        let schema = CheckedSchema::new(&tool.parameters)
             .map_err(|error| ApiError::with_schema(ApiErrorKind::ToolDefinitionInvalid, error))?;
+        schemas.insert(tool.name.as_str(), schema);
     }
-    Ok(())
+    Ok(schemas)
 }
 
 fn valid_tool_name(name: &str) -> bool {
@@ -1256,6 +961,577 @@ fn check_cancel(cancel: &AtomicBool) -> Result<(), ApiError> {
     }
 }
 
+/// A single model round; conversation, tool validation and budgets belong to
+/// the shared loop. Implementations preserve the caller's absolute deadline.
+pub trait ModelRound {
+    fn configure(&self, _body: &mut Value) {}
+    fn complete(
+        &mut self,
+        body: &Value,
+        serialized: &str,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        output_base: Option<u64>,
+        event: &mut dyn FnMut(ApiEvent),
+    ) -> Result<ModelReply, ApiError>;
+}
+
+pub fn analyze_with_model(
+    request: AnalyzeRequest<'_, '_>,
+    model: &mut dyn ModelRound,
+    event: &mut dyn FnMut(ApiEvent),
+) -> Result<AnalysisOutput, ApiError> {
+    let mut usage = UsageAggregator::default();
+    analyze_inner(model, request, &mut usage, event).map_err(|mut error| {
+        error.usage = Some(usage.finish());
+        error
+    })
+}
+
+struct HttpModel<'a, 't> {
+    client: &'a ChatCompletionsClient<'t>,
+    credential: &'a str,
+    stream: bool,
+}
+impl ModelRound for HttpModel<'_, '_> {
+    fn configure(&self, body: &mut Value) {
+        body["stream"] = json!(self.stream);
+        if self.stream {
+            body["stream_options"] = json!({"include_usage":true});
+        }
+    }
+    fn complete(
+        &mut self,
+        body: &Value,
+        serialized: &str,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        output_base: Option<u64>,
+        event: &mut dyn FnMut(ApiEvent),
+    ) -> Result<ModelReply, ApiError> {
+        let url = self.client.endpoint.chat_completions_url();
+        let wire_request = TransportRequest::new(
+            HttpMethod::Post,
+            &url,
+            self.credential,
+            Some(serialized.as_bytes()),
+            self.client.max_response_bytes,
+        );
+        let mut collector = StreamCollector::with_output_base(output_base);
+        let mut stream_invalid = false;
+        let remaining = remaining_time(deadline)?;
+        let response = if self.stream {
+            self.client.transport.send_stream(
+                &wire_request,
+                remaining,
+                cancel,
+                &mut |status, bytes| {
+                    if (200..300).contains(&status)
+                        && !stream_invalid
+                        && collector.push(bytes, event).is_err()
+                    {
+                        stream_invalid = true;
+                    }
+                    !stream_invalid
+                },
+            )
+        } else {
+            self.client.transport.send(&wire_request, remaining, cancel)
+        }
+        .map_err(|error| {
+            let mut error = if cancel.load(Ordering::Relaxed) {
+                ApiError::simple(ApiErrorKind::Cancelled)
+            } else if stream_invalid {
+                ApiError::simple(ApiErrorKind::MalformedResponse)
+            } else {
+                ApiError::from_transport(error)
+            };
+            error.partial_usage = collector.usage().cloned();
+            error
+        })?;
+        check_cancel(cancel)?;
+        remaining_time(deadline)?;
+        let status = response.status();
+        if !(200..300).contains(&status) {
+            event(ApiEvent::Response(
+                json!({"http_status":status,"body":String::from_utf8_lossy(response.body())}),
+            ));
+            if body.get("response_format").is_some()
+                && matches!(status, 400 | 422)
+                && explicit_unsupported_response_format(response.body())
+            {
+                return Err(ApiError::simple(ApiErrorKind::UnsupportedResponseFormat));
+            }
+            let mut error = ApiError::http_status(status);
+            if let Ok(value) = serde_json::from_slice::<Value>(response.body()) {
+                let param = value["error"]["param"].as_str().unwrap_or("");
+                error.parameter = [
+                    "model",
+                    "reasoning_effort",
+                    "response_format",
+                    "tools",
+                    "messages",
+                    "max_tokens",
+                ]
+                .into_iter()
+                .find(|name| *name == param);
+            }
+            return Err(error);
+        }
+        if !self.stream && response.body().len() > self.client.max_response_bytes {
+            return Err(ApiError::simple(ApiErrorKind::ResponseTooLarge));
+        }
+        let wire = if self.stream {
+            if stream_invalid {
+                let mut error = ApiError::simple(ApiErrorKind::MalformedResponse);
+                error.partial_usage = collector.usage().cloned();
+                return Err(error);
+            }
+            let partial = collector.usage().cloned();
+            collector.finish(event).map_err(|_| {
+                let mut error = ApiError::simple(ApiErrorKind::Truncated);
+                error.partial_usage = partial;
+                error
+            })?
+        } else {
+            let value: Value = serde_json::from_slice(response.body())
+                .map_err(|_| ApiError::simple(ApiErrorKind::MalformedResponse))?;
+            event(ApiEvent::Response(value.clone()));
+            value
+        };
+        if self.stream && !crate::json::fits_bytes(&wire, self.client.max_response_bytes) {
+            let mut error = ApiError::simple(ApiErrorKind::ResponseTooLarge);
+            error.partial_usage = wire.get("usage").filter(|v| v.is_object()).cloned();
+            return Err(error);
+        }
+        parse_chat_response(wire)
+    }
+}
+
+fn analyze_inner(
+    model: &mut dyn ModelRound,
+    request: AnalyzeRequest<'_, '_>,
+    usage: &mut UsageAggregator,
+    event: &mut dyn FnMut(ApiEvent),
+) -> Result<AnalysisOutput, ApiError> {
+    validate_timeout(request.timeout)?;
+    validate_model(request.model)?;
+    if request.reasoning_effort.is_some_and(|v| {
+        v.is_empty()
+            || v.len() > 64
+            || !v
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }) {
+        return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
+    }
+    if request.prompt.len() > MAX_PROMPT_BYTES {
+        return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
+    }
+    let output_schema = CheckedSchema::new(request.schema)
+        .map_err(|error| ApiError::with_schema(ApiErrorKind::InvalidConfig, error))?;
+    let tool_schemas = validate_tool_definitions(request.tools)?;
+    if !request.tools.is_empty() && request.tool_handler.is_none() {
+        return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
+    }
+    check_cancel(request.cancel)?;
+
+    let deadline = Instant::now()
+        .checked_add(request.timeout)
+        .ok_or_else(|| ApiError::simple(ApiErrorKind::Timeout))?;
+    let mut body = build_chat_body(
+        request.model,
+        request.reasoning_effort,
+        request.prompt,
+        request.schema,
+        request.tools,
+    );
+    let mut fallback_used = false;
+    let mut correction_used = false;
+    let mut tool_correction_used = false;
+    let mut requests = 0usize;
+    let mut tool_calls = 0usize;
+    let mut seen_calls = BTreeSet::<String>::new();
+    let mut seen_ids = BTreeSet::<String>::new();
+    let mut tool_handler = request.tool_handler;
+    let continuation_limit = tool_handler
+        .as_ref()
+        .and_then(|h| h.continuation_char_limit());
+    let mut continuation_chars = 0usize;
+    let mut finish_only = false;
+
+    loop {
+        check_cancel(request.cancel)?;
+        remaining_time(deadline)?;
+        if finish_only {
+            let fields = body.as_object_mut().unwrap();
+            fields.remove("tools");
+            fields.remove("tool_choice");
+        }
+        model.configure(&mut body);
+        let body_text = serde_json::to_string(&body)
+            .map_err(|_| ApiError::simple(ApiErrorKind::InvalidConfig))?;
+        if body_text.len() > MAX_REQUEST_BYTES {
+            return Err(ApiError::simple(ApiErrorKind::InvalidConfig));
+        }
+        if requests == 0 {
+            if let Some(handler) = tool_handler.as_ref() {
+                if handler.input_char_limit().is_some_and(|limit| {
+                    handler.input_chars(&body, body_text.chars().count()) > limit
+                }) {
+                    return Err(ApiError::simple(ApiErrorKind::InputLimit));
+                }
+            }
+        }
+        requests += 1;
+        event(ApiEvent::Phase("等待首包"));
+        let output_base = if usage.responses == 0 {
+            Some(0)
+        } else {
+            usage.clone().finish().completion_tokens
+        };
+        let parsed = match model.complete(
+            &body,
+            &body_text,
+            deadline,
+            request.cancel,
+            output_base,
+            event,
+        ) {
+            Ok(reply) => reply,
+            Err(error)
+                if body.get("response_format").is_some()
+                    && !fallback_used
+                    && error.kind() == ApiErrorKind::UnsupportedResponseFormat =>
+            {
+                fallback_used = true;
+                body.as_object_mut().unwrap().remove("response_format");
+                continue;
+            }
+            Err(mut error) => {
+                if let Some(partial) = error.partial_usage.take() {
+                    usage.record(Some(&partial));
+                }
+                return Err(error);
+            }
+        };
+        check_cancel(request.cancel)?;
+        remaining_time(deadline)?;
+        usage.record(parsed.usage.as_ref());
+        let messages = body["messages"].as_array_mut().unwrap();
+
+        if parsed.refusal {
+            return Err(ApiError::simple(ApiErrorKind::Refusal));
+        }
+        if matches!(
+            parsed.finish_reason.as_deref(),
+            Some("content_filter" | "refusal")
+        ) {
+            return Err(ApiError::simple(ApiErrorKind::Refusal));
+        }
+        if parsed.finish_reason.as_deref() == Some("length") {
+            return Err(ApiError::simple(ApiErrorKind::Truncated));
+        }
+
+        // Only a trusted local model adapter can attach this metadata.
+        // Provider JSON fields never authorize a repair or a tool call.
+        if let Some(error) = &parsed.model_output_error {
+            if finish_only {
+                return Err(ApiError::simple(ApiErrorKind::SchemaInvalid));
+            }
+            finish_only = !retain_continuation(
+                messages,
+                &parsed.message,
+                &mut continuation_chars,
+                continuation_limit,
+            ) || tool_correction_used;
+            tool_correction_used = true;
+            let reason = format!("The model response envelope was invalid: {error}. No tools in that reply were executed.");
+            if finish_only {
+                finish_without_tools(messages, &reason);
+            } else {
+                messages.push(json!({"role":"user","content":format!("{reason} Correct the response against the required envelope; provide exactly one tool request or final result.")}));
+            }
+            event(ApiEvent::Phase("模型输出格式错误，等待调整"));
+            continue;
+        }
+
+        if !parsed.tool_calls.is_empty() {
+            tool_calls = tool_calls.saturating_add(parsed.tool_calls.len());
+            // A final-only turn cannot reopen tools. Reused ids are never
+            // replayed, including ids from a previously rejected proposal.
+            if finish_only
+                || parsed
+                    .tool_calls
+                    .iter()
+                    .any(|call| seen_ids.contains(&call.id))
+            {
+                return Err(ApiError::simple(ApiErrorKind::NoProgress));
+            }
+            seen_ids.extend(parsed.tool_calls.iter().map(|call| call.id.clone()));
+            if !retain_continuation(
+                messages,
+                &parsed.message,
+                &mut continuation_chars,
+                continuation_limit,
+            ) {
+                let reason = "The latest tool proposal exceeded the shared continuation budget. No tools in that reply were executed, and that oversized reply was not added to the conversation.";
+                event(ApiEvent::ToolRejected(
+                    json!({"response":parsed.message,"error":reason,"final_only":true}),
+                ));
+                finish_only = true;
+                finish_without_tools(messages, reason);
+                continue;
+            }
+            let validated = (|| -> Result<Vec<ValidatedToolCall<'_>>, ToolFailure> {
+                if parsed.tool_calls.len() > MAX_TOOL_CALLS_PER_RESPONSE {
+                    return Err(ToolFailure::with_message(
+                        ToolFailureKind::BudgetExhausted,
+                        format!("This reply requested more than {MAX_TOOL_CALLS_PER_RESPONSE} tool calls."),
+                    ));
+                }
+                let calls =
+                    validate_tool_calls(&parsed.tool_calls, &tool_schemas).map_err(|error| {
+                        ToolFailure::with_message(
+                            if error.kind() == ApiErrorKind::UnknownTool {
+                                ToolFailureKind::Denied
+                            } else {
+                                ToolFailureKind::InvalidArguments
+                            },
+                            error.to_string(),
+                        )
+                    })?;
+                let mut signatures = BTreeSet::new();
+                for call in &calls {
+                    let allow_repeated = tool_handler.as_ref().is_some_and(|handler| {
+                        handler.allows_repeated_arguments(&call.name)
+                            || handler.query_progress(&call.name).is_some()
+                    });
+                    if !allow_repeated
+                        && (!signatures.insert(&call.signature)
+                            || seen_calls.contains(&call.signature))
+                    {
+                        return Err(ToolFailure::with_message(
+                            ToolFailureKind::BudgetExhausted,
+                            "The same query has already been answered; repeating it would make no progress.",
+                        ));
+                    }
+                }
+                let invocations = calls
+                    .iter()
+                    .map(|call| ToolInvocation {
+                        call_id: &call.id,
+                        name: &call.name,
+                        arguments: &call.arguments,
+                    })
+                    .collect::<Vec<_>>();
+                tool_handler
+                    .as_mut()
+                    .ok_or_else(|| ToolFailure::new(ToolFailureKind::Failed))?
+                    .validate_batch(&invocations)?;
+                Ok(calls)
+            })();
+            let validated = match validated {
+                Ok(calls) => calls,
+                Err(error) if error.kind() == ToolFailureKind::Failed => {
+                    return Err(ApiError::simple(ApiErrorKind::ToolFailed));
+                }
+                Err(error) => {
+                    check_cancel(request.cancel)?;
+                    remaining_time(deadline)?;
+                    finish_only = matches!(
+                        error.kind(),
+                        ToolFailureKind::BudgetExhausted | ToolFailureKind::UnsafeReplay
+                    ) || tool_correction_used;
+                    let reason =
+                        format!("No tools in this reply were executed. {}", error.feedback());
+                    event(ApiEvent::ToolRejected(
+                        json!({"response":parsed.message,"error":reason,"correction_used":tool_correction_used,"final_only":finish_only}),
+                    ));
+                    for call in &parsed.tool_calls {
+                        messages.push(tool_feedback(&call.id, &reason));
+                    }
+                    if finish_only {
+                        finish_without_tools(messages, &reason);
+                    } else {
+                        tool_correction_used = true;
+                        event(ApiEvent::Phase("工具请求已拒绝，等待模型调整"));
+                    }
+                    continue;
+                }
+            };
+            let mut image_messages = Vec::new();
+            let mut stopped_reason: Option<String> = None;
+            for (position, call) in validated.iter().enumerate() {
+                check_cancel(request.cancel)?;
+                remaining_time(deadline)?;
+                if let Some(reason) = &stopped_reason {
+                    messages.push(tool_feedback(&call.id, &format!("This call was not executed because the preceding tool stopped this batch: {reason}")));
+                    continue;
+                }
+                let repeated = !seen_calls.insert(call.signature.clone());
+                let handler = tool_handler
+                    .as_mut()
+                    .ok_or_else(|| ApiError::simple(ApiErrorKind::InvalidConfig))?;
+                event(ApiEvent::Phase(if call.name == "read_context" {
+                    "读取上下文"
+                } else if call.name == "read_image" {
+                    "读取图片"
+                } else {
+                    "执行工具"
+                }));
+                let progress = handler.query_progress(&call.name);
+                // Reserve later calls' minimum wrappers. The host receives
+                // this call's full allowance, including its own framing.
+                let result_budget = continuation_limit.map(|limit| {
+                    let wrappers = validated[position + 1..]
+                        .iter()
+                        .map(|call| message_input_chars(&empty_tool_message(&call.id)) + 1)
+                        .sum::<usize>();
+                    limit.saturating_sub(continuation_chars.saturating_add(wrappers))
+                });
+                let result = if result_budget == Some(0) {
+                    Err(ToolFailure::new(ToolFailureKind::BudgetExhausted))
+                } else {
+                    handler.invoke_guarded(
+                        &ToolInvocation {
+                            call_id: &call.id,
+                            name: &call.name,
+                            arguments: &call.arguments,
+                        },
+                        request.cancel,
+                        deadline,
+                        result_budget,
+                    )
+                };
+                check_cancel(request.cancel)?;
+                remaining_time(deadline)?;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) if error.kind() == ToolFailureKind::Failed => {
+                        return Err(ApiError::simple(ApiErrorKind::ToolFailed));
+                    }
+                    Err(error) => {
+                        let reason = error.feedback().to_owned();
+                        messages.push(tool_feedback(&call.id, &reason));
+                        finish_only = matches!(
+                            error.kind(),
+                            ToolFailureKind::BudgetExhausted | ToolFailureKind::UnsafeReplay
+                        ) || tool_correction_used;
+                        tool_correction_used = true;
+                        stopped_reason = Some(reason);
+                        continue;
+                    }
+                };
+                let (tool_message, images) = match result.messages(&call.id) {
+                    Ok(messages) => messages,
+                    Err(_) => {
+                        let reason = "The tool result could not be delivered within the allowed output format or size. Do not repeat the operation; its result is unavailable.";
+                        messages.push(tool_feedback(&call.id, reason));
+                        finish_only = true;
+                        stopped_reason = Some(reason.into());
+                        continue;
+                    }
+                };
+                let image_message =
+                    (!images.is_empty()).then(|| json!({"role":"user", "content":images}));
+                let chars = message_input_chars(&tool_message)
+                    + 1
+                    + image_message
+                        .as_ref()
+                        .map_or(0, |m| message_input_chars(m) + 1);
+                if result_budget.is_some_and(|limit| chars > limit) {
+                    let reason = "The tool result exceeded the shared continuation budget and was not delivered. Do not repeat the operation; use the previously delivered evidence.";
+                    messages.push(tool_feedback(&call.id, reason));
+                    finish_only = true;
+                    stopped_reason = Some(reason.into());
+                    continue;
+                }
+                continuation_chars = continuation_chars.saturating_add(chars);
+                messages.push(tool_message);
+                image_messages.extend(image_message);
+                if repeated && progress.is_some() && progress == handler.query_progress(&call.name)
+                {
+                    finish_only = true;
+                    stopped_reason =
+                        Some("The repeated query returned no additional evidence.".into());
+                }
+            }
+            // Correlate every tool result before presenting attached images.
+            messages.extend(image_messages);
+            if continuation_limit.is_some_and(|limit| continuation_chars >= limit) {
+                finish_only = true;
+                stopped_reason
+                    .get_or_insert_with(|| "The shared continuation budget is exhausted.".into());
+            }
+            if finish_only {
+                finish_without_tools(
+                    messages,
+                    stopped_reason
+                        .as_deref()
+                        .unwrap_or("Tool retrieval has ended."),
+                );
+            }
+            continue;
+        }
+
+        let Some(content) = parsed.message["content"].as_str() else {
+            return Err(ApiError::simple(ApiErrorKind::EmptyResponse));
+        };
+        event(ApiEvent::Phase("校验结果"));
+        let validated = serde_json::from_str::<Value>(content.trim())
+            .map_err(|_| ApiError::simple(ApiErrorKind::InvalidJson))
+            .and_then(|value| {
+                output_schema
+                    .output(value)
+                    .map_err(|error| ApiError::with_schema(ApiErrorKind::SchemaInvalid, error))
+            })
+            .and_then(|mut value| {
+                if let Some(handler) = tool_handler.as_deref_mut() {
+                    handler
+                        .validate_output(&mut value, correction_used)
+                        .map_err(|error| {
+                            ApiError::with_schema(ApiErrorKind::SchemaInvalid, error)
+                        })?;
+                }
+                Ok(value)
+            });
+        let error = match validated {
+            Ok(value) => {
+                check_cancel(request.cancel)?;
+                remaining_time(deadline)?;
+                return Ok(AnalysisOutput {
+                    value,
+                    usage: usage.clone().finish(),
+                    requests,
+                    tool_calls,
+                    response_format_fallback: fallback_used,
+                    correction_used,
+                });
+            }
+            Err(error) => error,
+        };
+        check_cancel(request.cancel)?;
+        if correction_used {
+            return Err(error);
+        }
+        remaining_time(deadline)?;
+        correction_used = true;
+        if !retain_continuation(
+            messages,
+            &parsed.message,
+            &mut continuation_chars,
+            continuation_limit,
+        ) {
+            finish_only = true;
+            finish_without_tools(messages, "The invalid reply exceeded the remaining continuation budget and was not retained.");
+        }
+        let correction = error.schema.as_ref().map(correction_schema_text).unwrap_or_else(||
+            "The previous reply was not a single valid JSON value. Return only the JSON value required by the system message. Do not include prose, Markdown fences, or comments.".into());
+        messages.push(json!({"role":"user", "content":correction}));
+    }
+}
+
 fn remaining_time(deadline: Instant) -> Result<Duration, ApiError> {
     let now = Instant::now();
     if now >= deadline {
@@ -1272,60 +1548,53 @@ fn remaining_time(deadline: Instant) -> Result<Duration, ApiError> {
 
 fn build_chat_body(
     model: &str,
-    messages: &[Value],
+    effort: Option<&str>,
+    prompt: &str,
     schema: &Value,
     tools: &[ToolDefinition],
-    use_response_format: bool,
 ) -> Value {
-    let mut body = Map::new();
-    body.insert("model".into(), Value::String(model.to_string()));
-    body.insert("messages".into(), Value::Array(messages.to_vec()));
-    body.insert("stream".into(), Value::Bool(false));
-    if use_response_format {
-        body.insert(
-            "response_format".into(),
-            json!({
-                "type": "json_schema",
-                "json_schema": {
-                    "name": RESPONSE_FORMAT_NAME,
-                    "strict": true,
-                    "schema": schema,
-                }
-            }),
-        );
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            {"role":"system", "content":prompt},
+            {"role":"user", "content":format!("{USER_INSTRUCTION}\n\nRequired JSON Schema (authoritative):\n{schema}")},
+        ],
+        "stream": false,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": RESPONSE_FORMAT_NAME, "strict": true, "schema": schema},
+        },
+    });
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = json!(effort);
     }
     if !tools.is_empty() {
-        body.insert(
-            "tools".into(),
-            Value::Array(
-                tools
-                    .iter()
-                    .map(|tool| {
-                        json!({
-                            "type": "function",
-                            "function": {
-                                "name": tool.name,
-                                "description": tool.description,
-                                "parameters": tool.parameters,
-                            }
-                        })
-                    })
-                    .collect(),
-            ),
-        );
-        body.insert("tool_choice".into(), json!("auto"));
+        body["tools"] = tools
+            .iter()
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    },
+                })
+            })
+            .collect();
+        body["tool_choice"] = json!("auto");
     }
-    Value::Object(body)
+    body
 }
 
 #[derive(Clone, Debug)]
-struct ParsedResponse {
+pub struct ModelReply {
     message: Value,
-    content: Option<String>,
     tool_calls: Vec<RawToolCall>,
     refusal: bool,
     finish_reason: Option<String>,
     usage: Option<Value>,
+    model_output_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1336,78 +1605,108 @@ struct RawToolCall {
 }
 
 #[derive(Clone, Debug)]
-struct ValidatedToolCall {
-    id: String,
-    name: String,
+struct ValidatedToolCall<'a> {
+    id: &'a str,
+    name: &'a str,
     arguments: Value,
     signature: String,
 }
 
-fn parse_chat_response(body: &[u8]) -> Result<ParsedResponse, ApiError> {
-    let value: Value = serde_json::from_slice(body)
-        .map_err(|_| ApiError::simple(ApiErrorKind::MalformedResponse))?;
+fn parse_chat_response(mut value: Value) -> Result<ModelReply, ApiError> {
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return Err(ApiError::simple(ApiErrorKind::MalformedResponse));
     }
+    let usage = value
+        .get_mut("usage")
+        .filter(|v| v.is_object())
+        .map(Value::take);
     let choices = value
-        .get("choices")
-        .and_then(Value::as_array)
+        .get_mut("choices")
+        .and_then(Value::as_array_mut)
         .ok_or_else(|| ApiError::simple(ApiErrorKind::EmptyResponse))?;
     let choice = choices
-        .first()
+        .first_mut()
         .ok_or_else(|| ApiError::simple(ApiErrorKind::EmptyResponse))?;
     let choice = choice
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| ApiError::simple(ApiErrorKind::MalformedResponse))?;
-    let message = choice
-        .get("message")
-        .and_then(Value::as_object)
-        .ok_or_else(|| ApiError::simple(ApiErrorKind::MalformedResponse))?;
-    let refusal = message.get("refusal").is_some_and(|refusal| match refusal {
-        Value::String(text) => !text.is_empty(),
-        Value::Bool(flag) => *flag,
-        _ => false,
-    });
-    let finish_reason = choice
-        .get("finish_reason")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let refused = refusal || matches!(finish_reason.as_deref(), Some("refusal" | "content_filter"));
-    let content = if refused {
-        None
-    } else {
-        extract_content(message)?
-    };
-    let tool_calls = if refused {
-        Vec::new()
-    } else {
-        extract_tool_calls(message)?
-    };
-    let usage = value
-        .get("usage")
-        .filter(|usage| usage.is_object())
-        .cloned();
-    let mut replay = json!({"role":"assistant","content":content});
-    if let Some(calls) = message.get("tool_calls") {
-        replay["tool_calls"] = calls.clone();
-    }
-    if let Some(reasoning) = message.get("reasoning_content").filter(|v| v.is_string()) {
-        replay["reasoning_content"] = reasoning.clone();
-    }
-    Ok(ParsedResponse {
-        message: replay,
-        content,
-        tool_calls,
-        refusal,
-        finish_reason,
+    ModelReply::parse_message(
+        choice
+            .remove("message")
+            .ok_or_else(|| ApiError::simple(ApiErrorKind::MalformedResponse))?,
+        match choice.remove("finish_reason") {
+            Some(Value::String(reason)) => Some(reason),
+            _ => None,
+        },
         usage,
-    })
+    )
 }
 
-fn extract_content(message: &Map<String, Value>) -> Result<Option<String>, ApiError> {
-    match message.get("content") {
+impl ModelReply {
+    pub fn from_message(
+        message: Value,
+        finish_reason: Option<String>,
+        usage: Option<Value>,
+    ) -> Result<Self, ApiError> {
+        if !crate::json::fits_bytes(&message, DEFAULT_MAX_RESPONSE_BYTES) {
+            return Err(ApiError::simple(ApiErrorKind::ResponseTooLarge));
+        }
+        Self::parse_message(message, finish_reason, usage)
+    }
+
+    fn parse_message(
+        message: Value,
+        finish_reason: Option<String>,
+        usage: Option<Value>,
+    ) -> Result<Self, ApiError> {
+        let Value::Object(mut message) = message else {
+            return Err(ApiError::simple(ApiErrorKind::MalformedResponse));
+        };
+        let refusal = message.get("refusal").is_some_and(|refusal| match refusal {
+            Value::String(text) => !text.is_empty(),
+            Value::Bool(flag) => *flag,
+            _ => false,
+        });
+        let refused =
+            refusal || matches!(finish_reason.as_deref(), Some("refusal" | "content_filter"));
+        let content = if refused {
+            None
+        } else {
+            extract_content(message.remove("content"))?
+        };
+        let tool_calls = if refused {
+            Vec::new()
+        } else {
+            extract_tool_calls(&message)?
+        };
+        let mut replay = json!({"role":"assistant","content":null});
+        replay["content"] = content.map(Value::String).unwrap_or(Value::Null);
+        if let Some(calls) = message.remove("tool_calls") {
+            replay["tool_calls"] = calls;
+        }
+        if let Some(reasoning) = message.remove("reasoning_content").filter(Value::is_string) {
+            replay["reasoning_content"] = reasoning;
+        }
+        Ok(Self {
+            message: replay,
+            tool_calls,
+            refusal,
+            finish_reason,
+            usage,
+            model_output_error: None,
+        })
+    }
+    /// Only trusted local adapters set envelope failures; wire JSON cannot.
+    pub fn with_output_error(mut self, error: impl AsRef<str>) -> Self {
+        self.model_output_error = Some(error.as_ref().chars().take(512).collect());
+        self
+    }
+}
+
+fn extract_content(content: Option<Value>) -> Result<Option<String>, ApiError> {
+    match content {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(Value::String(text)) => Ok(Some(text)),
         Some(Value::Array(parts)) => {
             if parts.is_empty() {
                 return Ok(None);
@@ -1438,7 +1737,7 @@ fn extract_tool_calls(message: &Map<String, Value>) -> Result<Vec<RawToolCall>, 
         Some(Value::Array(calls)) => calls,
         Some(_) => return Err(ApiError::simple(ApiErrorKind::InvalidToolCall)),
     };
-    if calls.len() > MAX_TOOL_CALLS_PER_RESPONSE {
+    if calls.len() > MAX_TOOL_CALLS_IN_RESPONSE {
         return Err(ApiError::simple(ApiErrorKind::InvalidToolCall));
     }
     let mut ids = BTreeSet::new();
@@ -1454,7 +1753,7 @@ fn extract_tool_calls(message: &Map<String, Value>) -> Result<Vec<RawToolCall>, 
                 !id.is_empty() && id.chars().count() <= 128 && !id.chars().any(|ch| ch.is_control())
             })
             .ok_or_else(|| ApiError::simple(ApiErrorKind::InvalidToolCall))?;
-        if !ids.insert(id.to_string()) {
+        if !ids.insert(id) {
             return Err(ApiError::simple(ApiErrorKind::InvalidToolCall));
         }
         if call.get("type").and_then(Value::as_str) != Some("function") {
@@ -1485,27 +1784,24 @@ fn extract_tool_calls(message: &Map<String, Value>) -> Result<Vec<RawToolCall>, 
     Ok(result)
 }
 
-fn validate_tool_calls(
-    calls: &[RawToolCall],
-    tools: &[ToolDefinition],
-) -> Result<Vec<ValidatedToolCall>, ApiError> {
-    let by_name = tools
-        .iter()
-        .map(|tool| (tool.name.as_str(), tool))
-        .collect::<BTreeMap<_, _>>();
+fn validate_tool_calls<'a>(
+    calls: &'a [RawToolCall],
+    schemas: &BTreeMap<&str, CheckedSchema<'_>>,
+) -> Result<Vec<ValidatedToolCall<'a>>, ApiError> {
     let mut result = Vec::with_capacity(calls.len());
     for call in calls {
-        let tool = by_name
+        let schema = schemas
             .get(call.name.as_str())
             .ok_or_else(|| ApiError::simple(ApiErrorKind::UnknownTool))?;
         let arguments: Value = serde_json::from_str(&call.raw_arguments)
             .map_err(|_| ApiError::simple(ApiErrorKind::InvalidToolArguments))?;
-        schema_validate::validate(&tool.parameters, &arguments)
+        schema
+            .validate(&arguments)
             .map_err(|error| ApiError::with_schema(ApiErrorKind::InvalidToolArguments, error))?;
         let signature = format!("{}:{}", call.name, canonical_json(&arguments));
         result.push(ValidatedToolCall {
-            id: call.id.clone(),
-            name: call.name.clone(),
+            id: &call.id,
+            name: &call.name,
             arguments,
             signature,
         });
@@ -1513,32 +1809,8 @@ fn validate_tool_calls(
     Ok(result)
 }
 
-fn canonical_json(value: &Value) -> String {
-    match value {
-        Value::Object(object) => {
-            let mut keys = object.keys().collect::<Vec<_>>();
-            keys.sort();
-            let fields = keys
-                .into_iter()
-                .map(|key| {
-                    let encoded = serde_json::to_string(key).unwrap_or_else(|_| "\"?\"".into());
-                    format!("{encoded}:{}", canonical_json(&object[key]))
-                })
-                .collect::<Vec<_>>();
-            format!("{{{}}}", fields.join(","))
-        }
-        Value::Array(items) => format!(
-            "[{}]",
-            items
-                .iter()
-                .map(canonical_json)
-                .collect::<Vec<_>>()
-                .join(",")
-        ),
-        other => other.to_string(),
-    }
-}
-
+/// Stable prompt and tool identity: sort object keys, preserve array order.
+/// Borrow values and serialize into one buffer instead of joining child strings.
 fn correction_schema_text(error: &ValidationError) -> String {
     let path = error
         .path()
@@ -1559,47 +1831,21 @@ fn explicit_unsupported_response_format(body: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
-    let (code, param, message) = if let Some(error) = value.get("error") {
-        if let Some(text) = error.as_str() {
-            (String::new(), String::new(), text.to_ascii_lowercase())
-        } else {
-            (
-                error
-                    .get("code")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase(),
-                error
-                    .get("param")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase(),
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase(),
-            )
-        }
-    } else {
-        (
-            value
-                .get("code")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase(),
-            value
-                .get("param")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase(),
-            value
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase(),
-        )
+    let error = value.get("error").unwrap_or(&value);
+    let field = |key| {
+        error
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase()
     };
+    let code = field("code");
+    let param = field("param");
+    let message = value
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| field("message"));
     if !param.is_empty() && param != "response_format" {
         return false;
     }
@@ -1676,149 +1922,8 @@ fn parse_models(body: &[u8]) -> Result<Vec<ModelInfo>, ApiError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{TestResponse, TestServer};
     use serde_json::json;
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::sync::Arc;
-    use std::thread;
-
-    #[derive(Clone)]
-    struct LocalRequest {
-        method: String,
-        path: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    }
-
-    impl LocalRequest {
-        fn header(&self, name: &str) -> Option<&str> {
-            self.headers
-                .iter()
-                .find(|(header, _)| header.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-        }
-    }
-
-    struct LocalServer {
-        addr: SocketAddr,
-        requests: Arc<std::sync::Mutex<Vec<LocalRequest>>>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl LocalServer {
-        fn start<F>(expected: usize, handler: F) -> Self
-        where
-            F: Fn(&LocalRequest, usize) -> (u16, Vec<u8>) + Send + 'static,
-        {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind local test server");
-            let addr = listener.local_addr().expect("local server addr");
-            listener
-                .set_nonblocking(true)
-                .expect("nonblocking local listener");
-            let requests = Arc::new(std::sync::Mutex::new(Vec::<LocalRequest>::new()));
-            let captured = Arc::clone(&requests);
-            let handle = thread::spawn(move || {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut served = 0usize;
-                while served < expected && Instant::now() < deadline {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            stream
-                                .set_nonblocking(false)
-                                .expect("blocking local stream");
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                            let request = read_local_request(&mut stream);
-                            let (status, body) = handler(&request, served);
-                            write_local_response(&mut stream, status, &body);
-                            captured.lock().expect("local requests").push(request);
-                            served += 1;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            Self {
-                addr,
-                requests,
-                handle: Some(handle),
-            }
-        }
-
-        fn join(mut self) -> Vec<LocalRequest> {
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("join local test server");
-            }
-            let requests = match Arc::try_unwrap(self.requests) {
-                Ok(requests) => requests.into_inner().expect("local requests mutex"),
-                Err(_) => panic!("local requests are still shared"),
-            };
-            requests
-        }
-    }
-
-    fn read_local_request(stream: &mut TcpStream) -> LocalRequest {
-        let mut data = Vec::new();
-        let mut chunk = [0u8; 1024];
-        let header_end = loop {
-            let read = stream.read(&mut chunk).expect("read local request");
-            if read == 0 {
-                panic!("local connection closed before headers");
-            }
-            data.extend_from_slice(&chunk[..read]);
-            if let Some(position) = data.windows(4).position(|window| window == b"\r\n\r\n") {
-                break position + 4;
-            }
-            if data.len() > 64 * 1024 {
-                panic!("local request headers too large");
-            }
-        };
-        let head = std::str::from_utf8(&data[..header_end - 4]).expect("ASCII local headers");
-        let mut lines = head.split("\r\n");
-        let request_line = lines.next().expect("local request line");
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().expect("local method").to_string();
-        let path = parts.next().expect("local path").to_string();
-        let mut headers = Vec::new();
-        for line in lines {
-            if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-            }
-        }
-        let content_length = headers
-            .iter()
-            .find(|(name, _)| name == "content-length")
-            .and_then(|(_, value)| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut body = data[header_end..].to_vec();
-        while body.len() < content_length {
-            let read = stream.read(&mut chunk).expect("read local request body");
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
-        body.truncate(content_length);
-        LocalRequest {
-            method,
-            path,
-            headers,
-            body,
-        }
-    }
-
-    fn write_local_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
-        let head = format!(
-            "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(body);
-        let _ = stream.flush();
-    }
 
     #[test]
     fn usage_unknown_is_not_zero_and_cached_is_bounded() {
@@ -1909,10 +2014,37 @@ mod tests {
     }
 
     #[test]
-    fn canonical_json_ignores_object_key_order() {
-        let first = json!({"a":1,"b":{"z":2,"y":3}});
-        let second = json!({"b":{"y":3,"z":2},"a":1});
+    fn canonical_json_preserves_values_and_json_accounting_matches_wire_characters() {
+        let first = json!({"z":{"b":2,"a":1},"a":[{"y":2,"x":1},0]});
+        let second = json!({"a":[{"x":1,"y":2},0],"z":{"a":1,"b":2}});
         assert_eq!(canonical_json(&first), canonical_json(&second));
+        assert_eq!(
+            canonical_json(&first),
+            r#"{"a":[{"x":1,"y":2},0],"z":{"a":1,"b":2}}"#
+        );
+        let mut reversed = second.clone();
+        reversed["a"].as_array_mut().unwrap().reverse();
+        assert_ne!(canonical_json(&first), canonical_json(&reversed));
+        let scalars = json!([
+            "中文🙂\n\t\"\\",
+            -0.0,
+            -4,
+            u64::MAX,
+            1.25e30,
+            true,
+            false,
+            null
+        ]);
+        assert_eq!(canonical_json(&scalars), scalars.to_string());
+        let controls = (0u8..32).map(char::from).collect::<String>();
+        for value in [
+            first,
+            reversed,
+            scalars,
+            json!({"controls":controls,"numbers":[f64::MIN_POSITIVE, f64::MAX]}),
+        ] {
+            assert_eq!(json_chars(&value), value.to_string().chars().count());
+        }
     }
 
     #[test]
@@ -1930,7 +2062,7 @@ mod tests {
 
     #[test]
     fn localhost_system_transport_completes_a_tool_loop() {
-        let server = LocalServer::start(2, |_, index| {
+        let server = TestServer::start(2, |_, index| {
             let value = if index == 0 {
                 json!({
                     "choices": [{
@@ -1958,10 +2090,7 @@ mod tests {
                     }]
                 })
             };
-            (
-                200,
-                serde_json::to_vec(&value).expect("local response JSON"),
-            )
+            TestResponse::json(&serde_json::to_vec(&value).expect("local response JSON"))
         });
         let addr = server.addr;
         let endpoint = Endpoint::parse_localhost_for_tests(&format!("http://{addr}/openai/v1"))
@@ -2034,11 +2163,8 @@ mod tests {
 
     #[test]
     fn localhost_models_discovery_is_a_get_without_a_model_call() {
-        let server = LocalServer::start(1, |_, _| {
-            (
-                200,
-                br#"{"data":[{"id":"local-model-a"},{"id":"local-model-b"}]}"#.to_vec(),
-            )
+        let server = TestServer::start(1, |_, _| {
+            TestResponse::json(br#"{"data":[{"id":"local-model-a"},{"id":"local-model-b"}]}"#)
         });
         let addr = server.addr;
         let endpoint = Endpoint::parse_localhost_for_tests(&format!("http://{addr}/openai/v1"))

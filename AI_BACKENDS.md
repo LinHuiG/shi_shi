@@ -5,9 +5,9 @@
 ## 模块边界
 
 - `src/ai.rs`：提示词组合、输出 schema、输入上限、取消检查、prepared 请求和调用入口。
-- `src/ai_backend.rs`：连接解析、驱动选择、`Backend` 分析接口、`AgentSession` 处置接口。
+- `src/ai_backend.rs`：连接解析、驱动选择、`Backend` 分析接口、`AgentSession` ACP 处置接口。
 - `src/ai_backend/codex.rs`、`src/codex_bridge.rs`：Codex CLI/app-server 参数、模型目录、登录状态、分析输出与事件解析。
-- `src/desktop_bridge.rs`、`src/handling_desktop.rs`：桌面管道、独立来源登记、项目与上下文准备、创建、追加和只读同步；不恢复目标执行会话。`src/ai_backend/agent_approval.rs` 保留其他接入仍使用的审批范围校验。
+- `src/desktop_bridge.rs`、`src/handling_desktop.rs`：桌面管道、独立来源登记、项目与上下文准备、创建、追加和只读同步；不恢复目标执行会话。Codex 审批在桌面处理，DSH 授权选项由 ACP 适配器校验。
 - `src/ai_backend/dsh.rs`、`providers/acp/`：Harness 桌面 ACP 启动、受限 profile 就绪检查、分析提交、会话/审批/取消/历史适配。
 - `src/ai_backend/api.rs`、`providers/api/`：OpenAI Chat Completions HTTP、严格 schema、SS 共用工具循环和模型目录。`src/ai_backend/model_api.rs` 把 Codex/DSH 文本响应适配到同一循环，不通过 MCP 执行非处置工具；图片保持原生内容，续轮共用预算、取消、总期限和用量累加。
 - `src/credentials.rs`：DPAPI 本地密钥或指定环境变量；密钥不进配置、状态、提示词 trace 或日志。
@@ -17,7 +17,7 @@
 
 `Config.codex` 保留为默认 Codex 连接的程序路径，空 `connection_id` 表示默认连接。`ai_connections` 保存附加连接的 `id/name/driver/executable/base_url/key_env`。`model_profiles` 有 `filter/analysis/handling/review` 四项，分别对应消息过滤、事项更新、AI 一键处置和归档分析。
 
-`for_kind()` 仅在调用快照中解析用途；`selected_connection` 不序列化。部分字段为空的 profile 使用基础配置的对应值，不会静默变成空模型或空连接。缺失连接、重复 ID、未实现的驱动必须明确报错，不能回退到其他接入。任何用途解析到 `api` 的 `handling` 都拒绝执行。
+`model_choice()` 借用配置字段解析用途，读取路由和校验参数无需复制完整配置；`for_kind()` 为实际请求生成拥有这些字段的冻结配置。两者共用继承规则，`selected_connection` 不序列化。部分字段为空的 profile 使用基础配置的对应值，不会静默变成空模型或空连接。缺失连接、重复 ID、未实现的驱动必须明确报错，不能回退到其他接入。任何用途解析到 `api` 的 `handling` 都拒绝执行。
 
 处置 `Run.connection` 保存创建时的连接快照。后续操作使用该快照，不混用其他接入的会话编号。Codex 处置由本机已登录桌面执行；创建时提交用途模型和强度，后续仅在拾事配置明确变化时覆盖，避免还原桌面端修改。其他接入保持原有行为。
 
@@ -30,16 +30,17 @@
 3. 请求使用应用实际测量并接受的同一 prompt/schema/tools。工具循环只执行本次声明的补查和用户全局启用的注册业务工具，命令由 SS 执行；不支持的工具、参数越界、消息/工具/响应格式错误都失败，不用普通文本冒充结构化结果。只在服务端明确表示不支持 `response_format` 时做有限降级，不重放模糊失败或可能有副作用的调用。
 4. 分析成功结果为业务 JSON 与用量。用量采用 `input_tokens/output_tokens/cached_input_tokens` 等现有字段；缺失计数表示未知，不能按零展示。工具结果中的图片转换为 Chat Completions 多模态 `image_url`，base64 不放进普通文本；限制 mime、base64 和总体积。
 5. 处置结果沿用现有历史/审批 DTO。`start/read/resume` 返回 `thread`，`submit` 返回 `turn`，`history` 返回逆序 `data` 轮次数组；轮次保留 `id/status/startedAt/items/error`。适配器只保存在内存的历史不得在重启后覆盖应用已保存的轮次。
-6. `UsageEvent` 含会话 ID、可选轮次 ID、原生 `notification` 及可选用量。Harness 处置保留受限会话；Codex 处置只连接桌面消息桥接，查询与入账继续去重。Codex 桌面未提供的用量保持未知；没有独立执行或交接回退。
+6. Harness 内部通过 `AgentEvent` 传递会话和轮次 ID，以及正文增量、工具记录、完成记录或单轮用量，不再绕行 Codex JSON 通知。Harness 处置保留受限会话；Codex 处置只连接桌面消息桥接，沿用历史回读，查询与入账继续去重。没有提供的缓存或桌面用量保持未知；没有独立执行或交接回退。
 7. 审批列表沿用 `id/method/params` 展示 DTO；回答由适配器转换，必须校验会话归属并展示协议原始范围，不扩大用户授予的权限。过期请求明确失败，不返回假成功。
 8. 创建、提交和运行中插话的结果不确定时不得自动重试。独立分析必须使用新会话；处置继续原持久会话。补查次数、图片预算、取消、工具隔离和提交 schema 不能靠提示词替代。
-9. Harness 分析和处置启动必须使用同一受限配置：分析使用 `--profile acp --patch <overlay>`、只读权限、空 `DSH_AGENTS_HOME` 和实际 `$DSH_HOME`；就绪检查读取版本和组合后的 `--dump-config`，校验活动插件 id/实现而不是只校验文件名。分析的 MCP 仅保留 `submit_analysis` 作为结构化文本返回通道；补查和业务工具都由 SS 的共用循环调度；没有 `submit_analysis` 接受结果或 schema 校验失败即整体失败。处置按用户已有权限展示审批，不支持的重命名、运行中插话等明确报错。
+9. Harness 分析和处置启动必须使用同一受限配置：分析使用 `--profile acp --patch <overlay>`、只读权限、空 `DSH_AGENTS_HOME` 和实际 `$DSH_HOME`；就绪检查读取版本和组合后的 `--dump-config`，校验活动插件 id/实现而不是只校验文件名。分析的 MCP 仅保留 `submit_analysis` 作为结构化文本返回通道；补查和业务工具都由 SS 的共用循环调度；没有 `submit_analysis` 接受结果或 schema 校验失败即整体失败。处置按用户已有权限展示审批；会话不尝试改名，运行中插话在提交前明确拒绝，不写入待核实补充记录。
 10. 不在普通日志记录提示词原文、模型思考、消息正文、密钥或会话凭据；只记录请求 id、长度、哈希、用量和失败类别。
 
 ## 流式、期限与本地诊断
 
 - `Config.ai_timeout_seconds` 是三种结构化分析接入共用的总时限，默认 600 秒，可设 30—1800 秒；没有按连接或来源分别配置的期限。工具循环与格式纠正共享剩余期限，上游网关可能提前返回 504。
-- API 连接的 `stream` 默认 true，可在高级选项明确关闭。WinHTTP 在 EOF 前逐块回调，SSE 解码保留正文、公开思考内容、工具参数及最终用量；DeepSeek 工具回合保留 `reasoning_content`，回放角色固定为 assistant。
+- Harness 分析正常结束时保留进程退出宽限；用户取消或总时限到达后立即终止本次自有进程树，再回收读写线程。RPC 先返回超时的竞态也走同一强制退出入口，不能继续等待正常退出或重发请求。
+- API 连接的 `stream` 默认 true，可在高级选项明确关闭。HTTP 层通过 reqwest/Tokio 复用连接，Windows 使用系统 TLS，沿用 WinHTTP 默认代理配置；在 EOF 前逐块回调，SSE 解码保留正文、公开思考内容、工具参数及最终用量。DeepSeek 工具回合保留 `reasoning_content`，回放角色固定为 assistant。
 - 已知只读工具参数校验失败允许一次纠正。全部参数通过验证前不执行该批工具；未知工具、权限拒绝及无进展不放行，不静默裁剪参数。
 - 前端 AI 长操作先接受操作编号，再查询终态；查询不重发原操作。运行中进度仅展示实际收到的公开内容，完整业务结果通过校验后才提交。
 - 普通活动日志仍只保存概况。开启“保留完整 AI 跟踪”时，原始响应和工具校验失败详情仅写本地调用目录，屏蔽当前 API 密钥及图片数据；工具失败单独保留，避免被有界事件流的截断隐藏。关闭时不保存这些正文。

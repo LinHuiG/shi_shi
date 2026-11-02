@@ -9,16 +9,7 @@ pub enum AiMode {
     Automatic,
     Nightly,
 }
-impl AiMode {}
 
-pub fn validate(config: &Config) -> Result<(), String> {
-    let start = parse(&config.work_start).ok_or("上班时间格式应为 HH:MM")?;
-    let end = parse(&config.work_end).ok_or("下班时间格式应为 HH:MM")?;
-    if start == end {
-        return Err("上下班时间不能相同；支持跨零点的工作时段".into());
-    }
-    Ok(())
-}
 fn parse(value: &str) -> Option<NaiveTime> {
     if value.len() != 5 {
         return None;
@@ -82,11 +73,9 @@ mod tests {
         ] {
             assert_eq!(is_work_time(&config, at(time)), expected);
         }
-        assert!(validate(&config).is_ok());
         config.work_end = "22:00".into();
-        assert!(validate(&config).is_err());
+        assert!(!is_work_time(&config, at("2026-10-15T22:00:00+08:00")));
         config.work_end = "25:00".into();
-        assert!(validate(&config).is_err());
         assert!(!is_work_time(&config, at("2026-10-15T22:00:00+08:00")));
     }
 }

@@ -1,11 +1,18 @@
 use crate::{engine::App, model::id};
 use serde_json::{json, Value};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError, Sender},
+        Arc,
+    },
+    thread::{self, JoinHandle},
+    time::Instant,
 };
 
 pub const CANCELLED: &str = "本次 AI 任务已中断，可手动重新执行";
+pub(crate) const BUSY: &str = "AI 正在处理其他请求，请稍后重试";
+pub(crate) const ARCHIVE_BUSY: &str = "归档已排队或正在执行，请稍后重试";
 
 /// Stable diagnostic category for a failed run. The original message is kept;
 /// this only adds a machine-readable class so the UI/logs can distinguish a
@@ -73,8 +80,47 @@ pub struct AiCall<'a> {
     pub cancel: Arc<AtomicBool>,
 }
 
+/// One total deadline across batches. Finishing wakes and joins the monitor,
+/// so it cannot cancel a call after the owner has completed its cleanup.
+pub(crate) struct DeadlineGuard {
+    done: Sender<()>,
+    worker: Option<JoinHandle<bool>>,
+}
+
+impl DeadlineGuard {
+    pub fn new(deadline: Instant, cancel: Arc<AtomicBool>) -> Self {
+        let (done, receive) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let expired = receive.recv_timeout(remaining) == Err(RecvTimeoutError::Timeout);
+            if expired {
+                cancel.store(true, Ordering::SeqCst);
+            }
+            expired
+        });
+        Self {
+            done,
+            worker: Some(worker),
+        }
+    }
+
+    /// Return whether this monitor fired, independently of manual cancellation.
+    pub fn finish(&mut self) -> bool {
+        let _ = self.done.send(());
+        self.worker
+            .take()
+            .is_some_and(|worker| worker.join().unwrap_or(false))
+    }
+}
+
+impl Drop for DeadlineGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 impl AiCall<'_> {
-    /// Keep one cancellation token/reservation across archive batches, but give
+    /// Keep one cancellation token/reservation across batches, but give
     /// each provider request an independent trace and live-preview identity.
     pub fn next_request(&mut self) -> Result<(), String> {
         if self.cancel.load(Ordering::SeqCst) {
@@ -95,9 +141,14 @@ impl AiCall<'_> {
     pub fn finish(&self) -> bool {
         let mut active = self.app.active_ai.lock().unwrap();
         let cancelled = self.cancel.load(Ordering::SeqCst);
-        if active.as_ref().is_some_and(|a| a.id == self.id) {
+        let finished = active.as_ref().is_some_and(|a| a.id == self.id);
+        if finished {
             *active = None;
             self.app.ai_busy.store(false, Ordering::SeqCst);
+        }
+        drop(active);
+        if finished {
+            self.app.background.wake();
         }
         cancelled
     }
@@ -116,6 +167,49 @@ impl App {
 
     pub(crate) fn begin_ai_for(&self, kind: &str) -> Result<AiCall<'_>, String> {
         let mut active = self.active_ai.lock().unwrap();
+        self.reserve_ai_call(kind, &mut active)
+    }
+
+    pub(crate) fn begin_analysis_after_scan(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<AiCall<'_>, String> {
+        let mut previous: Option<Arc<AtomicBool>> = None;
+        loop {
+            let wake = self.background.generation();
+            crate::process::check_running()?;
+            {
+                let mut active = self.active_ai.lock().unwrap();
+                // Observe cancellation and reserve under the same lock. Keep
+                // the token even after the previous call has released its slot,
+                // so stopping that call cannot silently restart this backlog.
+                if previous.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return Err(CANCELLED.into());
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err("等待 AI 空闲达到分析总时限，消息已保存，请稍后重试".into());
+                }
+                match self.reserve_ai_call("classify", &mut active) {
+                    Ok(call) => return Ok(call),
+                    Err(error) if matches!(error.as_str(), BUSY | ARCHIVE_BUSY) => {
+                        if let Some(call) = active.as_ref() {
+                            previous = Some(call.cancel.clone());
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            // Only the pre-invocation reservation waits. Provider failures are
+            // terminal and never return through this loop.
+            self.background.wait(wake);
+        }
+    }
+
+    fn reserve_ai_call(
+        &self,
+        kind: &str,
+        active: &mut Option<ActiveAi>,
+    ) -> Result<AiCall<'_>, String> {
         if kind != "archive"
             && (self.archive_busy.load(Ordering::SeqCst)
                 || self
@@ -126,10 +220,10 @@ impl App {
                     .iter()
                     .any(|a| a.status == "queued"))
         {
-            return Err("归档已排队或正在执行，请稍后重试".into());
+            return Err(ARCHIVE_BUSY.into());
         }
         if self.ai_busy.swap(true, Ordering::SeqCst) {
-            return Err("Codex 正在处理其他请求，请稍后重试".into());
+            return Err(BUSY.into());
         }
         let id = id();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -171,9 +265,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deadline_monitor_stops_on_completion_unwind_or_expiry() {
+        use std::time::Duration;
+        for cancelled in [false, true] {
+            let cancel = Arc::new(AtomicBool::new(cancelled));
+            let mut guard =
+                DeadlineGuard::new(Instant::now() + Duration::from_secs(30), cancel.clone());
+            assert!(!guard.finish(), "manual cancellation is not a timer expiry");
+            assert_eq!(cancel.load(Ordering::SeqCst), cancelled);
+            assert_eq!(Arc::strong_count(&cancel), 1, "monitor has exited");
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut guard = DeadlineGuard::new(Instant::now(), cancel.clone());
+        let limit = Instant::now() + Duration::from_secs(5);
+        while !cancel.load(Ordering::SeqCst) {
+            assert!(Instant::now() < limit, "deadline did not cancel the call");
+            thread::yield_now();
+        }
+        assert!(guard.finish());
+        assert_eq!(Arc::strong_count(&cancel), 1);
+
+        for _ in 0..64 {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut guard = DeadlineGuard::new(Instant::now(), cancel.clone());
+            assert_eq!(guard.finish(), cancel.load(Ordering::SeqCst));
+            assert_eq!(Arc::strong_count(&cancel), 1, "no late cancellation");
+        }
+
+        cancel.store(false, Ordering::SeqCst);
+        assert!(std::panic::catch_unwind(|| {
+            let _guard =
+                DeadlineGuard::new(Instant::now() + Duration::from_secs(30), cancel.clone());
+            panic!("synthetic early exit");
+        })
+        .is_err());
+        assert!(!cancel.load(Ordering::SeqCst));
+        assert_eq!(Arc::strong_count(&cancel), 1, "unwinding joins the monitor");
+    }
+
+    #[test]
     fn oversized_input_is_rejected_before_cli_start_or_call_reservation() {
-        let root = std::env::temp_dir().join(format!("shishi-input-limit-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-input-limit");
         app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
@@ -200,14 +332,11 @@ mod tests {
             .iter()
             .any(|v| v["kind"] == "ai_rejected"));
         assert!(!root.join("data/ai-work").exists());
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn queued_or_running_archive_reserves_priority_over_new_analysis() {
-        let root = std::env::temp_dir().join(format!("shishi-ai-priority-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-ai-priority");
         app.state.lock().unwrap().config.model_profiles = None;
         app.state
             .lock()
@@ -227,14 +356,11 @@ mod tests {
         drop(archive);
         app.archive_busy.store(false, Ordering::SeqCst);
         drop(app.begin_ai_for("classify").unwrap());
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn interruption_only_cancels_current_request_and_preserves_settings() {
-        let root = std::env::temp_dir().join(format!("shishi-ai-interrupt-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-ai-interrupt");
         app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         {
@@ -248,8 +374,7 @@ mod tests {
         assert!(!call.cancel.load(Ordering::SeqCst));
         app.interrupt_ai(&call.id).unwrap();
         // A stop arriving during prompt preparation must survive call reservation.
-        app.reserve_ai(crate::work_hours::AiMode::Manual, None)
-            .unwrap();
+        app.reserve_ai(crate::work_hours::AiMode::Manual).unwrap();
         assert!(app.state.lock().unwrap().ai_interrupted_at > 0);
         assert!(call.finish());
         let next = app.begin_ai().unwrap();
@@ -263,7 +388,5 @@ mod tests {
         drop(s);
         drop(next);
         drop(reloaded);
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

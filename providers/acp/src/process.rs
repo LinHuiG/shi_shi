@@ -4,12 +4,12 @@
 //! `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Closing the last handle terminates the
 //! whole tree, including MCP servers and any descendants. This is the same
 //! mechanism used by the staging transport for both the runtime child and its
-//! cleanup. `run_bounded` is for short, non-protocol commands such as
+//! cleanup. `run_bounded_command_until` is for short, non-protocol commands such as
 //! `dsh --version` and `dsh --dump-config`; it never reads a model.
 
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,8 +23,7 @@ use windows_sys::Win32::System::JobObjects::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
-    PROCESS_TERMINATE,
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 pub const STILL_ACTIVE: u32 = 259;
@@ -35,17 +34,13 @@ pub struct JobGuard {
     handle: usize,
 }
 
-// The handle is an owned kernel handle valid across threads.
-unsafe impl Send for JobGuard {}
-unsafe impl Sync for JobGuard {}
-
 impl JobGuard {
     pub fn create() -> Result<Self, String> {
         #[cfg(windows)]
         {
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {
-                return Err("CreateJobObjectW failed".into());
+                return Err(std::io::Error::last_os_error().to_string());
             }
             let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -58,8 +53,9 @@ impl JobGuard {
                 )
             };
             if ok == 0 {
+                let error = std::io::Error::last_os_error();
                 unsafe { CloseHandle(handle) };
-                return Err("SetInformationJobObject failed".into());
+                return Err(error.to_string());
             }
             Ok(Self {
                 handle: handle as usize,
@@ -74,15 +70,14 @@ impl JobGuard {
     pub fn assign(&self, child: &Child) -> Result<(), String> {
         #[cfg(windows)]
         {
-            let process =
-                unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE, child.id()) };
-            if process.is_null() {
-                return Err("OpenProcess for job assignment failed".into());
-            }
-            let ok = unsafe { AssignProcessToJobObject(self.handle as HANDLE, process) };
-            unsafe { CloseHandle(process) };
+            use std::os::windows::io::AsRawHandle;
+            let ok =
+                unsafe { AssignProcessToJobObject(self.handle as HANDLE, child.as_raw_handle()) };
             if ok == 0 {
-                return Err("AssignProcessToJobObject failed".into());
+                return Err(format!(
+                    "无法管理子进程生命周期：{}",
+                    std::io::Error::last_os_error()
+                ));
             }
             Ok(())
         }
@@ -105,11 +100,8 @@ impl Drop for JobGuard {
     fn drop(&mut self) {
         #[cfg(windows)]
         unsafe {
-            if self.handle != 0 {
-                let _ = TerminateJobObject(self.handle as HANDLE, 1);
-                let _ = CloseHandle(self.handle as HANDLE);
-                self.handle = 0;
-            }
+            // This uniquely owned handle always has KILL_ON_JOB_CLOSE set.
+            let _ = CloseHandle(self.handle as HANDLE);
         }
     }
 }
@@ -136,7 +128,7 @@ pub fn pid_alive(pid: u32) -> bool {
 /// Spawn a process suspended, assign it to a kill-on-close job, then resume its
 /// primary thread. This closes the race where a child could launch a
 /// grandchild before job assignment.
-pub fn spawn_in_job(mut command: Command) -> Result<(Child, JobGuard), String> {
+pub fn spawn_in_job(command: &mut Command) -> Result<(Child, JobGuard), String> {
     let job = JobGuard::create()?;
     #[cfg(windows)]
     {
@@ -144,16 +136,11 @@ pub fn spawn_in_job(mut command: Command) -> Result<(Child, JobGuard), String> {
         // CREATE_NO_WINDOW | CREATE_SUSPENDED
         command.creation_flags(0x0800_0000 | 0x0000_0004);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("spawn {command:?} failed: {error}"))?;
-    if let Err(error) = job.assign(&child) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let assigned = job.assign(&child);
     #[cfg(windows)]
-    if let Err(error) = resume_child(child.id()) {
+    let assigned = assigned.and_then(|_| resume_child(child.id()));
+    if let Err(error) = assigned {
         job.terminate();
         let _ = child.kill();
         let _ = child.wait();
@@ -171,7 +158,7 @@ fn resume_child(pid: u32) -> Result<(), String> {
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return Err("CreateToolhelp32Snapshot failed".into());
+            return Err(std::io::Error::last_os_error().to_string());
         }
         let mut entry: THREADENTRY32 = std::mem::zeroed();
         entry.dwSize = std::mem::size_of_val(&entry) as u32;
@@ -192,11 +179,12 @@ fn resume_child(pid: u32) -> Result<(), String> {
         if resumed {
             Ok(())
         } else {
-            Err("could not resume the job-owned child".into())
+            Err("无法恢复已受管的子进程".into())
         }
     }
 }
 
+#[derive(Debug, Default)]
 pub struct BoundedOutput {
     pub status: Option<ExitStatus>,
     pub stdout: Vec<u8>,
@@ -204,47 +192,35 @@ pub struct BoundedOutput {
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
     pub timed_out: bool,
+    pub cancelled: bool,
 }
 
-/// Run a short command with a wall-clock deadline and memory-bounded output.
-/// Stdout/stderr are drained concurrently so a child cannot deadlock on a full
-/// pipe. On Windows the child is assigned to a kill-on-close job.
-pub fn run_bounded(
-    program: &Path,
-    args: &[String],
-    cwd: Option<&Path>,
-    env: &[(String, String)],
-    timeout: Duration,
-    max_stdout: usize,
-    max_stderr: usize,
-) -> Result<BoundedOutput, String> {
-    let mut command = Command::new(program);
-    command.args(args);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    run_bounded_command(command, timeout, max_stdout, max_stderr)
-}
-
-pub fn run_bounded_command(
+/// Share the caller's total deadline and cancellation through process startup,
+/// execution and tree cleanup. An already stopped call never launches a child.
+pub fn run_bounded_command_until(
     mut command: Command,
-    timeout: Duration,
+    deadline: Instant,
     max_stdout: usize,
     max_stderr: usize,
+    cancel: &AtomicBool,
 ) -> Result<BoundedOutput, String> {
+    let mut cancelled = cancel.load(Ordering::SeqCst);
+    if cancelled || Instant::now() >= deadline {
+        return Ok(BoundedOutput {
+            cancelled,
+            timed_out: !cancelled,
+            ..BoundedOutput::default()
+        });
+    }
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let label = format!("{command:?}");
-    let (mut child, job) = spawn_in_job(command)?;
+    let (mut child, job) = spawn_in_job(&mut command)?;
     let stdout = child.stdout.take().ok_or("stdout pipe missing")?;
     let stderr = child.stderr.take().ok_or("stderr pipe missing")?;
     let stdout_thread = spawn_capped_reader(stdout, max_stdout);
     let stderr_thread = spawn_capped_reader(stderr, max_stderr);
-    let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
@@ -257,8 +233,9 @@ pub fn run_bounded_command(
                 return Err(format!("wait for {label} failed: {error}"));
             }
         }
-        if Instant::now() >= deadline {
-            timed_out = true;
+        cancelled = cancel.load(Ordering::SeqCst);
+        if cancelled || Instant::now() >= deadline {
+            timed_out = !cancelled;
             job.terminate();
             let _ = child.kill();
             break child.wait().ok();
@@ -280,6 +257,7 @@ pub fn run_bounded_command(
         stdout_truncated,
         stderr_truncated,
         timed_out,
+        cancelled,
     })
 }
 
@@ -311,32 +289,41 @@ fn spawn_capped_reader<R: Read + Send + 'static>(
     })
 }
 
-/// Write one line to a pipe and flush it. Used by the mock MCP/ACP servers.
-pub fn write_line(mut writer: impl Write, value: &serde_json::Value) -> std::io::Result<()> {
-    serde_json::to_writer(&mut writer, value)?;
-    writer.write_all(b"\n")?;
-    writer.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn cancelled_or_expired_command_never_spawns() {
+        for cancelled in [true, false] {
+            let out = run_bounded_command_until(
+                Command::new("shishi-nonexistent-command"),
+                if cancelled {
+                    Instant::now() + Duration::from_secs(30)
+                } else {
+                    Instant::now()
+                },
+                16,
+                16,
+                &AtomicBool::new(cancelled),
+            )
+            .unwrap();
+            assert_eq!(out.cancelled, cancelled);
+            assert_eq!(out.timed_out, !cancelled);
+            assert!(out.status.is_none());
+        }
+    }
+
+    #[test]
     fn bounded_output_truncates_and_returns_status() {
-        let out = run_bounded(
-            Path::new("cmd.exe"),
-            &[
-                "/D".into(),
-                "/S".into(),
-                "/C".into(),
-                "echo 0123456789 & echo err 1>&2".into(),
-            ],
-            None,
-            &[],
-            Duration::from_secs(10),
+        let mut command = Command::new("cmd.exe");
+        command.args(["/D", "/S", "/C", "echo 0123456789 & echo err 1>&2"]);
+        let out = run_bounded_command_until(
+            command,
+            Instant::now() + Duration::from_secs(10),
             4,
             2,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert!(!out.timed_out);
@@ -350,19 +337,19 @@ mod tests {
     #[test]
     fn timeout_terminates() {
         let started = Instant::now();
-        let out = run_bounded(
-            Path::new("cmd.exe"),
-            &[
-                "/D".into(),
-                "/S".into(),
-                "/C".into(),
-                "ping -n 30 127.0.0.1 >NUL".into(),
-            ],
-            None,
-            &[],
-            Duration::from_millis(250),
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Start-Sleep -Seconds 30",
+        ]);
+        let out = run_bounded_command_until(
+            command,
+            started + Duration::from_millis(250),
             1024,
             1024,
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert!(out.timed_out);
@@ -370,42 +357,53 @@ mod tests {
     }
 
     #[test]
-    fn job_terminates_grandchild() {
-        let temp = std::env::temp_dir().join(format!(
-            "shishi-acp-job-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+    fn cancellation_reaps_the_ready_process_tree_and_output_readers() {
+        let temp = crate::test_path("acp-job-test");
         std::fs::create_dir_all(&temp).unwrap();
         let pid_file = temp.join("pid.txt");
-        // Run cmd in the background through PowerShell and record its PID.
-        let ps = format!(
-            "$p=Start-Process -FilePath cmd.exe -ArgumentList '/D','/S','/C','ping -n 30 127.0.0.1 >NUL' -WindowStyle Hidden -PassThru; Set-Content -Path '{}' -Value $p.Id; Start-Sleep -Seconds 30",
-            pid_file.display()
-        );
-        let out = run_bounded(
-            Path::new("powershell.exe"),
-            &["-NoProfile".into(), "-Command".into(), ps],
-            None,
-            &[],
-            Duration::from_millis(700),
-            1024,
-            1024,
-        )
-        .unwrap();
-        assert!(out.timed_out);
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap_or_default()
-            .trim()
-            .parse()
-            .unwrap_or(0);
-        assert!(pid != 0, "grandchild pid was not recorded");
-        thread::sleep(Duration::from_millis(200));
+        let mut command = Command::new("powershell.exe");
+        command.env("SS_TEST_PID", &pid_file).args(["-NoProfile", "-NonInteractive", "-Command",
+            "$p=[Diagnostics.Process]::new(); $p.StartInfo.FileName='powershell.exe'; $p.StartInfo.Arguments='-NoProfile -NonInteractive -Command Start-Sleep -Seconds 30'; $p.StartInfo.UseShellExecute=$false; $p.StartInfo.CreateNoWindow=$true; [void]$p.Start(); [IO.File]::WriteAllText($env:SS_TEST_PID,[string]$p.Id); Start-Sleep -Seconds 30"]);
+        let cancel = AtomicBool::new(false);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (out, pid, cancelled_at) = thread::scope(|scope| {
+            let ready = scope.spawn(|| {
+                // Startup latency is not cancellation latency. Observe a live
+                // descendant before asking the real bounded runner to cancel.
+                let ready_deadline = Instant::now() + Duration::from_secs(10);
+                let pid = loop {
+                    if let Some(pid) = std::fs::read_to_string(&pid_file)
+                        .ok()
+                        .and_then(|v| v.trim().parse::<u32>().ok())
+                    {
+                        break pid;
+                    }
+                    assert!(
+                        Instant::now() < ready_deadline,
+                        "grandchild PID was not recorded"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                };
+                assert!(
+                    pid_alive(pid),
+                    "grandchild must be running before cancellation"
+                );
+                let cancelled_at = Instant::now();
+                cancel.store(true, Ordering::SeqCst);
+                (pid, cancelled_at)
+            });
+            let out = run_bounded_command_until(command, deadline, 1024, 1024, &cancel).unwrap();
+            let (pid, cancelled_at) = ready.join().unwrap();
+            (out, pid, cancelled_at)
+        });
+        assert!(out.cancelled && !out.timed_out && out.status.is_some());
+        assert!(cancelled_at.elapsed() < Duration::from_secs(3));
+        let exit_deadline = Instant::now() + Duration::from_secs(1);
+        while pid_alive(pid) && Instant::now() < exit_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(!pid_alive(pid), "grandchild survived job termination");
-        let _ = std::fs::remove_dir_all(temp);
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -418,12 +416,5 @@ mod tests {
     fn job_guard_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<JobGuard>();
-    }
-
-    #[test]
-    fn write_line_is_single_line() {
-        let mut out = Vec::new();
-        write_line(&mut out, &serde_json::json!({"a":1})).unwrap();
-        assert_eq!(out, b"{\"a\":1}\n");
     }
 }

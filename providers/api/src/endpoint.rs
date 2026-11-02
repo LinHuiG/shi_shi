@@ -15,6 +15,7 @@ use std::net::IpAddr;
 
 const MAX_BASE_URL_BYTES: usize = 2_048;
 const MAX_PATH_BYTES: usize = 512;
+pub(crate) const MAX_URL_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EndpointErrorKind {
@@ -52,7 +53,8 @@ impl EndpointErrorKind {
 }
 
 /// Safe endpoint error. It intentionally contains no URL, path, or authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{}", .kind.as_str())]
 pub struct EndpointError {
     kind: EndpointErrorKind,
 }
@@ -67,34 +69,170 @@ impl EndpointError {
     }
 }
 
-impl fmt::Display for EndpointError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.kind.as_str())
-    }
-}
-
-impl std::error::Error for EndpointError {}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Scheme {
+pub(crate) enum Scheme {
     Https,
-    HttpLocalhostTest,
+    Http,
 }
 
 impl Scheme {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Https => "https",
-            Self::HttpLocalhostTest => "http",
+            Self::Http => "http",
         }
     }
 
-    fn default_port(self) -> u16 {
+    pub(crate) fn default_port(self) -> u16 {
         match self {
             Self::Https => 443,
-            Self::HttpLocalhostTest => 80,
+            Self::Http => 80,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ParsedUrl {
+    pub(crate) scheme: Scheme,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) path: String,
+}
+
+impl ParsedUrl {
+    pub(crate) fn parse(input: &str, allow_localhost_http: bool) -> Result<Self, EndpointError> {
+        if input.is_empty()
+            || input.len() > MAX_URL_BYTES
+            || !input.is_ascii()
+            || input
+                .bytes()
+                .any(|byte| byte <= b' ' || byte == 0x7f || byte == b'\\')
+        {
+            return Err(EndpointError::new(EndpointErrorKind::InvalidCharacter));
+        }
+        if input.contains('?') {
+            return Err(EndpointError::new(EndpointErrorKind::Query));
+        }
+        if input.contains('#') {
+            return Err(EndpointError::new(EndpointErrorKind::Fragment));
+        }
+
+        let scheme_end = input
+            .find("://")
+            .ok_or_else(|| EndpointError::new(EndpointErrorKind::InvalidCharacter))?;
+        let scheme_text = &input[..scheme_end];
+        let rest = &input[scheme_end + 3..];
+        let scheme = if scheme_text.eq_ignore_ascii_case("https") {
+            Scheme::Https
+        } else if scheme_text.eq_ignore_ascii_case("http") {
+            Scheme::Http
+        } else {
+            return Err(EndpointError::new(EndpointErrorKind::UnsupportedScheme));
+        };
+
+        let authority_end = rest.find('/').unwrap_or(rest.len());
+        let authority = &rest[..authority_end];
+        let path = if authority_end == rest.len() {
+            "/"
+        } else {
+            &rest[authority_end..]
+        };
+        if authority.is_empty() {
+            return Err(EndpointError::new(EndpointErrorKind::InvalidHost));
+        }
+        if authority.contains('@') {
+            return Err(EndpointError::new(EndpointErrorKind::UserInfo));
+        }
+
+        let (host, port_text) = if let Some(after_bracket) = authority.strip_prefix('[') {
+            let close = after_bracket
+                .find(']')
+                .ok_or_else(|| EndpointError::new(EndpointErrorKind::InvalidHost))?;
+            let inner = &after_bracket[..close];
+            let suffix = &after_bracket[close + 1..];
+            let address: std::net::Ipv6Addr = inner
+                .parse()
+                .map_err(|_| EndpointError::new(EndpointErrorKind::InvalidHost))?;
+            let port_text = if suffix.is_empty() {
+                None
+            } else {
+                Some(
+                    suffix
+                        .strip_prefix(':')
+                        .ok_or_else(|| EndpointError::new(EndpointErrorKind::InvalidHost))?,
+                )
+            };
+            (address.to_string(), port_text)
+        } else {
+            if authority.matches(':').count() > 1 {
+                // Unbracketed IPv6 literals are ambiguous and rejected.
+                return Err(EndpointError::new(EndpointErrorKind::InvalidHost));
+            }
+            let (host, port_text) = match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            };
+            if host.is_empty()
+                || !host.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
+                })
+                || !host.bytes().any(|byte| byte.is_ascii_alphanumeric())
+            {
+                return Err(EndpointError::new(EndpointErrorKind::InvalidHost));
+            }
+            (host.to_ascii_lowercase(), port_text)
+        };
+
+        let port = match port_text {
+            None => scheme.default_port(),
+            Some(text) => {
+                if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                    return Err(EndpointError::new(EndpointErrorKind::InvalidPort));
+                }
+                let port: u32 = text
+                    .parse()
+                    .map_err(|_| EndpointError::new(EndpointErrorKind::InvalidPort))?;
+                if !(1..=u16::MAX as u32).contains(&port) {
+                    return Err(EndpointError::new(EndpointErrorKind::InvalidPort));
+                }
+                port as u16
+            }
+        };
+
+        if !path.starts_with('/') {
+            return Err(EndpointError::new(EndpointErrorKind::InvalidCharacter));
+        }
+
+        if scheme == Scheme::Http {
+            if !allow_localhost_http {
+                return Err(EndpointError::new(EndpointErrorKind::UnsupportedScheme));
+            }
+            if !is_loopback_host(&host) {
+                return Err(EndpointError::new(EndpointErrorKind::UnsupportedScheme));
+            }
+        }
+
+        Ok(Self {
+            scheme,
+            host,
+            port,
+            path: path.to_string(),
+        })
+    }
+
+    pub(crate) fn same_origin(&self, other: &Self) -> bool {
+        self.scheme == other.scheme
+            && self.host.eq_ignore_ascii_case(&other.host)
+            && self.port == other.port
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|address| address.is_loopback())
+            .unwrap_or(false)
 }
 
 /// A validated base endpoint. `Debug` hides the path prefix, which callers may
@@ -147,98 +285,21 @@ impl Endpoint {
             return Err(EndpointError::new(EndpointErrorKind::Fragment));
         }
 
-        let scheme_end = input
-            .find("://")
+        let (scheme, _) = input
+            .split_once("://")
             .ok_or_else(|| EndpointError::new(EndpointErrorKind::InvalidCharacter))?;
-        let scheme_text = &input[..scheme_end];
-        let rest = &input[scheme_end + 3..];
-        let scheme = if scheme_text.eq_ignore_ascii_case("https") {
-            Scheme::Https
-        } else if scheme_text.eq_ignore_ascii_case("http") && allow_localhost_http {
-            Scheme::HttpLocalhostTest
-        } else {
-            return Err(EndpointError::new(EndpointErrorKind::UnsupportedScheme));
-        };
-
-        let authority_end = rest.find('/').unwrap_or(rest.len());
-        let authority = &rest[..authority_end];
-        let raw_path = if authority_end == rest.len() {
-            ""
-        } else {
-            &rest[authority_end..]
-        };
-        if authority.is_empty() {
-            return Err(EndpointError::new(EndpointErrorKind::InvalidHost));
-        }
-        if authority.contains('@') {
-            return Err(EndpointError::new(EndpointErrorKind::UserInfo));
-        }
-
-        let (host, ipv6, port_text) = if let Some(after_bracket) = authority.strip_prefix('[') {
-            let close = after_bracket
-                .find(']')
-                .ok_or_else(|| EndpointError::new(EndpointErrorKind::InvalidHost))?;
-            let inner = &after_bracket[..close];
-            let suffix = &after_bracket[close + 1..];
-            let address: std::net::Ipv6Addr = inner
-                .parse()
-                .map_err(|_| EndpointError::new(EndpointErrorKind::InvalidHost))?;
-            let port_text = if suffix.is_empty() {
-                None
-            } else {
-                Some(
-                    suffix
-                        .strip_prefix(':')
-                        .ok_or_else(|| EndpointError::new(EndpointErrorKind::InvalidHost))?,
-                )
-            };
-            (address.to_string(), true, port_text)
-        } else {
-            if authority.matches(':').count() > 1 {
-                return Err(EndpointError::new(EndpointErrorKind::InvalidHost));
-            }
-            let (host, port_text) = match authority.split_once(':') {
-                Some((host, port)) => (host, Some(port)),
-                None => (authority, None),
-            };
-            if host.is_empty()
-                || !host.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
-                })
-                || !host.bytes().any(|byte| byte.is_ascii_alphanumeric())
-            {
-                return Err(EndpointError::new(EndpointErrorKind::InvalidHost));
-            }
-            (host.to_ascii_lowercase(), false, port_text)
-        };
-
-        let port = match port_text {
-            None => scheme.default_port(),
-            Some(text) => {
-                if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(EndpointError::new(EndpointErrorKind::InvalidPort));
-                }
-                let value: u32 = text
-                    .parse()
-                    .map_err(|_| EndpointError::new(EndpointErrorKind::InvalidPort))?;
-                if !(1..=u16::MAX as u32).contains(&value) {
-                    return Err(EndpointError::new(EndpointErrorKind::InvalidPort));
-                }
-                value as u16
-            }
-        };
-
-        if scheme == Scheme::HttpLocalhostTest && !is_loopback_host(&host) {
+        if !scheme.eq_ignore_ascii_case("https")
+            && !(allow_localhost_http && scheme.eq_ignore_ascii_case("http"))
+        {
             return Err(EndpointError::new(EndpointErrorKind::UnsupportedScheme));
         }
-
-        let path_prefix = normalize_path(raw_path)?;
+        let url = ParsedUrl::parse(input, allow_localhost_http)?;
         Ok(Self {
-            scheme,
-            host,
-            ipv6,
-            port,
-            path_prefix,
+            scheme: url.scheme,
+            ipv6: url.host.contains(':'),
+            host: url.host,
+            port: url.port,
+            path_prefix: normalize_path(&url.path)?,
         })
     }
 
@@ -248,10 +309,6 @@ impl Endpoint {
 
     pub fn port(&self) -> u16 {
         self.port
-    }
-
-    pub fn is_https(&self) -> bool {
-        self.scheme == Scheme::Https
     }
 
     pub(crate) fn chat_completions_url(&self) -> String {
@@ -296,54 +353,27 @@ impl fmt::Debug for Endpoint {
     }
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false)
-}
-
 fn normalize_path(path: &str) -> Result<String, EndpointError> {
     if path.is_empty() {
         return Ok(String::new());
     }
-    if path.len() > MAX_PATH_BYTES {
-        return Err(EndpointError::new(EndpointErrorKind::InvalidPath));
-    }
-    if !path.starts_with('/') {
+    if path.len() > MAX_PATH_BYTES || !path.starts_with('/') {
         return Err(EndpointError::new(EndpointErrorKind::InvalidPath));
     }
     let trimmed = path.strip_suffix('/').unwrap_or(path);
     if trimmed.is_empty() {
         return Ok(String::new());
     }
-    let mut segments = Vec::new();
-    for (index, segment) in trimmed.split('/').enumerate() {
-        if index == 0 {
-            if !segment.is_empty() {
-                return Err(EndpointError::new(EndpointErrorKind::InvalidPath));
-            }
-            continue;
-        }
-        if segment.is_empty() || segment == "." || segment == ".." || has_encoded_traversal(segment)
-        {
-            return Err(EndpointError::new(EndpointErrorKind::InvalidPath));
-        }
-        segments.push(segment);
-    }
-    if segments.is_empty() {
+    if trimmed[1..].split('/').any(|segment| {
+        segment.is_empty() || segment == "." || segment == ".." || has_encoded_traversal(segment)
+    }) {
         return Err(EndpointError::new(EndpointErrorKind::InvalidPath));
     }
-    let prefix = format!("/{}", segments.join("/"));
-    if prefix.len() > MAX_PATH_BYTES {
-        return Err(EndpointError::new(EndpointErrorKind::InvalidPath));
-    }
-    let lower = prefix.to_ascii_lowercase();
+    let lower = trimmed.to_ascii_lowercase();
     if lower.ends_with("/chat/completions") || lower.ends_with("/models") {
         return Err(EndpointError::new(EndpointErrorKind::EndpointSuffix));
     }
-    Ok(prefix)
+    Ok(trimmed.to_owned())
 }
 
 fn has_encoded_traversal(segment: &str) -> bool {
@@ -356,56 +386,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn joins_paths_without_adding_or_duplicating_v1() {
-        let endpoint = Endpoint::parse("https://api.example.test").unwrap();
-        assert_eq!(
-            endpoint.chat_completions_url(),
-            "https://api.example.test/chat/completions"
-        );
-        assert_eq!(endpoint.models_url(), "https://api.example.test/models");
-
-        let endpoint = Endpoint::parse("https://api.example.test/v1/").unwrap();
-        assert_eq!(
-            endpoint.chat_completions_url(),
-            "https://api.example.test/v1/chat/completions"
-        );
-
-        let endpoint =
-            Endpoint::parse("https://gateway.example.test/proxy/tenant/openai/v1").unwrap();
-        assert_eq!(
-            endpoint.models_url(),
-            "https://gateway.example.test/proxy/tenant/openai/v1/models"
-        );
-        assert!(!endpoint.chat_completions_url().contains("/v1/v1/chat"));
-    }
-
-    #[test]
-    fn explicit_non_default_port_is_preserved() {
-        let endpoint = Endpoint::parse("https://api.example.test:8443/openai/v1").unwrap();
-        assert_eq!(
-            endpoint.chat_completions_url(),
-            "https://api.example.test:8443/openai/v1/chat/completions"
-        );
-        let default = Endpoint::parse("https://api.example.test:443/v1").unwrap();
-        assert_eq!(default.models_url(), "https://api.example.test/v1/models");
-    }
-
-    #[test]
-    fn endpoint_suffix_is_rejected_instead_of_duplicated() {
-        for base in [
-            "https://api.example.test/chat/completions",
-            "https://api.example.test/v1/models/",
-            "https://api.example.test/MODELS",
-            "https://api.example.test/v1/CHAT/COMPLETIONS/",
+    fn endpoints_preserve_normalized_origin_and_path() {
+        for (input, expected) in [
+            ("https://api.example.test", "https://api.example.test"),
+            (
+                "https://api.example.test/v1/",
+                "https://api.example.test/v1",
+            ),
+            (
+                "https://gateway.example.test/proxy/tenant/openai/v1",
+                "https://gateway.example.test/proxy/tenant/openai/v1",
+            ),
+            (
+                "https://api.example.test:8443/openai/v1",
+                "https://api.example.test:8443/openai/v1",
+            ),
+            (
+                "https://api.example.test:443/v1",
+                "https://api.example.test/v1",
+            ),
+            (
+                "  https://[::1]:8443/openai/v1  ",
+                "https://[::1]:8443/openai/v1",
+            ),
         ] {
-            let error = Endpoint::parse(base).unwrap_err();
-            assert_eq!(error.kind(), EndpointErrorKind::EndpointSuffix, "{base}");
+            let endpoint = Endpoint::parse(input).unwrap();
+            assert_eq!(
+                endpoint.chat_completions_url(),
+                format!("{expected}/chat/completions"),
+                "{input}"
+            );
+            assert_eq!(
+                endpoint.models_url(),
+                format!("{expected}/models"),
+                "{input}"
+            );
+            if input.contains("[::1]") {
+                assert_eq!(endpoint.host(), "::1");
+            }
         }
     }
 
     #[test]
     fn unsafe_or_ambiguous_endpoints_are_rejected() {
         let cases = [
+            (
+                "https://api.example.test/chat/completions",
+                EndpointErrorKind::EndpointSuffix,
+            ),
+            (
+                "https://api.example.test/v1/models/",
+                EndpointErrorKind::EndpointSuffix,
+            ),
+            (
+                "https://api.example.test/MODELS",
+                EndpointErrorKind::EndpointSuffix,
+            ),
+            (
+                "https://api.example.test/v1/CHAT/COMPLETIONS/",
+                EndpointErrorKind::EndpointSuffix,
+            ),
             ("", EndpointErrorKind::Empty),
             (
                 "ftp://api.example.test/v1",
@@ -486,16 +526,6 @@ mod tests {
     }
 
     #[test]
-    fn ipv6_and_outer_whitespace_are_handled_explicitly() {
-        let endpoint = Endpoint::parse("  https://[::1]:8443/openai/v1  ").unwrap();
-        assert_eq!(endpoint.host(), "::1");
-        assert_eq!(
-            endpoint.chat_completions_url(),
-            "https://[::1]:8443/openai/v1/chat/completions"
-        );
-    }
-
-    #[test]
     fn debug_redacts_path_prefix() {
         let endpoint =
             Endpoint::parse("https://api.example.test/tenant/synthetic-secret/v1").unwrap();
@@ -521,7 +551,6 @@ mod tests {
     fn test_only_http_is_limited_to_loopback() {
         let endpoint =
             Endpoint::parse_localhost_for_tests("http://127.0.0.1:18080/openai/v1").unwrap();
-        assert!(!endpoint.is_https());
         assert_eq!(
             endpoint.models_url(),
             "http://127.0.0.1:18080/openai/v1/models"

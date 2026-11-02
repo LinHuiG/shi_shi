@@ -128,7 +128,6 @@ async function compareArchiveVersion(id) {
   const rules = (x) => (x.rules || []).map((r) => `${r.title}：${r.rule}`).join('\n');
   const tags = (x) =>
     (x.tags || []).map((g) => `${g.name}：${(g.values || []).join('、')}`).join('\n');
-  const memory = (x) => (x.memory || []).map((m) => `${m.key}：${m.text}`).join('\n');
   setModal(
     `<h2>比较归档版本</h2><p class="helper">左侧当前版本，右侧目标版本。确认后追加一个新的回滚版本。</p>${block('系统提示词', current.prompt, target.prompt)}${block('启用规则', rules(current), rules(target))}${block('标签目录', tags(current), tags(target))}<p class="helper">AI 记忆保持当前内容，不参与版本比较或回滚。</p><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-archive-rollback="${esc(id)}" data-expected="${esc(currentId)}">确认回滚</button></div>`,
   );

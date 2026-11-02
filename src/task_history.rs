@@ -1,5 +1,8 @@
 //! Stable human-facing numbers and scoped queries over retained task audits.
-use crate::{engine::App, model::State};
+use crate::{
+    engine::App,
+    model::{Message, State},
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -8,20 +11,16 @@ pub fn numbers(s: &State) -> BTreeMap<String, u64> {
     let mut pending = s
         .tasks
         .iter()
-        .map(|t| (t.created, t.id.clone()))
-        .chain(
-            s.audit
-                .iter()
-                .filter(|a| !a.task_id.is_empty())
-                .map(|a| (a.time, a.task_id.clone())),
-        )
+        .map(|t| (t.created, &t.id))
+        .chain(s.audit.iter().map(|a| (a.time, &a.task_id)))
+        .filter(|(_, id)| !id.is_empty() && !s.task_numbers.contains_key(*id))
         .collect::<Vec<_>>();
     pending.sort();
     let mut next = result.values().copied().max().unwrap_or(0);
     for (_, id) in pending {
-        if !result.contains_key(&id) && !id.is_empty() {
+        if !result.contains_key(id) {
             next += 1;
-            result.insert(id, next);
+            result.insert(id.clone(), next);
         }
     }
     result
@@ -38,6 +37,7 @@ pub fn label(kind: &str) -> &str {
         "manual_tools" => "修改事项工具名单",
         "manual_ai_edit" => "AI 辅助编辑事项",
         "manual_status" => "手动修改状态",
+        "defer_resumed" => "延后到期恢复处理",
         "manual_create" | "manual_new" => "手动创建事项",
         "ai_create" => "AI 新增事项",
         "ai_update" => "AI 更新事项",
@@ -141,32 +141,69 @@ pub fn matches(row: &Value, terms: &[String]) -> bool {
         }
     })
 }
+// Keep one scoped selection for the full IPC response and the paged reader.
+// Insertion order preserves completion > background > direct for shared IDs.
+fn evidence_rows<'a>(s: &'a State, id: &str) -> Option<Vec<(&'a Message, &'static str)>> {
+    let task = s.tasks.iter().find(|t| t.id == id)?;
+    let roles: BTreeMap<_, _> = [
+        (&task.evidence.direct, "direct"),
+        (&task.evidence.background, "background"),
+        (&task.evidence.completion, "completion"),
+    ]
+    .into_iter()
+    .flat_map(|(ids, role)| ids.iter().map(move |id| (id, role)))
+    .collect();
+    Some(
+        roles
+            .into_iter()
+            .filter_map(|(id, role)| {
+                s.messages
+                    .get(id)
+                    .filter(|m| !m.withdrawn)
+                    .map(|m| (m, role))
+            })
+            .collect(),
+    )
+}
+fn evidence_value((message, role): (&Message, &str)) -> Value {
+    let mut value = json!(message);
+    value["evidence_role"] = json!(role);
+    value
+}
 impl App {
+    pub fn evidence(&self, id: &str) -> Value {
+        let s = self.state.lock().unwrap();
+        Value::Array(
+            evidence_rows(&s, id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(evidence_value)
+                .collect(),
+        )
+    }
     pub fn evidence_query(&self, p: &Value) -> Result<Value, String> {
         let id = p["id"].as_str().ok_or("缺少事项编号")?;
         let terms = terms(p)?;
         let (since, until) = record_range(p)?;
         let ascending = record_ascending(p)?;
-        if !self.state.lock().unwrap().tasks.iter().any(|t| t.id == id) {
-            return Err("事项不存在".into());
-        }
-        let mut rows = self.evidence(id).as_array().cloned().unwrap_or_default();
+        let s = self.state.lock().unwrap();
+        let mut rows = evidence_rows(&s, id).ok_or("事项不存在")?;
         let all = rows.len();
-        rows.retain(|m| {
-            let time = m["time"].as_i64().unwrap_or(0);
-            let text = ["text", "sender", "group", "chat", "source_name"]
-                .iter()
-                .filter_map(|k| m[*k].as_str())
-                .collect::<Vec<_>>()
+        rows.retain(|(m, _)| {
+            if m.time < since || m.time > until {
+                return false;
+            }
+            if terms.is_empty() {
+                return true;
+            }
+            let text = [&m.text, &m.sender, &m.group, &m.chat, &m.source_name]
+                .map(String::as_str)
                 .join(" ")
                 .to_lowercase();
-            time >= since && time <= until && terms.iter().all(|t| text.contains(t))
+            terms.iter().all(|term| text.contains(term))
         });
         rows.sort_by(|a, b| {
-            let order = a["time"]
-                .as_i64()
-                .cmp(&b["time"].as_i64())
-                .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()));
+            let order = a.0.time.cmp(&b.0.time).then_with(|| a.0.id.cmp(&b.0.id));
             if ascending {
                 order
             } else {
@@ -176,7 +213,12 @@ impl App {
         let total = rows.len();
         let pages = total.div_ceil(50).max(1);
         let page = (p["page"].as_u64().unwrap_or(1) as usize).clamp(1, pages);
-        let rows: Vec<_> = rows.into_iter().skip((page - 1) * 50).take(50).collect();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .skip((page - 1) * 50)
+            .take(50)
+            .map(evidence_value)
+            .collect();
         Ok(json!({"rows":rows,"all":all,"total":total,"page":page,"pages":pages}))
     }
     pub fn task_changes(&self, p: &Value) -> Result<Value, String> {
@@ -261,8 +303,7 @@ mod tests {
     }
     #[test]
     fn saved_numbers_survive_restart_and_ui_task_edits() {
-        let root = std::env::temp_dir().join(format!("shishi-task-number-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-task-number");
         let task = app
             .task_edit(
                 &json!({"task":{"title":"Synthetic first","description":"body","status":"待处理"}}),
@@ -281,13 +322,10 @@ mod tests {
         assert_eq!(state.task_numbers[&id], 1);
         assert_eq!(state.task_numbers[&second_id], 2);
         drop(state);
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn scoped_search_sorts_and_pages_retained_records() {
-        let root = std::env::temp_dir().join(format!("shishi-history-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-history");
         {
             let mut s = app.state.lock().unwrap();
             s.tasks.push(Task {
@@ -335,15 +373,11 @@ mod tests {
             assert!(app.task_changes(&request).is_err());
             assert!(app.evidence_query(&request).is_err());
         }
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn evidence_window_is_scoped_filtered_bounded_and_inclusive() {
-        let root =
-            std::env::temp_dir().join(format!("shishi-record-window-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-record-window");
         {
             let mut s = app.state.lock().unwrap();
             let mut task = Task {
@@ -353,12 +387,17 @@ mod tests {
             for index in 0..120 {
                 let id = format!("message-{index:03}");
                 task.evidence.direct.push(id.clone());
-                task.evidence.background.push(id.clone());
+                if index < 119 {
+                    task.evidence.background.push(id.clone());
+                }
+                if index == 0 || index == 11 {
+                    task.evidence.completion.push(id.clone());
+                }
                 s.messages.insert(
                     id.clone(),
                     crate::model::Message {
                         id,
-                        text: "Synthetic needle".into(),
+                        text: "Synthetic needle ".repeat(1000),
                         time: index,
                         withdrawn: index == 10,
                         ..Default::default()
@@ -367,12 +406,7 @@ mod tests {
             }
             s.messages.insert(
                 "other".into(),
-                crate::model::Message {
-                    id: "other".into(),
-                    text: "Synthetic needle".into(),
-                    time: 15,
-                    ..Default::default()
-                },
+                crate::test_support::message("other", "Synthetic needle", 15),
             );
             s.tasks.push(task);
         }
@@ -381,6 +415,18 @@ mod tests {
             .unwrap();
         assert_eq!(all["all"], 119);
         assert_eq!(all["rows"].as_array().unwrap().len(), 50);
+        assert_eq!(all["rows"][0]["evidence_role"], "completion");
+        assert_eq!(all["rows"][1]["evidence_role"], "background");
+        let last = app
+            .evidence_query(&json!({"id":"task","sort":"asc","page":3}))
+            .unwrap();
+        assert_eq!(last["rows"].as_array().unwrap().len(), 19);
+        assert_eq!(last["rows"][18]["id"], "message-119");
+        assert_eq!(last["rows"][18]["evidence_role"], "direct");
+        let reverse = app
+            .evidence_query(&json!({"id":"task","sort":"desc"}))
+            .unwrap();
+        assert_eq!(reverse["rows"][0], last["rows"][18]);
         let rows = app
             .evidence_query(
                 &json!({"id":"task","since":10,"until":12,"query":"SYNTHETIC needle","sort":"asc"}),
@@ -388,9 +434,8 @@ mod tests {
             .unwrap();
         assert_eq!(rows["total"], 2);
         assert_eq!(rows["rows"][0]["time"], 11);
+        assert_eq!(rows["rows"][0]["evidence_role"], "completion");
         assert_eq!(rows["rows"][1]["time"], 12);
         assert!(app.evidence_query(&json!({"id":"other"})).is_err());
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
     }
 }

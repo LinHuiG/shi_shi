@@ -240,7 +240,6 @@ let state = null,
   modalTask = null,
   manualSources = [],
   toastTimer,
-  evidenceCache = {},
   modalFromTrace = false;
 const names = {
   tasks: '事项',
@@ -266,8 +265,15 @@ function dueLabel(t) {
   if (!t.due) return '';
   const d = new Date(t.due);
   if (!Number.isFinite(d.getTime())) return t.due;
+  if (!deadlineActive(t)) return '截止 ' + date(d.getTime());
   const hours = (d - Date.now()) / 3600000;
   return (hours < 0 ? '已逾期 · ' : hours < 24 ? '即将截止 · ' : '截止 ') + date(d.getTime());
+}
+function deadlineActive(t) {
+  return ['待处理', '处理中'].includes(t.status) && !t.archived && !t.merged_into;
+}
+function isOverdue(t) {
+  return deadlineActive(t) && Boolean(t.due) && new Date(t.due).getTime() < Date.now();
 }
 function localDue(d) {
   return d ? new Date(new Date(d).getTime() + 8 * 3600000).toISOString().slice(0, 16) : '';
@@ -282,7 +288,7 @@ let modalClosing = null,
   modalOutsideDismiss = null,
   modalBack = null;
 function setModal(html) {
-  if (typeof cancelEmbeddedPluginSettings === 'function' && cancelEmbeddedPluginSettings() === false) return;
+  if (cancelEmbeddedPluginSettings?.() === false) return;
   const overlay = $('#overlay'),
     closing = modalClosing,
     opacity = getComputedStyle(overlay).opacity;
@@ -341,6 +347,25 @@ async function copyText(text) {
     if (focused?.isConnected) focused.focus({ preventScroll: true });
   }
 }
+async function modalRequest(button, method, params, accept, { label, lockForm = false } = {}) {
+  const controls = lockForm ? [...$('#dialog').querySelectorAll('input,select,textarea,button')] : [button];
+  const previous = controls.map(control => [control, control.disabled]);
+  const message = $('#modal-error'), caption = button.textContent;
+  controls.forEach(control => { control.disabled = true; });
+  button.dataset.pending = 'true';
+  if (label) { button.textContent = label; message.textContent = ''; }
+  try {
+    const result = await rpc(method, params);
+    delete button.dataset.pending;
+    await accept(result);
+  } catch (error) {
+    message.textContent = error.message;
+  } finally {
+    delete button.dataset.pending;
+    previous.forEach(([control, disabled]) => { control.disabled = disabled; });
+    if (label) button.textContent = caption;
+  }
+}
 function closeModal() {
   const overlay = $('#overlay');
   if (overlay.hidden || modalClosing || $('#dialog').querySelector('[data-pending="true"]')) return;
@@ -350,7 +375,7 @@ function closeModal() {
     back();
     return;
   }
-  if (typeof cancelEmbeddedPluginSettings === 'function') cancelEmbeddedPluginSettings();
+  cancelEmbeddedPluginSettings?.();
   modalTask = null;
   modalFromTrace = false;
   modalOutsideDismiss = null;
@@ -391,13 +416,23 @@ async function perform(method, params = {}, notice = '已完成') {
   }
 }
 const htmlMemo = new WeakMap();
-function setHtml(selector, html) {
+function setHtml(selector, html, options) {
   const el = typeof selector === 'string' ? $(selector) : selector;
   if (!el) return;
-  const previous = htmlMemo.get(el);
-  if (previous?.input === html && previous.dom === el.innerHTML) return;
-  reconcileHtml(el, html);
-  htmlMemo.set(el, { input: html, dom: el.innerHTML });
+  let memo = htmlMemo.get(el);
+  if (!memo) {
+    memo = { dirty: true };
+    memo.observer = new MutationObserver(() => { memo.dirty = true; });
+    memo.observer.observe(el, { subtree: true, childList: true, attributes: true, characterData: true });
+    htmlMemo.set(el, memo);
+  }
+  // takeRecords also sees mutations made synchronously before this call.
+  if (memo.observer.takeRecords().length) memo.dirty = true;
+  if (memo.input === html && !memo.dirty) return;
+  reconcileHtml(el, html, options);
+  memo.observer.takeRecords();
+  memo.input = html;
+  memo.dirty = false;
 }
 let refreshInFlight = null,
   refreshForced = false,
@@ -411,12 +446,9 @@ function viewKey(s, p) {
     case 'tasks':
       return JSON.stringify([
         s.tag_state,
-        (s.handling || []).map(({ synced, updated, progress, ...r }) => ({
-          ...r,
-          rounds: r.rounds?.map(({ steps, ...round }) => round),
-        })),
+        (s.handling || []).map(r=>[r.id,r.task_id,r.status,r.desktop_status,
+          r.desktop_control,r.waiting_on,r.restartable,r.current_source]),
         s.tasks,
-        s.messages,
         s.task_history_revision,
         s.last_analysis_success_at,
         s.usage.day,
@@ -438,11 +470,11 @@ function viewKey(s, p) {
     case 'schedules':
       return JSON.stringify(s.schedules);
     case 'reports':
-      return JSON.stringify([s.reports, s.config.work_start, s.config.work_end, s.archive_attempt]);
+      return JSON.stringify([s.reports, s.config.work_start, s.config.work_end, s.archive_attempt, s.report_outcome]);
     case 'learning':
       return JSON.stringify([s.suggestions, s.rule_version, s.tag_state, s.evolution]);
     case 'logs':
-      return JSON.stringify([s.audit, s.activity, s.usage]);
+      return JSON.stringify(s.activity_day_revision ?? [s.audit, s.activity, s.usage]);
     case 'sources':
       return JSON.stringify([s.chat_sources, pluginCatalogRevision]);
     case 'prompts':
@@ -473,13 +505,23 @@ window.refreshState = function (force = false) {
       try {
         const forced = refreshForced;
         refreshForced = false;
-        const requestPage = page;
+        const requestPage = page,
+          requestTask = handlingWindow?.id || (requestPage==='tasks' ? selected || undefined : undefined),
+          requestSelected = requestPage==='tasks' ? selected || undefined : undefined,
+          requestLogDay = requestPage==='logs' ? logDay || shanghaiLogDay() : undefined;
         const next = await rpc('state', {
           page: requestPage,
-          task: handlingWindow?.id || selected || undefined,
+          task: requestTask,
+          selected_task: requestSelected,
+          log_day: requestLogDay,
+          activity_day_revision: page==='logs' ? state?.activity_day_revision : undefined,
+          handling_revision: !forced ? state?.handling_revision : undefined,
           core_revision: !forced && state?._page === requestPage ? state.core_revision : undefined,
         });
-        if (page !== requestPage) {
+        if (page !== requestPage ||
+          requestTask !== (handlingWindow?.id || (page==='tasks' ? selected || undefined : undefined)) ||
+          requestSelected !== (page==='tasks' ? selected || undefined : undefined) ||
+          requestLogDay !== (page==='logs' ? logDay || shanghaiLogDay() : undefined)) {
           refreshQueued = true;
           refreshForced = true;
           continue;
@@ -496,7 +538,16 @@ window.refreshState = function (force = false) {
           const previews = new Map(next.handling_live.map((run) => [run.id, run]));
           state.handling = (state.handling || []).map((run) => {
             const preview = previews.get(run.id);
-            return preview ? { ...run, ...preview } : run;
+            if(!preview)return run;
+            if(preview._round_changes){
+              if(run._details===false || run._base_updated!==preview._base_updated){
+                refreshQueued=true;refreshForced=true;return run;
+              }
+              const rounds=(run.rounds||[]).slice(0,preview._round_count);
+              for(const [index,round] of preview._round_changes)rounds[index]=round;
+              return {...run,...preview,rounds};
+            }
+            return { ...run, ...preview };
           });
         }
         status();
@@ -510,8 +561,8 @@ window.refreshState = function (force = false) {
             $('#view').contains(active) &&
             active?.matches('input,textarea,select') &&
             active.id !== 'inbox-search';
-        const changed =
-          renderedPage !== page || (!next._unchanged && renderedKey !== viewKey(state, page));
+        const nextKey = !next._unchanged || page === 'logs' ? viewKey(state, page) : undefined;
+        const changed = renderedPage !== page || (nextKey !== undefined && renderedKey !== nextKey);
         if (
           (forced &&
             !(
@@ -527,7 +578,7 @@ window.refreshState = function (force = false) {
         ) {
           const target = page,
             scroll = $('#view').scrollTop;
-          await render();
+          await render(nextKey);
           if (page === target) $('#view').scrollTop = scroll;
         }
         if (!uiReady) {
@@ -550,9 +601,8 @@ window.refreshState = function (force = false) {
   });
   return refreshInFlight;
 };
-let modelCatalog = [],
-  modelRequest = 0,
-  settingsBaseline = {},
+let settingsBaseline = {},
+  scanPending = false,
   scanToggleBusy = false;
 function readSettingsValues() {
   return Object.fromEntries(
@@ -582,7 +632,7 @@ function settingsChanged() {
   return Object.keys(settingsBaseline).some((id) => current[id] !== settingsBaseline[id]);
 }
 async function leaveSettings() {
-  if (typeof leaveMemory === 'function' && memoryEditor && !leaveMemory()) return false;
+  if (memoryEditor && !leaveMemory()) return false;
   if (connectionEditor?.saving || connectionEditor?.busy) {
     toast(connectionEditor.saving ? '正在保存连接' : '正在读取连接，请稍后重试');
     restoreConnectionFocus();

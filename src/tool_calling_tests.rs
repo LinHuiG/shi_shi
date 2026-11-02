@@ -42,6 +42,9 @@ fn helper() -> &'static Path {
 fn main(){ let mut args=std::env::args().skip(1); match args.next().as_deref(){
  Some("dump")=>{ for arg in args {println!("ARG:{}",arg.as_bytes().iter().map(|b|format!("{b:02x}")).collect::<String>());} },
  Some("flood")=>{let t=std::thread::spawn(||{for _ in 0..10000 {eprintln!("stderr data");}});for _ in 0..10000 {println!("stdout data");}t.join().unwrap();},
+ Some("sized")=>{let stdout=args.next().unwrap().parse().unwrap();let stderr=args.next().unwrap().parse().unwrap();io::stdout().write_all(&vec![b'o';stdout]).unwrap();io::stderr().write_all(&vec![b'e';stderr]).unwrap();},
+ Some("mark")=>{std::fs::write(args.next().unwrap(),"executed").unwrap();},
+ Some("mark_wait")=>{let mut marker=std::fs::OpenOptions::new().create(true).append(true).open(args.next().unwrap()).unwrap();writeln!(marker,"executed").unwrap();drop(marker);std::thread::sleep(Duration::from_secs(30));},
  Some("fail")=>{println!("ordinary text");eprintln!("synthetic error");std::process::exit(7);},
  Some("encoding")=>{io::stdout().write_all(&[0xd6,0xd0,0xce,0xc4]).unwrap();},
  Some("utf8")=>{println!("中文输出");eprintln!("中文错误");},
@@ -390,7 +393,7 @@ fn session_result(session: &ToolSession<'_>, name: &str, call: &str, arguments: 
 }
 
 #[test]
-fn sessions_freeze_templates_recheck_live_switches_and_persist_intents_before_execution() {
+fn sessions_allow_metadata_edits_recheck_live_switches_and_persist_intents_before_execution() {
     let fixture = Fixture::new();
     let t = fixture.register("echo frozen_template");
     let task = fixture.task(&[t.clone()]);
@@ -402,10 +405,9 @@ fn sessions_freeze_templates_recheck_live_switches_and_persist_intents_before_ex
         &task.id,
         vec![t.clone()],
         &config,
-        0,
     );
-    fixture.0.state.lock().unwrap().config.tools[0].command_template =
-        "echo changed_template".into();
+    fixture.0.state.lock().unwrap().config.tools[0].display_name = "Changed label".into();
+    fixture.0.state.lock().unwrap().config.tools[0].description = "Updated description".into();
     assert!(
         session_result(&session, &t.name, "first", &json!({}))["stdout"]
             .as_str()
@@ -445,6 +447,296 @@ fn sessions_freeze_templates_recheck_live_switches_and_persist_intents_before_ex
         )
         .is_err());
     assert_eq!(fixture.0.state.lock().unwrap().tool_runs[0].calls.len(), 3);
+}
+
+#[test]
+fn changed_execution_definitions_are_rejected_before_any_process_starts() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.root.join("changed-definition-marker.txt");
+    let tool = fixture.register(&format!("{} \"{}\"", executable("mark"), marker.display()));
+    let config = fixture.0.state.lock().unwrap().config.clone();
+    for changed in ["command", "parameters", "directory", "encoding"] {
+        let mut current = tool.clone();
+        match changed {
+            "command" => current.command_template = "echo replacement".into(),
+            "parameters" => current.parameters.push(Parameter {
+                name: "new_parameter".into(),
+                ..Default::default()
+            }),
+            "directory" => current.working_directory = fixture.0.root.display().to_string(),
+            "encoding" => current.output_encoding = "gbk".into(),
+            _ => unreachable!(),
+        }
+        fixture.0.state.lock().unwrap().config.tools[0] = current;
+        let session = ToolSession::new(
+            &fixture.0,
+            changed,
+            "archive",
+            "",
+            vec![tool.clone()],
+            &config,
+        );
+        let error = session
+            .execute_with_result_budget(
+                &tool.name,
+                "old-definition",
+                &json!({}),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(2),
+                Some(config.retrieval_budget_chars),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ToolFailureKind::Denied);
+        assert!(
+            !marker.exists(),
+            "the old command executed after {changed} changed"
+        );
+        assert_eq!(
+            fixture
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .tool_runs
+                .last()
+                .unwrap()
+                .calls[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .status,
+            "rejected"
+        );
+    }
+    assert!(fixture.0.tool_runtime.rates.lock().unwrap().is_empty());
+}
+
+#[test]
+fn timed_out_commands_are_not_replayed_with_fresh_call_ids() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.root.join("timeout-marker.txt");
+    let tool = fixture.register(&format!(
+        "{} \"{}\"",
+        executable("mark_wait"),
+        marker.display()
+    ));
+    let config = fixture.0.state.lock().unwrap().config.clone();
+    let session = ToolSession::new(
+        &fixture.0,
+        "request",
+        "archive",
+        "",
+        vec![tool.clone()],
+        &config,
+    );
+    let ToolResult::Text(first) = session
+        .execute(
+            &tool.name,
+            "first",
+            &json!({}),
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap()
+    else {
+        panic!("command result must be text");
+    };
+    let first: CommandResult = serde_json::from_str(&first).unwrap();
+    assert_eq!(first.status, "timed_out");
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "executed\n");
+    let rejected = session
+        .execute(
+            &tool.name,
+            "fresh-id",
+            &json!({}),
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .err()
+        .unwrap();
+    assert_eq!(rejected.kind(), ToolFailureKind::UnsafeReplay);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "executed\n");
+    assert_eq!(fixture.0.state.lock().unwrap().tool_runs[0].calls.len(), 1);
+}
+
+#[test]
+fn concurrent_fresh_id_cannot_replay_a_command_with_a_pending_intent() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.root.join("pending-marker.txt");
+    let tool = fixture.register(&format!(
+        "{} \"{}\"",
+        executable("mark_wait"),
+        marker.display()
+    ));
+    let config = fixture.0.state.lock().unwrap().config.clone();
+    let session = ToolSession::new(
+        &fixture.0,
+        "request",
+        "archive",
+        "",
+        vec![tool.clone()],
+        &config,
+    );
+    let cancel = AtomicBool::new(false);
+    let (first, second) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            session.execute(
+                &tool.name,
+                "first",
+                &json!({}),
+                &cancel,
+                Instant::now() + Duration::from_secs(5),
+            )
+        });
+        let start_deadline = Instant::now() + Duration::from_secs(2);
+        while !marker.exists() && Instant::now() < start_deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        let second = session.execute(
+            &tool.name,
+            "concurrent",
+            &json!({}),
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(2),
+        );
+        cancel.store(true, Ordering::SeqCst);
+        (first.join().unwrap(), second)
+    });
+    assert!(first.is_ok());
+    assert_eq!(second.err().unwrap().kind(), ToolFailureKind::UnsafeReplay);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "executed\n");
+    assert_eq!(fixture.0.state.lock().unwrap().tool_runs[0].calls.len(), 1);
+}
+
+#[test]
+fn unknown_outcomes_block_equivalent_arguments_but_known_results_allow_new_calls() {
+    let mut tool = tool("echo {{value}}");
+    tool.parameters.push(Parameter {
+        name: "value".into(),
+        ..Default::default()
+    });
+    for (result, blocked) in [
+        (None, true),
+        (
+            Some(CommandResult {
+                status: "completed".into(),
+                exit_code: Some(0),
+                ..Default::default()
+            }),
+            false,
+        ),
+        (
+            Some(CommandResult {
+                status: "nonzero_exit".into(),
+                exit_code: Some(7),
+                ..Default::default()
+            }),
+            false,
+        ),
+        (
+            Some(CommandResult {
+                status: "nonzero_exit".into(),
+                ..Default::default()
+            }),
+            true,
+        ),
+        (
+            Some(CommandResult {
+                status: "output_error".into(),
+                exit_code: Some(0),
+                error: "capture failed".into(),
+                ..Default::default()
+            }),
+            true,
+        ),
+        (
+            Some(CommandResult {
+                status: "rejected".into(),
+                error: "not started".into(),
+                ..Default::default()
+            }),
+            false,
+        ),
+        (
+            Some(CommandResult {
+                status: "start_failed".into(),
+                error: "not started".into(),
+                ..Default::default()
+            }),
+            false,
+        ),
+    ] {
+        let calls = [CallRecord {
+            tool_id: tool.id.clone(),
+            tool: tool.name.clone(),
+            arguments: json!({}),
+            result,
+            ..Default::default()
+        }];
+        assert_eq!(
+            uncertain_prior_call(&calls, &tool, &json!({"value":""})).is_some(),
+            blocked
+        );
+        assert!(uncertain_prior_call(&calls, &tool, &json!({"value":"different"})).is_none());
+    }
+}
+
+#[test]
+fn api_live_rejections_are_recoverable_and_do_not_charge_result_text() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.root.join("rejected-marker.txt");
+    let tool = fixture.register(&format!("{} \"{}\"", executable("mark"), marker.display()));
+    let config = fixture.0.state.lock().unwrap().config.clone();
+    for disabled in [false, true] {
+        fixture.0.state.lock().unwrap().config.tools[0].enabled = !disabled;
+        if !disabled {
+            fixture.0.tool_runtime.rates.lock().unwrap().insert(
+                tool.id.clone(),
+                std::iter::repeat_with(Instant::now)
+                    .take(tool_registry::CALLS_PER_MINUTE)
+                    .collect(),
+            );
+        }
+        let session = ToolSession::new(
+            &fixture.0,
+            &format!("request-{disabled}"),
+            "archive",
+            "",
+            vec![tool.clone()],
+            &config,
+        );
+        let rejected = session
+            .execute_with_result_budget(
+                &tool.name,
+                "rejected",
+                &json!({}),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(2),
+                Some(config.retrieval_budget_chars),
+            )
+            .err()
+            .unwrap();
+        assert_eq!(rejected.kind(), ToolFailureKind::Denied);
+        assert!(!marker.exists());
+        assert_eq!(*session.continuation_chars.lock().unwrap(), 0);
+        assert_eq!(
+            fixture
+                .0
+                .state
+                .lock()
+                .unwrap()
+                .tool_runs
+                .last()
+                .unwrap()
+                .calls[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .status,
+            "rejected"
+        );
+    }
 }
 
 #[test]
@@ -525,7 +817,6 @@ fn rejected_provider_arguments_are_queryable_without_inventing_legacy_metadata()
         "",
         vec![t.clone()],
         &config,
-        0,
     );
     session.record_rejection(&json!({"response":{"tool_calls":[{"id":"bad","function":{"name":t.name,"arguments":"{\"value\":2}"}}]},"error":"Invalid tool arguments"})).unwrap();
     session
@@ -568,7 +859,7 @@ fn exhausted_continuation_budget_records_a_rejection_without_executing() {
     let fixture = Fixture::new();
     let t = fixture.register("echo must_not_execute");
     let mut config = fixture.0.state.lock().unwrap().config.clone();
-    config.max_input_chars = 100;
+    config.retrieval_budget_chars = 100;
     let session = ToolSession::new(
         &fixture.0,
         "request",
@@ -576,7 +867,6 @@ fn exhausted_continuation_budget_records_a_rejection_without_executing() {
         "",
         vec![t.clone()],
         &config,
-        99,
     );
     assert!(session
         .execute(
@@ -587,12 +877,352 @@ fn exhausted_continuation_budget_records_a_rejection_without_executing() {
             Instant::now() + Duration::from_secs(2)
         )
         .is_err());
-    assert!(session.budget_exhausted.load(Ordering::SeqCst));
     let s = fixture.0.state.lock().unwrap();
     let result = s.tool_runs[0].calls[0].result.as_ref().unwrap();
     assert_eq!(result.status, "rejected");
     assert!(result.stdout.is_empty());
 }
+
+#[test]
+fn tool_results_that_fit_preserve_both_streams_and_all_metadata() {
+    for (stdout, stderr) in [
+        ("o".repeat(15_000), String::new()),
+        (String::new(), "e".repeat(15_000)),
+        ("\0\n\"\\中文🦀".repeat(800), "warning".into()),
+    ] {
+        let result = CommandResult {
+            tool: "synthetic".into(),
+            call_id: "call".into(),
+            status: "completed".into(),
+            stdout,
+            stderr,
+            error: "retained metadata".into(),
+            ..Default::default()
+        };
+        let expected = serde_json::to_string(&result).unwrap();
+        assert_eq!(
+            tool_result_text(result.clone(), 20_000, false).unwrap(),
+            expected
+        );
+        assert_eq!(
+            tool_result_text(result, expected.chars().count(), false).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn trimmed_tool_results_share_unused_space_and_count_json_escapes() {
+    for (stdout, stderr, limit) in [
+        ("o".repeat(20_000), String::new(), 10_000),
+        (String::new(), "e".repeat(20_000), 10_000),
+        ("o".repeat(20_000), "warning".into(), 10_000),
+        ("\0\n\"\\中🦀".repeat(3_000), "warning".into(), 6_000),
+        ("o".repeat(32_768), "e".repeat(32_768), 100_000),
+    ] {
+        let result = CommandResult {
+            status: "completed".into(),
+            stdout,
+            stderr,
+            error: "retained metadata".into(),
+            ..Default::default()
+        };
+        let text = tool_result_text(result.clone(), limit, false).unwrap();
+        let returned: CommandResult = serde_json::from_str(&text).unwrap();
+        assert!(returned.truncated);
+        assert_eq!(returned.error, result.error);
+        assert_eq!(returned.status, result.status);
+        assert!(result.stdout.starts_with(&returned.stdout));
+        assert!(result.stderr.starts_with(&returned.stderr));
+        assert!(text.chars().count() <= limit.min(60_000));
+        assert!(text.len() <= shishi_api::openai::MAX_TOOL_RESULT_BYTES);
+        assert!(limit.min(60_000) - text.chars().count() < 6);
+        if result.stderr.is_empty() {
+            assert!(returned.stdout.len() > 9_000);
+        } else if result.stdout.is_empty() {
+            assert!(returned.stderr.len() > 9_000);
+        } else if result.stderr == "warning" {
+            assert_eq!(returned.stderr, "warning");
+        } else {
+            assert!(returned.stdout.len() > 29_000 && returned.stderr.len() > 29_000);
+        }
+    }
+
+    let result = CommandResult {
+        stdout: "o".into(),
+        ..Default::default()
+    };
+    let exact = serde_json::to_string(&result).unwrap().chars().count();
+    let returned: CommandResult =
+        serde_json::from_str(&tool_result_text(result, exact - 1, false).unwrap()).unwrap();
+    assert!(returned.truncated && returned.stdout.is_empty());
+    assert!(tool_result_text(CommandResult::default(), 1, false).is_none());
+}
+
+#[test]
+fn json_output_prefix_sizes_match_serde_for_controls_and_unicode() {
+    let text = (0..=127)
+        .map(|c| char::from_u32(c).unwrap())
+        .chain("中文🦀\u{2028}".chars())
+        .collect::<String>();
+    let json = serde_json::to_string(&text).unwrap();
+    assert_eq!(
+        json_string_prefix(&text, usize::MAX, usize::MAX, usize::MAX),
+        (
+            text.len(),
+            json.chars().count() - 2,
+            json.len() - 2,
+            serde_json::to_string(&json).unwrap().chars().count() - 6
+        )
+    );
+    for (chars, bytes, outer_chars) in [
+        (1, 1, 1),
+        (120, 120, 240),
+        (500, 500, 500),
+        (usize::MAX, 700, 700),
+        (usize::MAX, usize::MAX, 125),
+    ] {
+        let (end, used_chars, used_bytes, used_outer) =
+            json_string_prefix(&text, chars, bytes, outer_chars);
+        let encoded = serde_json::to_string(&text[..end]).unwrap();
+        let outer = serde_json::to_string(&encoded).unwrap().chars().count() - 6;
+        assert_eq!(used_chars, encoded.chars().count() - 2);
+        assert_eq!(used_bytes, encoded.len() - 2);
+        assert_eq!(used_outer, outer);
+        assert!(used_chars <= chars && used_bytes <= bytes && used_outer <= outer_chars);
+        if let Some(next) = text[end..].chars().next() {
+            let encoded = serde_json::to_string(&text[..end + next.len_utf8()]).unwrap();
+            let outer = serde_json::to_string(&encoded).unwrap().chars().count() - 6;
+            assert!(
+                encoded.chars().count() - 2 > chars
+                    || encoded.len() - 2 > bytes
+                    || outer > outer_chars
+            );
+        }
+    }
+}
+
+#[test]
+fn api_result_budget_counts_outer_json_without_reducing_mcp_allowance() {
+    let result = CommandResult {
+        stdout: "\"".repeat(15_000),
+        stderr: "warning\n".into(),
+        ..Default::default()
+    };
+    let original = serde_json::to_string(&result).unwrap();
+    let encoded_chars = serde_json::to_string(&original).unwrap().chars().count() - 2;
+    assert_eq!(result_input_chars(&original, true), encoded_chars);
+    assert_eq!(
+        tool_result_text(result.clone(), encoded_chars, true).unwrap(),
+        original
+    );
+    assert_eq!(
+        tool_result_text(result.clone(), 40_000, false).unwrap(),
+        original,
+        "MCP must not reserve API string escaping"
+    );
+    let text = tool_result_text(result, 40_000, true).unwrap();
+    let returned: CommandResult = serde_json::from_str(&text).unwrap();
+    let encoded = serde_json::to_string(&text).unwrap().chars().count() - 2;
+    assert!(encoded <= 40_000 && encoded > 39_995);
+    assert!(returned.truncated && returned.stdout.len() > 9_000);
+    assert_eq!(returned.stderr, "warning\n");
+
+    // The 60k safety cap applies to result text, independently of its extra
+    // transport escaping; a roomy API budget must not halve it a second time.
+    let result = CommandResult {
+        stdout: "\"".repeat(32_768),
+        stderr: "\\".repeat(32_768),
+        ..Default::default()
+    };
+    let text = tool_result_text(result, 150_000, true).unwrap();
+    assert!((59_998..=60_000).contains(&text.chars().count()));
+    assert!(result_input_chars(&text, true) > 100_000);
+    assert!(result_input_chars(&text, true) <= 150_000);
+}
+
+#[test]
+fn api_budget_counts_only_delivered_results_and_never_rewinds_usage() {
+    let fixture = Fixture::new();
+    let tool = fixture.register(&executable("sized 15000 0"));
+    let mut config = fixture.0.state.lock().unwrap().config.clone();
+    config.retrieval_budget_chars = 40_000;
+    let session = ToolSession::new(
+        &fixture.0,
+        "request",
+        "archive",
+        "",
+        vec![tool.clone()],
+        &config,
+    );
+    let execute = |id, budget| {
+        let ToolResult::Text(text) = session
+            .execute_with_result_budget(
+                &tool.name,
+                id,
+                &json!({}),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(10),
+                Some(budget),
+            )
+            .unwrap()
+        else {
+            panic!("command result must be text");
+        };
+        text
+    };
+    let first = execute("first", 20_000);
+    let returned: CommandResult = serde_json::from_str(&first).unwrap();
+    assert_eq!(returned.stdout.len(), 15_000);
+    assert!(!returned.truncated);
+    let wrapper = |id: &str| {
+        shishi_api::openai::message_input_chars(
+            &json!({"role":"tool","tool_call_id":id,"content":""}),
+        ) + 1
+    };
+    let used = wrapper("first") + serde_json::to_string(&first).unwrap().chars().count() - 2;
+    assert_eq!(*session.continuation_chars.lock().unwrap(), used);
+    let second = execute("stale-allowance", 30_000);
+    let actual = serde_json::to_string(&second).unwrap().chars().count() - 2;
+    let returned: CommandResult = serde_json::from_str(&second).unwrap();
+    assert_eq!(returned.stdout.len(), 15_000);
+    assert!(!returned.truncated);
+    let used = used + actual + wrapper("stale-allowance");
+    assert_eq!(*session.continuation_chars.lock().unwrap(), used);
+    // A stale, wider outer allowance cannot reset the results already delivered.
+    let last = execute("wider-allowance", 80_000);
+    let actual = serde_json::to_string(&last).unwrap().chars().count() - 2;
+    assert_eq!(actual + wrapper("wider-allowance"), 40_000 - used);
+    assert_eq!(*session.continuation_chars.lock().unwrap(), 40_000);
+    assert!(
+        serde_json::from_str::<CommandResult>(&last)
+            .unwrap()
+            .truncated
+    );
+}
+
+#[test]
+fn positive_api_budget_below_result_metadata_never_starts_the_command() {
+    let fixture = Fixture::new();
+    let marker = fixture.0.root.join("synthetic-tool-marker.txt");
+    let tool = fixture.register(&format!("{} \"{}\"", executable("mark"), marker.display()));
+    let mut config = fixture.0.state.lock().unwrap().config.clone();
+    config.retrieval_budget_chars = 2_000;
+    let minimal = CommandResult {
+        tool: tool.name.clone(),
+        call_id: "tiny".into(),
+        status: "completed".into(),
+        exit_code: Some(0),
+        ..Default::default()
+    };
+    let minimum_chars = result_input_chars(&serde_json::to_string(&minimal).unwrap(), true);
+    for remaining in [1, minimum_chars - 1] {
+        let session = ToolSession::new(
+            &fixture.0,
+            &format!("request-{remaining}"),
+            "archive",
+            "",
+            vec![tool.clone()],
+            &config,
+        );
+        assert!(session
+            .execute_with_result_budget(
+                &tool.name,
+                "tiny",
+                &json!({}),
+                &AtomicBool::new(false),
+                Instant::now() + Duration::from_secs(10),
+                Some(remaining),
+            )
+            .is_err());
+        assert!(
+            !marker.exists(),
+            "a positive but unusable budget executed the command"
+        );
+        let state = fixture.0.state.lock().unwrap();
+        let result = state.tool_runs.last().unwrap().calls[0]
+            .result
+            .as_ref()
+            .unwrap();
+        assert_eq!(result.status, "rejected");
+        assert_eq!(result.duration_ms, 0);
+        assert!(result.stdout.is_empty());
+    }
+    assert!(fixture.0.tool_runtime.rates.lock().unwrap().is_empty());
+
+    // Prove the same synthetic command really writes the marker when allowed.
+    let session = ToolSession::new(
+        &fixture.0,
+        "allowed",
+        "archive",
+        "",
+        vec![tool.clone()],
+        &config,
+    );
+    let ToolResult::Text(text) = session
+        .execute_with_result_budget(
+            &tool.name,
+            "control",
+            &json!({}),
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(10),
+            Some(config.retrieval_budget_chars),
+        )
+        .unwrap()
+    else {
+        panic!("command result must be text");
+    };
+    let result: CommandResult = serde_json::from_str(&text).unwrap();
+    assert_eq!(result.status, "completed");
+    assert_eq!(fs::read_to_string(marker).unwrap(), "executed");
+}
+
+#[test]
+fn delivered_tool_results_use_remaining_budget_without_changing_durable_output() {
+    let fixture = Fixture::new();
+    let tool = fixture.register(&executable("sized 15000 0"));
+    let mut config = fixture.0.state.lock().unwrap().config.clone();
+    config.retrieval_budget_chars = 40_000;
+    let session = ToolSession::new(
+        &fixture.0,
+        "request",
+        "archive",
+        "",
+        vec![tool.clone()],
+        &config,
+    );
+    for i in 0..3 {
+        let returned = session_result(&session, &tool.name, &format!("call-{i}"), &json!({}));
+        let len = returned["stdout"].as_str().unwrap().len();
+        if i < 2 {
+            assert_eq!(len, 15_000);
+            assert_eq!(returned["truncated"], false);
+        } else {
+            assert!(len > 8_000 && len < 10_000);
+            assert_eq!(returned["truncated"], true);
+        }
+    }
+    assert_eq!(*session.continuation_chars.lock().unwrap(), 40_000);
+    assert!(session
+        .execute(
+            &tool.name,
+            "exhausted",
+            &json!({}),
+            &AtomicBool::new(false),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .is_err());
+    let state = fixture.0.state.lock().unwrap();
+    let calls = &state.tool_runs[0].calls;
+    assert_eq!(calls.len(), 4);
+    for call in &calls[..3] {
+        let stored = call.result.as_ref().unwrap();
+        assert_eq!(stored.stdout.len(), 15_000);
+        assert!(!stored.truncated);
+    }
+    assert_eq!(calls[3].result.as_ref().unwrap().status, "rejected");
+}
+
 #[test]
 fn additive_table_upgrade_preserves_legacy_configuration_and_history_queries_are_scoped_and_paged()
 {

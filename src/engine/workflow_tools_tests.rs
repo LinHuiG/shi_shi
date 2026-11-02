@@ -3,28 +3,21 @@ use crate::tool_registry::ToolDefinition;
 
 #[test]
 fn large_project_catalog_remains_bounded_only_at_the_ai_request_boundary() {
-    let root = std::env::temp_dir().join(format!("ss-project-budget-{}", id()));
-    let app = App::load(root.clone()).unwrap();
+    let (root, app) = crate::test_support::scoped_app("ss-project-budget");
     app.state.lock().unwrap().handling.local_projects = (0..80)
-        .map(|i| json!({"id":format!("local:{i}"),"name":format!("Synthetic {i}"),"cwd":root}))
+        .map(|i| json!({"id":format!("local:{i}"),"name":format!("Synthetic {i}"),"cwd":root.as_path()}))
         .collect();
     for kind in ["classify", "format", "edit"] {
         let context = app.capture_prepare_context(kind, true, None).unwrap();
         assert_eq!(context.projects.as_array().unwrap().len(), 60);
         assert_eq!(context.projects[0]["id"], "local:ai-workdir");
     }
-    assert_eq!(
-        app.handling_projects().unwrap().as_array().unwrap().len(),
-        81
-    );
-    drop(app);
-    let _ = std::fs::remove_dir_all(root);
+    assert_eq!(app.analysis_projects().as_array().unwrap().len(), 81);
 }
 
 #[test]
 fn requests_freeze_actual_tools_projects_and_their_own_purpose_route() {
-    let root = std::env::temp_dir().join(format!("shishi-prepared-tools-{}", id()));
-    let app = App::load(root.clone()).unwrap();
+    let (_root, app) = crate::test_support::scoped_app("shishi-prepared-tools");
     let mut state = app.state.lock().unwrap().clone();
     state.config.codex.clear();
     state
@@ -65,9 +58,7 @@ fn requests_freeze_actual_tools_projects_and_their_own_purpose_route() {
     let projects =
         json!([{"id":"codex:source:project","name":"Synthetic project","cwd":"D:/synthetic"}]);
     for kind in ["classify", "format", "edit", "archive"] {
-        let mut context = app
-            .capture_prepare_context_from(&state, kind, true, projects.clone())
-            .unwrap();
+        let mut context = app.capture_prepare_context_from(&state, kind, true, projects.clone());
         let prepared = app
             .prepare_ai_request_with(
                 kind,
@@ -94,7 +85,7 @@ fn requests_freeze_actual_tools_projects_and_their_own_purpose_route() {
             .prepared
             .prompt
             .contains("synthetic_private_template"));
-        assert!(!ai::public_payload(&prepared.payload)
+        assert!(!json!(ai::public_payload(&prepared.payload))
             .to_string()
             .contains("command_template"));
         if kind != "archive" {
@@ -103,11 +94,9 @@ fn requests_freeze_actual_tools_projects_and_their_own_purpose_route() {
     }
     // A single-task operation uses the same global registry, even when the old
     // persisted task allowlist is empty or contains unrelated historical IDs.
-    state.tasks.push(Task {
-        id: "task".into(),
-        title: "Synthetic task".into(),
-        ..Default::default()
-    });
+    state
+        .tasks
+        .push(crate::test_support::task("task", "Synthetic task"));
     *app.state.lock().unwrap() = state;
     let context = app
         .capture_prepare_context("edit", true, Some("task"))
@@ -120,15 +109,12 @@ fn requests_freeze_actual_tools_projects_and_their_own_purpose_route() {
         .capture_prepare_context("edit", true, Some("task"))
         .unwrap();
     assert_eq!(context.config.tools.len(), 1);
-    drop(app);
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn one_sentence_edit_saves_the_project_in_the_same_transaction_and_stale_edits_do_not_overwrite_it()
 {
-    let root = std::env::temp_dir().join(format!("shishi-edit-project-{}", id()));
-    let app = App::load(root.clone()).unwrap();
+    let (root, app) = crate::test_support::scoped_app("shishi-edit-project");
     let task: Task = serde_json::from_value(
         app.task_edit(&json!({"task":{"title":"Synthetic task"}}))
             .unwrap(),
@@ -159,6 +145,4 @@ fn one_sentence_edit_saves_the_project_in_the_same_transaction_and_stale_edits_d
     assert!(app.state.lock().unwrap().tasks[0]
         .suggested_project_id
         .is_empty());
-    drop(app);
-    let _ = std::fs::remove_dir_all(root);
 }

@@ -184,9 +184,12 @@ impl Plugin {
             return Err("插件未提供此接口".into());
         }
         fs::create_dir_all(work).map_err(|e| e.to_string())?;
-        let library = Library::open(&plain_file(&self.dir, &self.manifest.entrypoint)?)?;
-        let request=serde_json::to_vec(&json!({"protocol":1,"method":method,"config":config,"params":params,"context":{"plugin_dir":self.dir,"work_dir":work,"timeout_ms":90000}})).map_err(|e|e.to_string())?;
-        library.call(&request)
+        crate::plugin_worker::call(
+            self,
+            false,
+            json!({"protocol":1,"method":method,"config":config,"params":params,"context":{"plugin_dir":self.dir,"work_dir":work,"timeout_ms":90000}}),
+            None,
+        )
     }
 }
 pub(crate) struct Library(windows_sys::Win32::Foundation::HMODULE);
@@ -227,7 +230,7 @@ impl Library {
             GetProcAddress(self.0, name.as_ptr()).ok_or("插件缺少 ABI 导出函数".into())
         }
     }
-    fn call(&self, input: &[u8]) -> Result<Value, String> {
+    pub(crate) fn call(&self, input: &[u8]) -> Result<Value, String> {
         const MAX: usize = 32 * 1024 * 1024;
         if input.len() > MAX {
             return Err("插件请求超过 32 MiB".into());
@@ -317,18 +320,8 @@ fn install_zip(root: &Path, path: &Path) -> Result<Installed, String> {
     fs::create_dir(&unpack).map_err(|e| e.to_string())?;
     let result = (|| {
         let system = std::env::var_os("SystemRoot").ok_or("无法定位 Windows 系统目录")?;
-        let mut command = std::process::Command::new(
-            PathBuf::from(system).join("System32/WindowsPowerShell/v1.0/powershell.exe"),
-        );
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            include_str!("../assets/unpack-plugin.ps1"),
-        ]);
+        let mut command = crate::process::powershell(system);
+        command.args(["-Command", include_str!("../assets/unpack-plugin.ps1")]);
         command.env(
             "SHISHI_PLUGIN_PACKAGE",
             json!({"path":path.canonicalize().map_err(|e|e.to_string())?,"destination":unpack})

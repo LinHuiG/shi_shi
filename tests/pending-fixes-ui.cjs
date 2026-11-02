@@ -1,5 +1,5 @@
 // Synthetic regression for the complete SS-156 through SS-162 pending batch.
-const fs=require('fs'),path=require('path'),os=require('os'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),os=require('os'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const out=fs.mkdtempSync(path.join(os.tmpdir(),'shishi-pending-fixes-')),now=Date.now();
 const fixture={version:'1.1.19',build_time:1700000000000,updates:{status:'idle'},config:{enabled:false,auto_ai:false,auto_update:false,leaders:[],interval_minutes:5,daily_calls:40,work_start:'09:00',work_end:'18:00'},tasks:[{id:'task',title:'合成验收',description:'检查显示和阅读行为。',today:true,status:'待处理',created:now,updated:now}],tag_state:{unified:true,priority_kind:'事项等级',groups:[{name:'事项等级',values:['普通'],display_priority:10},{name:'事项类型',values:['日常'],display_priority:20},{name:'提出者',values:['示例'],display_priority:100}],filters:{},versions:[{id:'initial'}]},handling:[{id:'run',task_id:'task',thread_id:'synthetic',transport:'desktop',connection:{driver:'codex'},status:'ended',rounds:[],requests:[]}],usage:{calls:0,input_tokens:0,output_tokens:0,cached_reports:0},schedules:[],messages:[],audit:[],activity:[],reports:[],suggestions:[],chat_sources:[]};
 const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.clockNow=${now};Date.now=()=>clockNow;window.failCheck=false;window.logRows=[
@@ -7,7 +7,10 @@ const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.
 {kind:'scan',time:2,detail:{rows:249,added:0,updated:0,sources:1,errors:[],elapsed_ms:1000}},
 {kind:'scan',time:3,detail:{rows:233,elapsed_ms:1000}},
 {kind:'scan',time:4,detail:{rows:1,added:1,updated:0,sources:1,errors:['合成来源读取失败'],elapsed_ms:1000}},
-{kind:'scan',time:5,detail:{rows:0,added:0,updated:0,sources:0,errors:['合成全部失败'],elapsed_ms:1000}}];
+{kind:'scan',time:5,detail:{rows:0,added:0,updated:0,sources:0,errors:['合成全部失败'],elapsed_ms:1000}},
+{kind:'analysis_result',time:6,detail:{request_id:'synthetic-analysis',applied:0,processed:3,remaining:0,no_action_reason:'普通确认，无需新增事项。<img src=x onerror="window.logMarkupExecuted=true">'}},
+{kind:'analysis_result',time:7,detail:{applied:0,processed:2,remaining:1}},
+{kind:'analysis_result',time:8,detail:{applied:1,processed:4,remaining:2}}];
 window.ipc={postMessage(raw){const {id,method,params:p}=JSON.parse(raw);requests.push({method,p});setTimeout(()=>{let data=true,error='';
 if(method==='state')data=fixture;if(method==='evidence'||method==='handling_audit')data=[];
 if(method==='settings_patch'){Object.assign(fixture.config,p);data={config:fixture.config};}
@@ -15,7 +18,7 @@ if(method==='tag_decide'){fixture.tag_state.groups.find(g=>g.name===p.name).disp
 if(method==='activity_query')data={rows:logRows,total:logRows.length,page:1,pages:1};
 if(method==='update_check'){if(failCheck)error='合成网络失败';else{fixture.updates={status:'checking',checked_at:clockNow-50000};data=fixture.updates;setTimeout(()=>{fixture.updates={status:'current',checked_at:clockNow-50000,current_until:clockNow+30000};window.stateChanged('finished-'+requests.length);},180);}}
 receive({id,ok:!error,data,error});},method==='update_check'?50:5)}};`;
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{
+withBrowser(async(browser)=>{
 const page=await browser.newPage({viewport:{width:1600,height:1000}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));await page.waitForFunction(()=>document.querySelector('[data-handle="start"]')?.textContent.includes('重新处置'));
 assert.equal(await page.locator('.handling-terminated>.helper').innerText(),'本次处置已结束，可重新发起。');
 assert(await page.locator('.handling-terminated').evaluate(el=>{const [a,b]=[...el.children].map(n=>n.getBoundingClientRect());return Math.abs((a.top+a.bottom-b.top-b.bottom)/2)<1;}),'finished text and button share the same vertical center');
@@ -35,10 +38,13 @@ await page.evaluate(()=>failCheck=true);await button.click();await page.waitForF
 await page.screenshot({path:path.join(out,'settings.png'),fullPage:true});
 for(const width of [900,600,360]){await page.setViewportSize({width,height:900});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));assert(await page.locator('.tag-priority-row').evaluateAll(els=>els.every(el=>el.scrollWidth<=el.clientWidth)));}await page.setViewportSize({width:1280,height:900});
 await page.locator('[data-page="logs"]').first().click();await page.locator('.event').first().waitFor();const log=await page.locator('#log-results').innerText();for(const text of ['新增 2 条 · 更新 1 条 · 1.3 秒','无新增或更新消息','扫描返回 233 条记录','消息读取部分完成','消息读取失败','合成来源读取失败'])assert(log.includes(text),text);assert(!log.includes('读取 251 条消息'));
+const emptyAnalysis=page.locator('[data-event-key="6:analysis_result:"]'),legacyAnalysis=page.locator('[data-event-key="7:analysis_result:"]'),changedAnalysis=page.locator('[data-event-key="8:analysis_result:"]');
+assert.equal(await emptyAnalysis.locator('.event-heading b').innerText(),'分析完成 · 无事项变更');assert((await emptyAnalysis.locator('.event-description').innerText()).includes('普通确认，无需新增事项。<img src=x onerror="window.logMarkupExecuted=true">'));assert.equal(await emptyAnalysis.locator('img').count(),0);assert(!(await page.evaluate(()=>window.logMarkupExecuted)));assert.equal(await emptyAnalysis.locator('[data-trace="synthetic-analysis"]').count(),1);
+assert.equal(await legacyAnalysis.locator('.event-heading b').innerText(),'分析完成 · 无事项变更');assert.equal(await legacyAnalysis.locator('.event-description').innerText(),'分析 2 条消息，新增或更新 0 个事项 · 还有 1 条等待分析');assert.equal(await legacyAnalysis.locator('[data-trace]').count(),0);assert.equal(await changedAnalysis.locator('.event-heading b').innerText(),'事项已更新');assert.equal(await changedAnalysis.locator('.event-description').innerText(),'分析 4 条消息，新增或更新 1 个事项 · 还有 2 条等待分析');for(const field of ['no_action_reason','request_id','undefined','null'])assert(!log.includes(field),field+' is not a user-facing label');
 await page.locator('[data-page="tasks"]').first().click();await page.evaluate(async()=>{fixture.handling[0].status='inProgress';fixture.handling[0].rounds=[{id:'tools',status:'inProgress',steps:[{id:'tool',kind:'commandExecution',text:'合成输出\n'.repeat(90)}]}];await refreshState(true);});await page.locator('[data-handle="start"]').click();await page.locator('.handling-stream-detail>summary').waitFor();
-const card=page.locator('.handling-stream'),latest=card.locator('[data-handling-latest]');assert.equal(await card.locator('[data-handling-reading-toggle]').count(),0);assert(await latest.isHidden());
+const card=page.locator('.handling-stream'),latest=card.locator('[data-handling-latest]');assert(await latest.isHidden());
 for(const reduced of ['no-preference','reduce']){await page.emulateMedia({reducedMotion:reduced});await card.locator('summary').click();await page.waitForTimeout(240);assert(await card.locator('[data-handling-stream]').evaluate(el=>el.scrollHeight>el.clientHeight));assert(await latest.isHidden());await card.locator('summary').click();await page.waitForTimeout(240);assert(await latest.isHidden());}
 await page.evaluate(async()=>{fixture.handling[0].rounds=[{id:'prose',status:'inProgress',steps:[{id:'note',kind:'agentMessage',text:'合成持续进展\n'.repeat(90)}]}];await refreshState(true);});await page.waitForTimeout(240);
 for(const reduced of ['no-preference','reduce']){await page.emulateMedia({reducedMotion:reduced});await card.locator('[data-handling-stream]').evaluate(el=>el.scrollTop-=180);await latest.waitFor();await latest.click();await page.waitForTimeout(240);assert(await latest.isHidden());assert(await card.locator('[data-handling-stream]').evaluate(el=>handlingStreamAtLatest(el)));}
 await page.screenshot({path:path.join(out,'reading-controls.png')});assert.deepEqual(errors,[]);console.log('PASS pending scan counts/log compatibility, release label, full no-update cooldown, persistent two-column tags, finished alignment and accurate reading controls. '+out);
-}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});
+}).catch(e=>{console.error(e);process.exitCode=1;});

@@ -59,6 +59,8 @@ def allowed(path):
         return False
     if path.suffix == '.zip':
         return path.parent.as_posix() == 'tests/fixtures/plugins'
+    if path.suffix == '.pfx':
+        return path.as_posix() == 'providers/api/tests/fixtures/untrusted-localhost.pfx'
     return path.suffix in ALLOWED_EXT or path.name.startswith(('LICENSE', '.license')) or path.name in {'.gitignore', '.gitattributes'}
 
 def check(files):

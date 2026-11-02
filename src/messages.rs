@@ -8,7 +8,7 @@ pub fn protected(s: &State) -> BTreeSet<String> {
         .tasks
         .iter()
         .filter(|t| !t.archived)
-        .flat_map(|t| t.evidence.all())
+        .flat_map(|t| t.evidence.iter().map(str::to_owned))
         .collect::<BTreeSet<_>>();
     // Private archived memory and archive-group rollback material may cite
     // message ids directly. Keep those messages alive so retention cannot
@@ -37,24 +37,45 @@ fn allowed_at(s: &State, m: &Message, keep: &BTreeSet<String>, at: i64) -> bool 
 pub fn prune(s: &mut State) {
     let cutoff = now() - i64::from(s.config.message_retention_days.max(1)) * 86_400_000;
     let keep = protected(s);
-    let expired = s
+    let expired = crate::retention::record_pruned(
+        &mut s.retention_digest,
+        "messages",
+        "sources",
+        s.messages
+            .values()
+            .filter(|message| message.time < cutoff && !keep.contains(&message.id))
+            .map(|message| {
+                (
+                    message.time,
+                    if message.source_name.trim().is_empty() {
+                        message.source_id.as_str()
+                    } else {
+                        message.source_name.as_str()
+                    },
+                )
+            }),
+    );
+    let removed = s
         .messages
-        .values()
-        .filter(|message| message.time < cutoff && !keep.contains(&message.id))
-        .cloned()
+        .iter()
+        .filter_map(|(id, m)| {
+            (!(m.time >= cutoff && !s.deleted_messages.contains_key(id) || keep.contains(id)))
+                .then(|| id.clone())
+        })
         .collect::<Vec<_>>();
-    if !expired.is_empty() {
-        crate::retention::add_messages(s, &expired);
+    if !removed.is_empty() {
+        for id in removed {
+            s.messages.remove(&id);
+        }
     }
-    s.messages.retain(|id, m| {
-        m.time >= cutoff && !s.deleted_messages.contains_key(id) || keep.contains(id)
-    });
     s.analyzed.retain(|id, _| s.messages.contains_key(id));
     s.analysis_retries
         .retain(|id, _| s.messages.contains_key(id));
     s.analysis_retry_counts
         .retain(|id, _| s.messages.contains_key(id));
-    if !expired.is_empty() {
+    s.analysis_retry_scopes
+        .retain(|id, _| s.messages.contains_key(id));
+    if expired {
         crate::retention::compact_digest(s);
     }
 }
@@ -139,33 +160,73 @@ impl App {
         if ids.is_empty() || ids.len() > 1000 {
             return Err("每次请选择1–1000条消息".into());
         }
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        let mut count = 0;
-        for ident in ids {
-            let ident = ident.as_str().ok_or("无效消息编号")?;
-            if s.messages.remove(ident).is_some() {
-                s.deleted_messages.insert(ident.into(), now());
-                s.analyzed.remove(ident);
-                count += 1;
+        self.commit_state(|s| {
+            let mut count = 0;
+            for ident in ids {
+                let ident = ident.as_str().ok_or("无效消息编号")?;
+                if s.messages.remove(ident).is_some() {
+                    s.deleted_messages.insert(ident.into(), now());
+                    s.analyzed.remove(ident);
+                    count += 1;
+                }
             }
-        }
-        Self::audit(
-            &mut s,
-            "messages_delete",
-            "",
-            "手动删除消息，防止扫描重新导入，保留关联事项",
-            Value::Null,
-            json!({"count":count}),
-        );
-        self.save(&s)?;
-        *lock = s;
-        Ok(json!({"count":count}))
+            Self::audit(
+                s,
+                "messages_delete",
+                "",
+                "手动删除消息，防止扫描重新导入，保留关联事项",
+                Value::Null,
+                json!({"count":count}),
+            );
+            Ok(json!({"count":count}))
+        })
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_retention_and_withdrawal_passes_keep_shared_collections() {
+        let mut s = State::default();
+        s.messages.insert(
+            "active".into(),
+            Message {
+                id: "active".into(),
+                time: now(),
+                ..Default::default()
+            },
+        );
+        s.messages.insert(
+            "withdrawn".into(),
+            Message {
+                id: "withdrawn".into(),
+                time: now(),
+                withdrawn: true,
+                ..Default::default()
+            },
+        );
+        s.tasks.push(Task {
+            id: "task".into(),
+            evidence: TaskEvidence {
+                direct: vec!["active".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let messages = s.messages.clone();
+        let tasks = s.tasks.clone();
+        prune(&mut s);
+        crate::engine::reconcile_withdrawals(&mut s);
+        assert!(s.messages.same_snapshot(&messages));
+        assert!(s.tasks.same_snapshot(&tasks));
+        s.deleted_messages.insert("active".into(), now());
+        // Existing evidence protection remains authoritative during retention.
+        prune(&mut s);
+        assert!(s.messages.contains_key("active"));
+        s.tasks.clear();
+        prune(&mut s);
+        assert!(!s.messages.contains_key("active"));
+    }
     #[test]
     fn retention_expires_unprocessed_messages_including_paused_retries() {
         let mut s = State::default();
@@ -173,11 +234,8 @@ mod tests {
             s.messages.insert(
                 id.into(),
                 Message {
-                    id: id.into(),
-                    time: now() - 366 * 86_400_000i64,
-                    text: "请核对".into(),
                     private: true,
-                    ..Default::default()
+                    ..crate::test_support::message(id, "请核对", now() - 366 * 86_400_000i64)
                 },
             );
         }
@@ -199,16 +257,15 @@ mod tests {
             for i in 0..237 {
                 s.messages.insert(
                     format!("m{i:03}"),
-                    Message {
-                        id: format!("m{i:03}"),
-                        time: at,
-                        text: if i < 7 {
-                            "历史目标".into()
+                    crate::test_support::message(
+                        format!("m{i:03}"),
+                        if i < 7 {
+                            "历史目标"
                         } else {
-                            "普通消息".into()
+                            "普通消息"
                         },
-                        ..Default::default()
-                    },
+                        at,
+                    ),
                 );
             }
         }

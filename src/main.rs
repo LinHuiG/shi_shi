@@ -14,7 +14,9 @@ mod backdrop;
 mod backlog;
 mod cache_diagnostics;
 mod calendar_service;
+mod cli_transport;
 mod codex_bridge;
+mod command_api;
 mod context_budget;
 mod context_mcp;
 mod desktop_bridge;
@@ -33,6 +35,7 @@ mod messages;
 mod model;
 mod native_dialog;
 mod plugin_settings;
+mod plugin_worker;
 mod plugins;
 mod process;
 mod prompt_config;
@@ -62,6 +65,7 @@ mod work_state;
 use shishi_api::http_client;
 mod credentials;
 mod live_ai_regression;
+mod local_service;
 mod log_writer;
 mod memory_editor;
 mod message_filter;
@@ -87,6 +91,8 @@ use work_hours::AiMode;
 use wry::{WebContext, WebViewBuilder, WebViewBuilderExtWindows};
 #[derive(Debug)]
 enum UiEvent {
+    Backend(local_service::Signal),
+    BackendStopped,
     NoticeCommand(task_notifications::Command),
     NoticeOpened(String),
     StorageExit,
@@ -104,257 +110,265 @@ fn fatal(s: &str) {
         .set_level(rfd::MessageLevel::Error)
         .show();
 }
-fn dispatch(app: &Arc<App>, v: &Value) -> Result<Value, String> {
-    process::check_running()?;
-    if app.storage_changing.load(Ordering::SeqCst) {
-        return Err("正在切换数据目录，请等待迁移窗口完成".into());
-    }
-    let p = &v["params"];
-    match v["method"].as_str().unwrap_or("") {
-        "tool_list" => Ok(app.tool_list()),
-        "tool_making_prompt" => app.tool_making_prompt(p),
-        "tool_save" => app.tool_save(p),
-        "tool_toggle" => app.tool_toggle(p),
-        "tool_delete" => app.tool_delete(p),
-        "tool_command_preview" => app.tool_command_preview(p),
-        "tool_test" => app.tool_test(p),
-        "tool_test_cancel" => Ok(app.tool_test_cancel(p)),
-        "tool_run_get" => app.tool_run_get(p),
-        "tool_run_history" => app.tool_run_history(p),
-        "state" => Ok(if p.get("sections").is_some() {
-            app.snapshot_sections(p.get("sections"))
+// Keep discovery and dispatch in one declaration; no source text is embedded.
+macro_rules! dispatch_commands {
+    ($app:ident, $params:ident; $($($method:literal)|+ => $handler:expr),* $(,)?) => {
+        const COMMAND_METHODS: &[&str] = &[$($($method,)+)*];
+        fn dispatch($app: &Arc<App>, request: &Value) -> Result<Value, String> {
+            let _request = $app.local_runtime.begin()?;
+            process::check_running()?;
+            if $app.storage_changing.load(Ordering::SeqCst) {
+                return Err("正在切换数据目录，请等待迁移窗口完成".into());
+            }
+            let $params = &request["params"];
+            match request["method"].as_str().unwrap_or("") {
+                $($($method)|+ => $handler,)*
+                _ => Err("未知请求".into()),
+            }
+        }
+    };
+}
+dispatch_commands! { app, p;
+    "cli_methods" => Ok(command_api::methods()),
+    "tasks_query" => command_api::tasks_query(app, p),
+    "task_get" => command_api::task_get(app, p),
+    "tool_list" => Ok(app.tool_list()),
+    "tool_making_prompt" => app.tool_making_prompt(p),
+    "tool_save" => app.tool_save(p),
+    "tool_toggle" => app.tool_toggle(p),
+    "tool_delete" => app.tool_delete(p),
+    "tool_command_preview" => app.tool_command_preview(p),
+    "tool_test" => app.tool_test(p),
+    "tool_test_cancel" => Ok(app.tool_test_cancel(p)),
+    "tool_run_get" => app.tool_run_get(p),
+    "tool_run_history" => app.tool_run_history(p),
+    "state" => Ok(if p.get("sections").is_some() {
+        app.snapshot_sections(p.get("sections"))
+    } else {
+        app.snapshot_request(p)
+    }),
+    "state_version" => Ok(app.state_version()),
+    "work_state" => app.set_work_state(p),
+    "tag_filters" => app.tag_filters(p),
+    "tag_decide" => app.tag_decide(p),
+    "advice_decide" => app.advice_decide(p),
+    "advice_feedback" => app.advice_feedback(p),
+    "messages_delete" => app.delete_messages(p),
+    "messages_query" => app.query_messages(p),
+    "source_toggle" => app.source_toggle(p),
+    "plugin_uninstall" => app.plugin_uninstall(p),
+    "handling_prepare" => app.handling_prepare(p["task_id"].as_str().unwrap_or("")),
+    "handling_projects" => Ok(app.analysis_projects()),
+    "handling_add_project" => app.handling_add_project(p),
+    "handling_start" => app.handling_start(p),
+    "handling_followup" => app.handling_followup(p),
+    "handling_sync" => app.handling_sync(p["task_id"].as_str()),
+    "handling_request" => app.handling_request(p),
+    "handling_reconnect" => app.handling_reconnect(p),
+    "handling_reset_setup" => app.handling_reset_setup(p),
+    "handling_terminate" => app.handling_terminate(p),
+    "handling_adopt" => app.handling_adopt(p),
+    "handling_learn" => app.handling_learn(),
+    "handling_audit" => app.handling_audit(p["task_id"].as_str().unwrap_or("")),
+    "handling_open" => {
+        let thread = p["thread_id"].as_str().ok_or("缺少会话编号")?;
+        app.handling_open(thread)?;
+        Ok(json!(true))
+    },
+    "detect" => {
+        if p["driver"] == "dsh" {
+            Ok(ai_connections::detect_dsh(
+                p["saved"].as_str().unwrap_or(""),
+            ))
         } else {
-            app.snapshot_cached(
-                p["page"].as_str(),
-                p["core_revision"].as_str(),
-                p["task"].as_str(),
-            )
-        }),
-        "state_version" => Ok(app.state_version()),
-        "work_state" => app.set_work_state(p),
-        "tag_filters" => app.tag_filters(p),
-        "tag_decide" => app.tag_decide(p),
-        "advice_decide" => app.advice_decide(p),
-        "advice_feedback" => app.advice_feedback(p),
-        "messages_delete" => app.delete_messages(p),
-        "messages_query" => app.query_messages(p),
-        "source_toggle" => app.source_toggle(p),
-        "plugin_uninstall" => app.plugin_uninstall(p),
-        "handling_prepare" => app.handling_prepare(p["task_id"].as_str().unwrap_or("")),
-        "handling_projects" => app.handling_projects(),
-        "handling_add_project" => app.handling_add_project(p),
-        "handling_start" => app.handling_start(p),
-        "handling_followup" => app.handling_followup(p),
-        "handling_sync" => app.handling_sync(p["task_id"].as_str()),
-        "handling_request" => app.handling_request(p),
-        "handling_reconnect" => app.handling_reconnect(p),
-        "handling_reset_setup" => app.handling_reset_setup(p),
-        "handling_terminate" => app.handling_terminate(p),
-        "handling_adopt" => app.handling_adopt(p),
-        "handling_learn" => app.handling_learn(),
-        "handling_audit" => app.handling_audit(p["task_id"].as_str().unwrap_or("")),
-        "handling_open" => {
-            let thread = p["thread_id"].as_str().ok_or("缺少会话编号")?;
-            app.handling_open(thread)?;
-            Ok(json!(true))
+            Ok(json!({"codex":ai::detect_cli()}))
         }
-        "detect" => {
-            if p["driver"] == "dsh" {
-                Ok(ai_connections::detect_dsh(
-                    p["saved"].as_str().unwrap_or(""),
-                ))
+    },
+    "connection_save" => app.save_connection(p),
+    "connection_delete" => app.delete_connection(p),
+    "activity_query" => app.activity_query(p),
+    "task_changes" => app.task_changes(p),
+    "evidence_query" => app.evidence_query(p),
+    "update_check" => crate::updates::check(app.clone(), false),
+    "update_install" => crate::updates::install(app, p["scheduled"].as_str()),
+    "about_open" => crate::updates::open_link(p["target"].as_str().unwrap_or("")),
+    "dsh_initialize_acp" => {
+        let connection = model::from_json(&p["connection"])?;
+        ai_backend::dsh::initialize_acp(&connection, &app.root, p["confirmed"] == true)
+    },
+    "dsh_workspace_plugin" => {
+        let connection = model::from_json(&p["connection"])?;
+        ai_backend::dsh::workspace_plugin(
+            &connection,
+            p["install"] == true,
+            p["confirmed"] == true,
+        )
+    },
+    "prompt_save" => app.save_prompt(p),
+    "plugins" => app.plugin_catalog(),
+    "plugin_upload" => app.install_plugin_upload(p),
+    "plugin_install" => app.install_plugin(
+        p["path"]
+            .as_str()
+            .ok_or("请选择插件 ZIP 包或 plugin.json")?,
+    ),
+    "source_discover" => app.source_discover(p),
+    "plugin_settings" => crate::plugin_settings::dispatch(app, p),
+    "source_save" => app.source_save(p),
+    "source_remove" => app.source_remove(p),
+    "source_range" => app.source_range(p),
+    "prompt_history" => Ok(app.prompt_history()),
+    "memory_read" => Ok(app.memory_read()),
+    "memory_save" => app.memory_save(p),
+    "plugin_development_guide" => Ok(
+        json!({"text":format!("{}\n\n{}\n\n{}\n\n{}",include_str!("../docs/PLUGIN_ADAPTATION.md"),include_str!("../PLUGIN_API.txt"),include_str!("../examples/json-source/plugin.json"),include_str!("../examples/json-source/src/lib.rs"))}),
+    ),
+    "cli_skill" => Ok(command_api::skill(&app.root)),
+    "prompt_adopt" => app.adopt_prompt(p["id"].as_str().unwrap_or("")),
+    "prompt_rollback" => app.rollback_prompt(
+        p["id"].as_str().unwrap_or(""),
+        p["expected"].as_str().unwrap_or(""),
+    ),
+    "prompt_retry" => app.retry_prompt_review(p["id"].as_str().unwrap_or("")),
+    "prompts" => Ok(
+        json!({"tool_call":ai::default_policy("tool_call"),"classify":ai::default_policy("classify"),"format":ai::default_policy("format"),"learning":ai::default_policy("learning"),"report":ai::default_policy("report"),"handling":ai::default_policy("handling"),"prompt_review":ai::default_policy("prompt_review"),"archive":ai::default_policy("archive")}),
+    ),
+    "ai_trace" => {
+        let id = p["id"].as_str().ok_or("缺少调用编号")?;
+        uuid::Uuid::parse_str(id).map_err(|_| "无效的调用编号")?;
+        let dir = crate::storage::data_dir(&app.root)
+            .join("ai-traces")
+            .join(id);
+        if !dir.is_dir() {
+            let retain = app.state.lock().unwrap().config.retain_ai_traces;
+            return Err(if retain {
+                "这次调用没有保存详细输入输出（旧版记录）".into()
             } else {
-                Ok(json!({"codex":ai::detect_cli()}))
-            }
+                "完整跟踪已关闭，本次未保存输入输出".into()
+            });
         }
-        "connection_save" => app.save_connection(p),
-        "connection_delete" => app.delete_connection(p),
-        "activity_query" => app.activity_query(p),
-        "task_changes" => app.task_changes(p),
-        "evidence_query" => app.evidence_query(p),
-        "update_check" => crate::updates::check(app.clone(), false),
-        "update_install" => crate::updates::install(app, p["scheduled"].as_str()),
-        "about_open" => crate::updates::open_link(p["target"].as_str().unwrap_or("")),
-        "dsh_initialize_acp" => {
-            let connection =
-                serde_json::from_value(p["connection"].clone()).map_err(|e| e.to_string())?;
-            ai_backend::dsh::initialize_acp(&connection, &app.root, p["confirmed"] == true)
+        let read = |name| fs::read_to_string(dir.join(name)).unwrap_or_default();
+        if p["previous"] == true {
+            let identity: Value = serde_json::from_str(&read("request.json"))
+                .map_err(|_| "当前记录缺少同类请求标识，请使用更新后的调用记录比较")?;
+            let current_time = fs::metadata(dir.join("input.txt"))
+                .and_then(|m| m.modified())
+                .map_err(|_| "当前请求输入不可读")?;
+            let mut candidates =
+                fs::read_dir(crate::storage::data_dir(&app.root).join("ai-traces"))
+                    .map_err(|_| "跟踪目录不可读")?
+                    .filter_map(Result::ok)
+                    .take(10000)
+                    .filter_map(|entry| {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name == id || uuid::Uuid::parse_str(&name).is_err() {
+                            return None;
+                        }
+                        let path = entry.path().join("input.txt");
+                        let other: Value = serde_json::from_slice(
+                            &fs::read(entry.path().join("request.json")).ok()?,
+                        )
+                        .ok()?;
+                        if other != identity {
+                            return None;
+                        }
+                        let time = fs::metadata(&path).ok()?.modified().ok()?;
+                        (time <= current_time).then_some((time, name, path))
+                    })
+                    .collect::<Vec<_>>();
+            candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            let (_, previous_id, path) =
+                candidates.first().ok_or("没有更早的已保留请求可供比较")?;
+            let previous = fs::read_to_string(path).map_err(|_| "上一份请求输入不可读")?;
+            return Ok(
+                json!({"input":read("input.txt"),"previous_input":previous,"previous_request_id":previous_id}),
+            );
         }
-        "dsh_workspace_plugin" => {
-            let connection =
-                serde_json::from_value(p["connection"].clone()).map_err(|e| e.to_string())?;
-            ai_backend::dsh::workspace_plugin(
-                &connection,
-                p["install"] == true,
-                p["confirmed"] == true,
-            )
+        Ok(
+            json!({"input":read("input.txt"),"output":read("output.txt"),"events":format!("{}\n{}",read("tool-failures.jsonl"),read("events.jsonl")),"schema":read("schema.json"),"error":read("error.txt")}),
+        )
+    },
+    "analysis_session_open" => {
+        let driver = p["driver"].as_str().unwrap_or("");
+        let thread = p["thread_id"].as_str().ok_or("缺少会话编号")?;
+        uuid::Uuid::parse_str(thread).map_err(|_| "无效会话编号")?;
+        if driver != "codex" {
+            return Err("此接入不支持自动打开会话，请在对应客户端按会话编号查看".into());
         }
-        "prompt_save" => app.save_prompt(p),
-        "plugins" => app.plugin_catalog(),
-        "plugin_upload" => app.install_plugin_upload(p),
-        "plugin_install" => app.install_plugin(
-            p["path"]
-                .as_str()
-                .ok_or("请选择插件 ZIP 包或 plugin.json")?,
-        ),
-        "source_discover" => app.source_discover(p),
-        "plugin_settings" => crate::plugin_settings::dispatch(app, p),
-        "source_save" => app.source_save(p),
-        "source_remove" => app.source_remove(p),
-        "source_range" => app.source_range(p),
-        "prompt_history" => Ok(app.prompt_history()),
-        "memory_read" => Ok(app.memory_read()),
-        "memory_save" => app.memory_save(p),
-        "plugin_development_guide" => Ok(
-            json!({"text":format!("{}\n\n{}\n\n{}\n\n{}",include_str!("../docs/PLUGIN_ADAPTATION.md"),include_str!("../PLUGIN_API.txt"),include_str!("../examples/json-source/plugin.json"),include_str!("../examples/json-source/src/lib.rs"))}),
-        ),
-        "prompt_adopt" => app.adopt_prompt(p["id"].as_str().unwrap_or("")),
-        "prompt_rollback" => app.rollback_prompt(
-            p["id"].as_str().unwrap_or(""),
-            p["expected"].as_str().unwrap_or(""),
-        ),
-        "prompt_retry" => app.retry_prompt_review(p["id"].as_str().unwrap_or("")),
-        "prompts" => Ok(
-            json!({"tool_call":ai::default_policy("tool_call"),"classify":ai::default_policy("classify"),"format":ai::default_policy("format"),"learning":ai::default_policy("learning"),"report":ai::default_policy("report"),"handling":ai::default_policy("handling"),"prompt_review":ai::default_policy("prompt_review"),"archive":ai::default_policy("archive")}),
-        ),
-        "ai_trace" => {
-            let id = p["id"].as_str().ok_or("缺少调用编号")?;
-            uuid::Uuid::parse_str(id).map_err(|_| "无效的调用编号")?;
-            let dir = crate::storage::data_dir(&app.root)
-                .join("ai-traces")
-                .join(id);
-            if !dir.is_dir() {
-                let retain = app.state.lock().unwrap().config.retain_ai_traces;
-                return Err(if retain {
-                    "这次调用没有保存详细输入输出（旧版记录）".into()
-                } else {
-                    "完整跟踪已关闭，本次未保存输入输出".into()
-                });
-            }
-            let read = |name| fs::read_to_string(dir.join(name)).unwrap_or_default();
-            if p["previous"] == true {
-                let identity: Value = serde_json::from_str(&read("request.json"))
-                    .map_err(|_| "当前记录缺少同类请求标识，请使用更新后的调用记录比较")?;
-                let current_time = fs::metadata(dir.join("input.txt"))
-                    .and_then(|m| m.modified())
-                    .map_err(|_| "当前请求输入不可读")?;
-                let mut candidates =
-                    fs::read_dir(crate::storage::data_dir(&app.root).join("ai-traces"))
-                        .map_err(|_| "跟踪目录不可读")?
-                        .filter_map(Result::ok)
-                        .take(10000)
-                        .filter_map(|entry| {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            if name == id || uuid::Uuid::parse_str(&name).is_err() {
-                                return None;
-                            }
-                            let path = entry.path().join("input.txt");
-                            let other: Value = serde_json::from_slice(
-                                &fs::read(entry.path().join("request.json")).ok()?,
-                            )
-                            .ok()?;
-                            if other != identity {
-                                return None;
-                            }
-                            let time = fs::metadata(&path).ok()?.modified().ok()?;
-                            (time <= current_time).then_some((time, name, path))
-                        })
-                        .collect::<Vec<_>>();
-                candidates.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-                let (_, previous_id, path) =
-                    candidates.first().ok_or("没有更早的已保留请求可供比较")?;
-                let previous = fs::read_to_string(path).map_err(|_| "上一份请求输入不可读")?;
-                return Ok(
-                    json!({"input":read("input.txt"),"previous_input":previous,"previous_request_id":previous_id}),
-                );
-            }
-            Ok(
-                json!({"input":read("input.txt"),"output":read("output.txt"),"events":format!("{}\n{}",read("tool-failures.jsonl"),read("events.jsonl")),"schema":read("schema.json"),"error":read("error.txt")}),
-            )
+        crate::ai_backend::backend(&crate::ai_backend::Connection::default())?
+            .open_session(thread)?;
+        Ok(json!(true))
+    },
+    "models" => {
+        if p.get("connection").is_some() {
+            app.connection_models(p)
+        } else {
+            ai::list_models(p["codex"].as_str().unwrap_or(""))
         }
-        "analysis_session_open" => {
-            let driver = p["driver"].as_str().unwrap_or("");
-            let thread = p["thread_id"].as_str().ok_or("缺少会话编号")?;
-            uuid::Uuid::parse_str(thread).map_err(|_| "无效会话编号")?;
-            if driver != "codex" {
-                return Err("此接入不支持自动打开会话，请在对应客户端按会话编号查看".into());
-            }
-            crate::ai_backend::backend(&crate::ai_backend::Connection::default())?
-                .open_session(thread)?;
-            Ok(json!(true))
-        }
-        "models" => {
-            if p.get("connection").is_some() {
-                app.connection_models(p)
-            } else {
-                ai::list_models(p["codex"].as_str().unwrap_or(""))
-            }
-        }
-        "config" => app.configure(p.clone()),
-        "settings_patch" => app.configure_patch(p),
-        "scan" => app.scan(AiMode::Manual),
-        "scan_only" => app.refresh_messages(),
-        "scan_control" => app.scan_control(p),
-        "ai_job_start" => ai_jobs::start(app, p),
-        "ai_job_result" => ai_jobs::result(p),
-        "analyze" => app.analyze(AiMode::Manual),
-        "analysis_backlog" => app.analysis_backlog(p),
-        "image_preview" => app.image_preview(p),
-        "ai_interrupt" => app.interrupt_ai(p["request_id"].as_str().unwrap_or("")),
-        "generate" => {
-            let draft = app.create_generation(p)?;
-            let reply = json!(draft);
-            let worker = app.clone();
-            std::thread::spawn(move || worker.generate_background(draft, AiMode::Manual));
-            Ok(reply)
-        }
-        "format" => app.format(p["text"].as_str().unwrap_or("")),
-        "schedule_edit" => app.schedule_edit(p),
-        "schedule_delete" => app.schedule_delete(p),
-        "schedule_format" => app.schedule_format(p["text"].as_str().unwrap_or("")),
-        "edit" => app.task_edit(p),
-        "edit_ai" => app.task_ai_edit(p),
-        "action" => app.task_action(p),
-        "merge" => app.merge(p),
-        "undo" => app.undo(p["index"].as_u64().ok_or("缺少记录索引")? as usize),
-        "evidence" => Ok(app.evidence(p["id"].as_str().unwrap_or(""))),
-        "report" => app.report("手动报表", AiMode::Manual),
-        "archive" => app.archive(AiMode::Manual),
-        "archive_history" => Ok(app.archive_history()),
-        "archive_version" => app.archive_version(p["id"].as_str().unwrap_or("")),
-        "archive_rollback" => app.archive_rollback(
-            p["id"].as_str().unwrap_or(""),
-            p["expected"].as_str().unwrap_or(""),
-        ),
-        "archive_task" => app.archive_task(p),
-        "learn" => app.learn(AiMode::Manual),
-        "rule" => app.rule_toggle(p["id"].as_str().unwrap_or("")),
-        "pick" => file_picker::pick(p),
-        "open_data" => {
-            std::process::Command::new("explorer.exe")
-                .arg(crate::storage::data_dir(&app.root))
-                .spawn()
-                .map_err(|e| e.to_string())?;
-            Ok(json!(true))
-        }
-        "codex_status" | "ai_connection_status" => {
-            let c = app.state.lock().unwrap().config.clone();
-            let connection = match p.get("connection") {
-                Some(value) => serde_json::from_value(value.clone()).map_err(|e| e.to_string())?,
-                None => ai_backend::connection(&c)?,
-            };
-            ai_backend::backend(&connection)?.status(&connection, &app.root)
-        }
-        _ => Err("未知请求".into()),
-    }
+    },
+    "config" => app.configure(p.clone()),
+    "settings_patch" => app.configure_patch(p),
+    "scan" => app.scan(AiMode::Manual),
+    "scan_only" => app.refresh_messages(),
+    "scan_control" => app.scan_control(p),
+    "ai_job_start" => ai_jobs::start(app, p),
+    "ai_job_result" => ai_jobs::result(p),
+    "analyze" => app.analyze(AiMode::Manual),
+    "analysis_backlog" => app.analysis_backlog(p),
+    "image_preview" => app.image_preview(p),
+    "ai_interrupt" => app.interrupt_ai(p["request_id"].as_str().unwrap_or("")),
+    "generate" => {
+        let draft = app.create_generation(p)?;
+        let reply = json!(draft);
+        let worker = app.clone();
+        std::thread::spawn(move || worker.generate_background(draft, AiMode::Manual));
+        Ok(reply)
+    },
+    "format" => app.format(p["text"].as_str().unwrap_or("")),
+    "schedule_edit" => app.schedule_edit(p),
+    "schedule_delete" => app.schedule_delete(p),
+    "schedule_format" => app.schedule_format(p["text"].as_str().unwrap_or("")),
+    "edit" => app.task_edit(p),
+    "edit_ai" => app.task_ai_edit(p),
+    "action" => app.task_action(p),
+    "merge" => app.merge(p),
+    "undo" => app.undo(p["index"].as_u64().ok_or("缺少记录索引")? as usize),
+    "evidence" => Ok(app.evidence(p["id"].as_str().unwrap_or(""))),
+    "report" => app.report("手动报表", AiMode::Manual),
+    "archive" => app.archive(AiMode::Manual),
+    "archive_history" => Ok(app.archive_history()),
+    "archive_version" => app.archive_version(p["id"].as_str().unwrap_or("")),
+    "archive_rollback" => app.archive_rollback(
+        p["id"].as_str().unwrap_or(""),
+        p["expected"].as_str().unwrap_or(""),
+    ),
+    "archive_task" => app.archive_task(p),
+    "learn" => app.learn(AiMode::Manual),
+    "rule" => app.rule_toggle(p["id"].as_str().unwrap_or("")),
+    "pick" => file_picker::pick(p),
+    "open_data" => {
+        std::process::Command::new("explorer.exe")
+            .arg(crate::storage::data_dir(&app.root))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(json!(true))
+    },
+    "codex_status" | "ai_connection_status" => {
+        let c = app.state.lock().unwrap().config.clone();
+        let connection = match p.get("connection") {
+            Some(value) => model::from_json(value)?,
+            None => ai_backend::connection(&c)?,
+        };
+        ai_backend::backend(&connection)?.status(&connection, &app.root)
+    },
 }
 fn main() {
     let args = std::env::args().collect::<Vec<_>>();
-    if let Some(i) = args.iter().position(|a| a == "--plugin-settings-call") {
+    if let Some(i) = args.iter().position(|a| a == "--plugin-worker") {
         if let Err(error) = args
             .get(i + 1)
             .ok_or("缺少插件配置参数".to_string())
-            .and_then(|p| plugin_settings::run(std::path::Path::new(p)))
+            .and_then(|p| plugin_worker::run(std::path::Path::new(p)))
         {
             eprintln!("{error}");
             std::process::exit(1);
@@ -448,17 +462,6 @@ fn main() {
         }
         return;
     }
-    if let Some(i) = args.iter().position(|a| a == "--analysis-mcp") {
-        let result = args
-            .get(i + 1)
-            .ok_or("缺少分析资料文件".to_string())
-            .and_then(|p| analysis_context::serve(std::path::Path::new(p)));
-        if let Err(e) = result {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-        return;
-    }
     if let Some(i) = args.iter().position(|a| a == "--context-mcp-root") {
         let result = args
             .get(i + 1)
@@ -527,6 +530,9 @@ fn main() {
                 &e,
             );
         }
+        if args.iter().any(|a| a == "--background") {
+            std::process::exit(1);
+        }
         fatal(&e)
     }
 }
@@ -543,6 +549,11 @@ fn load_ui(args: &[String]) -> Result<String, String> {
 }
 fn start() -> Result<(), String> {
     let args = std::env::args().collect::<Vec<_>>();
+    let background = args.iter().any(|a| a == "--background");
+    let no_jobs = args.iter().any(|a| a == "--no-background-jobs");
+    if no_jobs && !args.iter().any(|a| a == "--root") {
+        return Err("隔离验证必须通过 --root 指定目录".into());
+    }
     if let Some(i) = args.iter().position(|a| a == "--apply-update") {
         return updates::helper(std::path::Path::new(args.get(i + 1).ok_or("缺少更新计划")?));
     }
@@ -569,7 +580,21 @@ fn start() -> Result<(), String> {
             .to_path_buf()
     };
     let root = std::path::absolute(root).map_err(|e| e.to_string())?;
-    let storage_transition = storage::transition_lock(&root)?;
+    // Concurrent GUI/CLI launchers wait for the same startup transition. A
+    // migration still owns this lock until its new locator is fully committed.
+    let startup_deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let storage_transition = loop {
+        match storage::transition_lock(&root) {
+            Ok(lock) => break lock,
+            Err(error)
+                if error == "正在切换数据目录，请等待迁移窗口完成后重试"
+                    && std::time::Instant::now() < startup_deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(error) => return Err(error),
+        }
+    };
     storage::initialize(&root)?;
     storage::plain_directory(&storage::data_dir(&root))?;
     fs::create_dir_all(crate::storage::data_dir(&root)).map_err(|e| e.to_string())?;
@@ -580,6 +605,32 @@ fn start() -> Result<(), String> {
         .open(crate::storage::data_dir(&root).join("app.lock"))
         .map_err(|e| e.to_string())?;
     if lock.try_lock_exclusive().is_err() {
+        if background || !smoke {
+            // Another launcher may still be publishing its endpoint. Only
+            // retry this idempotent ownership request, never business edits.
+            let method = if background {
+                "backend.start"
+            } else {
+                "ui.open"
+            };
+            for _ in 0..200 {
+                if let Ok(Some(route)) = cli_transport::route(&root) {
+                    if cli_transport::call(&route, method, json!({}))
+                        .and_then(cli_transport::success)
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+                if !background && tray::show_existing(&root) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if background {
+            return Err("已有后台尚未就绪或正在退出，请稍后重试".into());
+        }
         if !smoke && tray::show_existing(&root) {
             return Ok(());
         }
@@ -588,15 +639,20 @@ fn start() -> Result<(), String> {
     crate::prompt_config::initialize(&root)?;
     // Incompatible managed state must be surfaced before App initialization can
     // fail. The dialog lists exact files; cancel stops loading and keeps them.
-    let headless = smoke || args.iter().any(|a| a == "--read-once");
+    let headless = background || smoke || args.iter().any(|a| a == "--read-once");
     managed_data::startup_with(&root, headless, managed_data::native_choice)?;
     state_store::migrate(&storage::data_dir(&root))?;
     let app = Arc::new(App::load(root.clone())?);
+    app.local_runtime.acquire(!background)?;
+    if args.iter().any(|a| a == "--cli-owner") {
+        app.local_runtime.acquire(false)?;
+    }
     if let Err(error) = state_store::clean_config_generations(&storage::data_dir(&root)) {
         app.log("configuration_cleanup_deferred", json!({"error":error}));
     }
     drop(storage_transition);
     if !smoke
+        && !no_jobs
         && !args
             .iter()
             .any(|a| a == "--read-once" || a == "--no-auto-update")
@@ -627,12 +683,20 @@ fn start() -> Result<(), String> {
             status: "待处理".into(),
             ..Default::default()
         });
-        state.handling.runs.push(handling::Run{id:"approval-run".into(),task_id:"approval-fixture".into(),thread_id:"synthetic".into(),status:"waiting".into(),project_name:"合成项目".into(),requests:vec![json!({"id":"synthetic-request","method":"item/commandExecution/requestApproval","params":{"command":(0..80).map(|n|format!("synthetic command {n}\n")).collect::<String>(),"reason":"合成审批，只检查窗口，不执行命令"}})],..Default::default()});
+        state.handling.runs.push(handling::Run{id:"approval-run".into(),task_id:"approval-fixture".into(),thread_id:"synthetic".into(),status:"waiting".into(),project_name:"合成项目".into(),requests:vec![json!({"id":"synthetic-request","method":"dsh/tool/requestApproval","params":{"tool_call":{"title":"合成审批，只检查窗口，不执行命令","rawInput":(0..80).map(|n|format!("synthetic command {n}\n")).collect::<String>()},"dsh_options":[{"id":"once","name":"允许","kind":"allow_once"},{"id":"no","name":"拒绝","kind":"reject_once"}]}})],..Default::default()});
     }
     let event_loop = EventLoopBuilder::<UiEvent>::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    if !smoke {
+        let service_proxy = proxy.clone();
+        local_service::start(&app, move |signal| {
+            let _ = service_proxy.send_event(UiEvent::Backend(signal));
+        })?;
+    }
     // Use DWM's full-client frame, not Tao's legacy transparent-window blur.
     let backdrop = !smoke || mica_smoke;
+    let icon =
+        tao::window::Icon::from_rgba(include_bytes!("../assets/shishi.rgba").to_vec(), 64, 64).ok();
     let window = WindowBuilder::new()
         .with_title("拾事")
         .with_transparent(false)
@@ -644,16 +708,10 @@ fn start() -> Result<(), String> {
         // Reveal only after the page has rendered and completed an IPC round trip.
         .with_visible(false)
         .with_focused(false)
-        .with_window_icon(
-            tao::window::Icon::from_rgba(include_bytes!("../assets/shishi.rgba").to_vec(), 64, 64)
-                .ok(),
-        )
-        .with_taskbar_icon(
-            tao::window::Icon::from_rgba(include_bytes!("../assets/shishi.rgba").to_vec(), 64, 64)
-                .ok(),
-        )
+        .with_window_icon(icon.clone())
+        .with_taskbar_icon(icon)
         .with_theme(Some(Theme::Dark))
-        .with_inner_size(LogicalSize::new(1240., 820.))
+        .with_inner_size(LogicalSize::new(1360., 820.))
         .with_min_inner_size(LogicalSize::new(900., 620.))
         .build(&event_loop)
         .map_err(|e| e.to_string())?;
@@ -681,7 +739,7 @@ fn start() -> Result<(), String> {
                 crate::storage::data_dir(&watch_root).join("startup-error.txt"),
                 message,
             );
-            if !smoke {
+            if !smoke && !background {
                 fatal(message);
             }
             std::process::exit(1);
@@ -800,7 +858,7 @@ fn start() -> Result<(), String> {
     );
     let smoke_proxy = proxy.clone();
     let mut smoke_report: Option<Value> = None;
-    if !smoke {
+    if !smoke && !no_jobs {
         let bg = app.clone();
         let scheduler = app.clone();
         let handling = app.clone();
@@ -846,6 +904,9 @@ fn start() -> Result<(), String> {
             let mut failed_since: Option<i64> = None;
             while !process::stopping() {
                 let at = model::now();
+                if let Err(e) = boundary.resume_deferred(at) {
+                    boundary.error(&e);
+                }
                 if failed_since
                     .is_some_and(|since| at.saturating_sub(since) > work_scheduler::MAX_TICK_GAP_MS)
                 {
@@ -898,22 +959,13 @@ fn start() -> Result<(), String> {
         let scanner = app.clone();
         std::thread::spawn(move || {
             while !process::stopping() {
+                let wake = scanner.background.generation();
                 scanner.scan_tick();
-                std::thread::sleep(Duration::from_secs(5));
+                scanner.background.wait(wake);
             }
         });
         std::thread::spawn(move || {
-            bg.resume_pending();
-            loop {
-                if process::stopping() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(15));
-                if let Err(e) = bg.prune_messages() {
-                    bg.error(&e);
-                }
-                bg.tick();
-            }
+            bg.run_background();
         });
         // The only periodic UI refresh: push when the visible state changed.
         let notifier = app.clone();
@@ -946,10 +998,47 @@ fn start() -> Result<(), String> {
             *control_flow = ControlFlow::WaitUntil(std::time::Instant::now() + Duration::from_secs(1));
         }
         match event {
+            Event::UserEvent(UiEvent::Backend(local_service::Signal::Show)) => {
+                if initialized.load(Ordering::SeqCst) && app.local_runtime.gui() {
+                    window.set_visible(true); window.set_minimized(false); window.set_focus();
+                    let _=webview.evaluate_script("window.refreshState(true)");
+                }
+            }
+            Event::UserEvent(UiEvent::Backend(local_service::Signal::Hide)) => {
+                if !app.local_runtime.gui() {
+                    window.set_visible(false);
+                    if let Some(surface)=approvals.as_mut(){surface.dismiss();}
+                    notifications=None;
+                }
+            }
+            Event::UserEvent(UiEvent::Backend(local_service::Signal::Restart)) => {
+                let _=smoke_proxy.send_event(UiEvent::StorageExit);
+            }
+            Event::UserEvent(UiEvent::Backend(local_service::Signal::Shutdown)) => {
+                if !process::stopping() {
+                    app.log("backend_exit",app.local_runtime.snapshot());
+                    if let Some(active)=app.active_ai.lock().unwrap().as_ref(){active.cancel.store(true,Ordering::SeqCst);}
+                    process::shutdown();
+                    let worker=app.clone(); let exit_proxy=smoke_proxy.clone();
+                    std::thread::spawn(move || {
+                        worker.local_runtime.wait_idle(Duration::from_secs(30));
+                        // A transaction already in progress must leave its lock
+                        // before the process exits, even after the drain limit.
+                        { let _store=worker.store.lock().unwrap(); }
+                        let _=worker.log_writer.stop();
+                        let _=exit_proxy.send_event(UiEvent::BackendStopped);
+                    });
+                }
+            }
+            Event::UserEvent(UiEvent::BackendStopped) => {
+                drop(tray.take());
+                std::process::exit(0);
+            }
             Event::UserEvent(UiEvent::NoticeCommand(command)) => {
                 if let Some(surface) = notifications.as_mut() {
                     let task = surface.command(&command, &mut app.notifications.lock().unwrap());
                     if let Some(id) = task {
+                        if app.local_runtime.acquire(true).is_err(){return;}
                         window.set_minimized(false);
                         window.set_visible(true);
                         window.set_focus();
@@ -988,7 +1077,7 @@ fn start() -> Result<(), String> {
             }
             Event::UserEvent(UiEvent::ApprovalCommand(value)) => {
                 match value["method"].as_str().unwrap_or("") {
-                    "approval_ready"=>{if let Some(surface)=approvals.as_mut(){surface.ready();surface.refresh(&app,&window);surface.reply(&json!({"id":value["id"],"ok":true,"data":true}));}}
+                    "approval_ready"=>{if let Some(surface)=approvals.as_mut(){surface.ready();if app.local_runtime.gui(){surface.refresh(&app,&window);}surface.reply(&json!({"id":value["id"],"ok":true,"data":true}));}}
                     "approval_hide"=>{if let Some(surface)=approvals.as_mut(){surface.hide_key(value["params"]["key"].as_str().unwrap_or(""));surface.reply(&json!({"id":value["id"],"ok":true,"data":true}));}}
                     "approval_presented" if approval_smoke=>{
                         if let Some(surface)=approvals.as_ref(){
@@ -1011,7 +1100,7 @@ fn start() -> Result<(), String> {
                 }
             }
             Event::UserEvent(UiEvent::ApprovalReply(reply))=>{
-                if let Some(surface)=approvals.as_mut(){surface.reply(&reply);surface.refresh(&app,&window);}
+                if let Some(surface)=approvals.as_mut(){surface.reply(&reply);if app.local_runtime.gui(){surface.refresh(&app,&window);}}
                 push_generation+=1;
                 let _=webview.evaluate_script(&format!("window.stateChanged({push_generation})"));
             }
@@ -1038,7 +1127,7 @@ fn start() -> Result<(), String> {
                         report["tray_message"] = json!(true);
                         let _ = smoke_proxy.send_event(UiEvent::Tray(tray::Action::Exit));
                     }
-                } else if initialized.load(Ordering::SeqCst) {
+                } else if app.local_runtime.acquire(true).is_ok() && initialized.load(Ordering::SeqCst) {
                     window.set_visible(true);
                     window.set_minimized(false);
                     window.set_focus();
@@ -1046,6 +1135,16 @@ fn start() -> Result<(), String> {
                 }
             }
             Event::UserEvent(UiEvent::Tray(tray::Action::Exit)) => {
+                if !smoke {
+                    if app.storage_changing.load(Ordering::SeqCst) { return; }
+                    let force=app.local_runtime.cli() && native_dialog::backend_exit_confirmation(window.hwnd() as isize);
+                    let closing=app.local_runtime.release(true,force);
+                    window.set_visible(false);
+                    if let Some(surface)=approvals.as_mut(){surface.dismiss();}
+                    notifications=None;
+                    if closing {let _=smoke_proxy.send_event(UiEvent::Backend(local_service::Signal::Shutdown));}
+                    return;
+                }
                 app.log("exit_from_tray", json!({}));
                 process::shutdown();
                 let _ = app.log_writer.stop();
@@ -1129,7 +1228,7 @@ fn start() -> Result<(), String> {
                                 "document.documentElement.dataset.backdrop='mica'",
                             );
                         }
-                        window.set_visible(true);
+                        if app.local_runtime.gui() { window.set_visible(true); }
                     }
                 }
             }
@@ -1137,7 +1236,7 @@ fn start() -> Result<(), String> {
                 let _ = webview.evaluate_script(&format!("window.receive({})", v));
             }
             Event::UserEvent(UiEvent::Refresh) => {
-                let notice_count = app.notifications.lock().unwrap().count();
+                let notice_count = if app.local_runtime.gui() {app.notifications.lock().unwrap().count()}else{0};
                 if notice_count > 0 {
                     let surface = notifications.get_or_insert_with(Default::default);
                     if let Err(error) = surface.prepare(notice_count, target, &mut context, smoke_proxy.clone()) {
@@ -1147,7 +1246,7 @@ fn start() -> Result<(), String> {
                 }
                 if let Some(surface) = notifications.as_mut() {surface.refresh(&mut app.notifications.lock().unwrap(), &window);}
                 let update=app.updates.snapshot();
-                if app.state.lock().unwrap().config.auto_update && update["status"]=="ready"
+                if app.local_runtime.gui() && app.state.lock().unwrap().config.auto_update && update["status"]=="ready"
                     && update["reminder"]["expires_at"].as_i64().is_some_and(|t|model::now()<t)
                     && update["reminder"]["id"].as_str().is_some_and(|v|v!=announced_update) {
                     announced_update=update["reminder"]["id"].as_str().unwrap_or("").to_owned();
@@ -1155,7 +1254,7 @@ fn start() -> Result<(), String> {
                     window.set_focus();
                 }
                 push_generation += 1;
-                if let Some(surface)=approvals.as_mut(){surface.refresh(&app,&window);}
+                if app.local_runtime.gui() {if let Some(surface)=approvals.as_mut(){surface.refresh(&app,&window);}}
                 let _ = webview.evaluate_script(&format!("window.stateChanged({push_generation})"));
             }
             Event::WindowEvent {

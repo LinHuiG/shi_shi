@@ -6,7 +6,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::{atomic::Ordering, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 const RPC: Duration = Duration::from_secs(20);
 /// Remove only the per-request temporary directory this process created, on
@@ -66,12 +66,7 @@ fn usage(value: Option<shishi_acp::TokenUsage>) -> Value {
 /// value returned by model discovery or a plain model id routed to the default
 /// account provider, and never invent a value for an unadvertised route.
 fn model_route(value: &str) -> (String, String) {
-    if let Ok(route) = serde_json::from_str::<Vec<String>>(value) {
-        if route.len() == 2 {
-            return (route[0].clone(), route[1].clone());
-        }
-    }
-    ("deepseek-account".into(), value.into())
+    serde_json::from_str(value).unwrap_or_else(|_| ("deepseek-account".into(), value.into()))
 }
 fn selection(client: &AcpClient, session: &str, c: &Config) -> Result<(), String> {
     let (provider, model) = model_route(&c.model);
@@ -124,31 +119,87 @@ fn handling_client(c: &Connection, cwd: &Path) -> Result<(AcpClient, JobCleanup)
     let mut spec = DshLaunch::new(&c.executable, PathBuf::new(), cwd).handling();
     spec.patch = patch;
     spec.dsh_home = Some(dsh_home);
-    let launch = console_safe_launch(spec.acp_launch().map_err(|e| e.to_string())?, &dir)?;
+    let launch = console_safe_launch(spec.acp_launch(), &dir)?;
     let client = AcpClient::spawn(&launch, PermissionPolicy::Surface).map_err(|e| e.to_string())?;
     client.initialize(RPC).map_err(|e|format!("ACP initialize 失败：{e}；标准输出必须仅含 JSON-RPC。SHISHI_ACP_DIAGNOSTICS=1 可启用本地失败帧诊断"))?;
     Ok((client, cleanup))
 }
-impl Backend for Dsh {
-    fn analyze(
-        &self,
+fn remaining(cancel: &AtomicBool, deadline: Instant) -> Result<Duration, String> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(crate::ai_control::CANCELLED.into());
+    }
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| "AI 总时限已到".into())
+}
+
+fn with_deadline<T>(
+    client: &AcpClient,
+    cancel: &AtomicBool,
+    deadline: Instant,
+    run: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    remaining(cancel, deadline).inspect_err(|_| client.abort())?;
+    let done = AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::SeqCst) {
+                if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                    client.abort();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let result = run();
+        done.store(true, Ordering::SeqCst);
+        result
+    });
+    // The RPC may time out before the watcher wakes; teardown must still skip
+    // the normal-exit grace period in that race.
+    remaining(cancel, deadline).inspect_err(|_| client.abort())?;
+    result
+}
+
+/// One logical tool loop owns one restricted process. Its loaded profile is
+/// fixed (HMR is disabled); each round still gets a fresh session and ticket.
+/// Field order ensures the process is reaped before its profile is removed.
+pub(super) struct AnalysisProcess {
+    client: AcpClient,
+    cleanup: JobCleanup,
+    workdir: PathBuf,
+    dsh_home: PathBuf,
+}
+
+impl AnalysisProcess {
+    pub(super) fn prepare(
         c: &Connection,
-        r: AnalysisRequest<'_>,
-        event: &mut dyn FnMut(AnalysisEvent),
-    ) -> Result<(Value, Value), String> {
-        if r.payload["_model_only"] != true {
-            return super::model_api::analyze(c, r, event);
-        }
-        self.validate(c, r.config)?;
+        r: &AnalysisRequest<'_>,
+        deadline: Instant,
+    ) -> Result<Self, String> {
+        remaining(r.cancel, deadline)?;
+        Self::prepare_at(c, r, deadline, home()?)
+    }
+
+    fn prepare_at(
+        c: &Connection,
+        r: &AnalysisRequest<'_>,
+        deadline: Instant,
+        dsh_home: PathBuf,
+    ) -> Result<Self, String> {
+        remaining(r.cancel, deadline)?;
+        Dsh.validate(c, &r.config.model, &r.config.reasoning_effort)?;
         let job = crate::storage::data_dir(&r.root)
             .join("ai-work")
             .join(crate::model::id());
         fs::create_dir_all(&job).map_err(|e| e.to_string())?;
-        let _cleanup = JobCleanup(job.clone());
+        let cleanup = JobCleanup(job.clone());
         let workdir = crate::ai::analysis_workdir(r.root, r.config)?;
         fs::create_dir_all(&workdir).map_err(|e| e.to_string())?;
-        let profile = connection_profile(&job.join("profile"))?;
-        let dsh_home = home()?;
+        let profile =
+            shishi_acp::materialize_profile(&job.join("profile")).map_err(|e| e.to_string())?;
+        shishi_acp::providers::inherit_desktop_providers(&profile, &dsh_home)?;
         let readiness_config = shishi_acp::restricted::ReadinessConfig {
             dsh_cmd: PathBuf::from(&c.executable),
             dsh_home: dsh_home.clone(),
@@ -156,18 +207,42 @@ impl Backend for Dsh {
             patch: profile.patch.clone(),
             workdir: Some(workdir.clone()),
         };
-        shishi_acp::check_readiness(&readiness_config)
-            .map_err(|e| e.guidance(&readiness_config))?;
-        if r.cancel.load(Ordering::SeqCst) {
-            return Err(crate::ai_control::CANCELLED.into());
-        }
-        let snapshot = job.join("context.json");
-        fs::write(&snapshot, r.payload["_local_context"].to_string()).map_err(|e| e.to_string())?;
-        let retrieval = r.tools.is_some_and(|tools| {
-            tools["tools"]
-                .as_array()
-                .is_some_and(|rows| rows.iter().any(|tool| tool["name"] != "submit_analysis"))
-        });
+        shishi_acp::restricted::check_readiness_until(&readiness_config, deadline, r.cancel)
+            .map_err(|e| {
+                remaining(r.cancel, deadline)
+                    .err()
+                    .unwrap_or_else(|| e.guidance(&readiness_config))
+            })?;
+        remaining(r.cancel, deadline)?;
+        let launch = profile
+            .analysis_launch(&c.executable, &workdir, &dsh_home)
+            .acp_launch();
+        let launch = console_safe_launch(launch, &job)?;
+        let client =
+            AcpClient::spawn(&launch, PermissionPolicy::DenyAll).map_err(|e| e.to_string())?;
+        with_deadline(&client, r.cancel, deadline, || {
+            client.initialize(RPC.min(remaining(r.cancel, deadline)?))
+                .map_err(|e| format!("ACP initialize 失败：{e}；标准输出必须仅含 JSON-RPC。SHISHI_ACP_DIAGNOSTICS=1 可启用本地失败帧诊断"))?;
+            Ok(())
+        })?;
+        Ok(Self {
+            client,
+            cleanup,
+            workdir,
+            dsh_home,
+        })
+    }
+
+    pub(super) fn analyze(
+        &self,
+        r: AnalysisRequest<'_>,
+        deadline: Instant,
+        event: &mut dyn FnMut(AnalysisEvent),
+    ) -> Result<(Value, Value), String> {
+        remaining(r.cancel, deadline)?;
+        let job = self.cleanup.0.join(crate::model::id());
+        fs::create_dir_all(&job).map_err(|e| e.to_string())?;
+        let _cleanup = JobCleanup(job.clone());
         let (provider, model) = model_route(&r.config.model);
         let spec = shishi_acp::analysis::AnalysisSpec {
             request_id: crate::model::id(),
@@ -178,119 +253,97 @@ impl Backend for Dsh {
                 .as_array()
                 .cloned()
                 .unwrap_or_default(),
-            workdir: workdir.clone(),
-            snapshot_path: snapshot.clone(),
+            workdir: self.workdir.clone(),
             app_exe: std::env::current_exe().map_err(|e| e.to_string())?,
             model: Some((provider, model)),
             effort: (!r.config.reasoning_effort.is_empty())
                 .then(|| r.config.reasoning_effort.clone()),
-            retrieval,
         };
         let prepared =
             shishi_acp::analysis::prepare(&job.join("submit"), &spec).map_err(|e| e.to_string())?;
-        let launch = profile
-            .analysis_launch(&c.executable, &workdir, dsh_home)
-            .acp_launch()
-            .map_err(|e| e.to_string())?;
-        let launch = console_safe_launch(launch, &job)?;
-        let client =
-            AcpClient::spawn(&launch, PermissionPolicy::DenyAll).map_err(|e| e.to_string())?;
-        let done = AtomicBool::new(false);
-        let result = std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while !done.load(Ordering::SeqCst) {
-                    if r.cancel.load(Ordering::SeqCst) {
-                        client.shutdown();
-                        break;
+        let result = with_deadline(&self.client, r.cancel, deadline, || {
+            let mut announced = false;
+            let accepted = shishi_acp::analysis::run(
+                &self.client,
+                &spec,
+                &prepared,
+                remaining(r.cancel, deadline)?,
+                &mut |e| {
+                    let AcpEvent { session_id, update } = e;
+                    if !announced {
+                        event(AnalysisEvent::SessionStarted(session_id));
+                        announced = true;
                     }
-                    std::thread::sleep(Duration::from_millis(30));
-                }
-            });
-            let answer = (|| {
-                client.initialize(RPC).map_err(|e| format!("ACP initialize 失败：{e}；标准输出必须仅含 JSON-RPC。SHISHI_ACP_DIAGNOSTICS=1 可启用本地失败帧诊断"))?;
-                let mut announced = false;
-                let accepted = shishi_acp::analysis::run(
-                    &client,
-                    &spec,
-                    &prepared,
-                    Duration::from_secs(r.config.ai_timeout_seconds),
-                    &mut |e| {
-                        if let AcpEvent::SessionUpdate { session_id, update } = e {
-                            if !announced {
-                                event(AnalysisEvent::SessionStarted(session_id));
-                                announced = true;
-                            }
-                            let progress = match update {
-                                SessionUpdate::AgentMessageChunk { text } => {
-                                    Some(("content", text))
-                                }
-                                SessionUpdate::AgentThoughtChunk { text } => {
-                                    Some(("reasoning", text))
-                                }
-                                SessionUpdate::ToolCall { title, .. } => {
-                                    Some(("tool", title.unwrap_or_else(|| "读取上下文".into())))
-                                }
-                                _ => None,
-                            };
-                            if let Some((kind, text)) = progress {
-                                if r.config.retain_ai_traces {
-                                    crate::ai::append_trace_event(
-                                        r.trace,
-                                        &json!({"type":kind,"text":text}),
-                                    );
-                                }
-                                event(AnalysisEvent::Stream {
-                                    kind: kind.into(),
-                                    text,
-                                    append: kind != "tool",
-                                });
-                            }
+                    let progress = match update {
+                        SessionUpdate::AgentMessageChunk { text } => Some(("content", text)),
+                        SessionUpdate::AgentThoughtChunk { text } => Some(("reasoning", text)),
+                        SessionUpdate::ToolCall { title, .. } => {
+                            Some(("tool", title.unwrap_or_else(|| "读取上下文".into())))
                         }
-                    },
-                )
-                .map_err(|e| error_message(&e.to_string()))?;
-                event(AnalysisEvent::Stream {
-                    kind: "phase".into(),
-                    text: "校验结果".into(),
-                    append: false,
-                });
-                if !announced {
-                    event(AnalysisEvent::SessionStarted(
-                        accepted.session.session_id.clone(),
-                    ));
-                }
-                let tokens = usage(accepted.prompt.usage);
-                shishi_acp::workspace::publish(&home()?, &accepted.session.session_id)?;
-                event(AnalysisEvent::Usage(tokens.clone()));
-                let meter = match fs::read(snapshot.with_extension("meter")) {
-                    Ok(raw) => serde_json::from_slice(&raw).map_err(|_| "分析补查记录损坏")?,
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        crate::analysis_context::Meter::default()
+                        _ => None,
+                    };
+                    if let Some((kind, text)) = progress {
+                        if r.config.retain_ai_traces {
+                            crate::ai::append_trace_event(
+                                r.trace,
+                                &json!({"type":kind,"text":text}),
+                            );
+                        }
+                        event(AnalysisEvent::Stream {
+                            kind: kind.into(),
+                            text,
+                            append: kind != "tool",
+                        });
                     }
-                    Err(_) => return Err("分析补查记录不可读".into()),
-                };
-                let mut value = accepted.value;
-                if r.config.retain_ai_traces {
-                    fs::write(r.trace.join("output.txt"), value.to_string())
-                        .map_err(|e| format!("分析结果跟踪保存失败：{e}"))?;
+                },
+            )
+            .map_err(|e| error_message(&e.to_string()))?;
+            if !accepted.session_closed {
+                // Some ACP versions cannot close a session. Keep the validated
+                // result, but retire this process before a later round starts.
+                self.client.shutdown();
+            }
+            event(AnalysisEvent::Stream {
+                kind: "phase".into(),
+                text: "校验结果".into(),
+                append: false,
+            });
+            if !announced {
+                event(AnalysisEvent::SessionStarted(accepted.session_id.clone()));
+            }
+            let tokens = usage(accepted.prompt.usage);
+            event(AnalysisEvent::Usage(tokens.clone()));
+            if let Err(error) = shishi_acp::workspace::publish(&self.dsh_home, &accepted.session_id)
+            {
+                event(AnalysisEvent::VisibilityIssue {
+                    thread_id: accepted.session_id.clone(),
+                    error,
+                });
+            }
+            let value = accepted.value;
+            if r.config.retain_ai_traces {
+                if let Err(error) = fs::write(r.trace.join("output.txt"), value.to_string()) {
+                    event(AnalysisEvent::Stream {
+                        kind: "diagnostic".into(),
+                        text: format!("分析结果已取得，跟踪文件保存失败：{error}"),
+                        append: false,
+                    });
                 }
-                if r.payload["_model_only"] != true {
-                    super::api::attach_result(&mut value, &r.payload["_local_context"], &meter);
-                }
-                Ok((value, tokens))
-            })();
-            done.store(true, Ordering::SeqCst);
-            answer
+            }
+            Ok((value, tokens))
         });
-        client.shutdown();
-        // Only this fresh UUID directory is owned by the request.
-        let _ = fs::remove_dir_all(&job);
-        if r.cancel.load(Ordering::SeqCst) {
-            Err(crate::ai_control::CANCELLED.into())
-        } else {
-            result
+        if result.is_err() {
+            self.client.shutdown();
         }
+        result
     }
+
+    pub(super) fn is_connected(&self) -> bool {
+        self.client.is_connected()
+    }
+}
+
+impl Backend for Dsh {
     fn models(&self, c: &Connection, root: &Path) -> Result<Value, String> {
         let readiness = self
             .status(c, root)
@@ -314,18 +367,18 @@ impl Backend for Dsh {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let models=session.model_option().map(|o|o.choices.iter().map(|m|json!({"model":m.value,"displayName":m.name,"providerName":m.group,"provider":serde_json::from_str::<Vec<String>>(&m.value).ok().and_then(|r|r.first().cloned()),"supportedReasoningEfforts":efforts.clone()})).collect::<Vec<_>>()).unwrap_or_default();
+        let models=session.model_option().map(|o|o.choices.iter().map(|m|json!({"model":m.value,"displayName":m.name,"providerName":m.group,"provider":serde_json::from_str::<Vec<String>>(&m.value).ok().and_then(|r|r.first().cloned()),"supportedReasoningEfforts":efforts})).collect::<Vec<_>>()).unwrap_or_default();
         let current = session.current_model_route();
         client.shutdown();
         Ok(
             json!({"models":models,"efforts":efforts,"current":current.map(|(p,m)|json!({"provider":p,"model":m}))}),
         )
     }
-    fn validate(&self, c: &Connection, config: &Config) -> Result<(), String> {
+    fn validate(&self, c: &Connection, model: &str, _: &str) -> Result<(), String> {
         if !Path::new(&c.executable).is_file() {
             return Err("未找到桌面 Harness 启动器，请选择新版 dsh.cmd".into());
         }
-        if config.model.is_empty() {
+        if model.is_empty() {
             return Err("请填写 Harness 模型编号".into());
         }
         Ok(())
@@ -382,7 +435,52 @@ struct DshAgent {
     _profile: JobCleanup,
     client: Arc<AcpClient>,
     history: Arc<Mutex<BTreeMap<String, Vec<Value>>>>,
-    events: Arc<Mutex<Vec<UsageEvent>>>,
+    events: Arc<Mutex<Vec<AgentEvent>>>,
+}
+fn update_items(items: &mut Vec<Value>, update: SessionUpdate) -> Option<AgentUpdate> {
+    match update {
+        SessionUpdate::AgentMessageChunk { text } => {
+            if let Some(item) = items.iter_mut().find(|item| item["id"] == "answer") {
+                match &mut item["text"] {
+                    Value::String(buffer) => buffer.push_str(&text),
+                    value => *value = Value::String(text.clone()),
+                }
+            } else {
+                items.push(
+                    json!({"id":"answer","type":"agentMessage","phase":"final_answer","text":text}),
+                );
+            }
+            Some(AgentUpdate::MessageDelta {
+                item_id: "answer".into(),
+                text,
+            })
+        }
+        SessionUpdate::ToolCall {
+            tool_call_id,
+            title,
+            status,
+            kind,
+            raw_input,
+        } => {
+            items.push(json!({"id":tool_call_id,"type":"mcpToolCall","status":status,"tool":title,"arguments":raw_input,"kind":kind}));
+            items
+                .iter()
+                .find(|item| item["id"] == tool_call_id)
+                .cloned()
+                .map(AgentUpdate::Item)
+        }
+        SessionUpdate::ToolCallUpdate {
+            tool_call_id,
+            status,
+            text,
+        } => {
+            let item = items.iter_mut().find(|item| item["id"] == tool_call_id)?;
+            item["status"] = json!(status);
+            item["result"] = json!(text);
+            Some(AgentUpdate::Item(item.clone()))
+        }
+        _ => None,
+    }
 }
 fn context(tool: &ContextTool) -> McpServer {
     McpServer::stdio(
@@ -403,23 +501,14 @@ impl AgentSession for DshAgent {
     fn is_alive(&self) -> bool {
         self.client.is_connected()
     }
-    fn start(
-        &self,
-        cwd: &str,
-        _: &str,
-        tool: &ContextTool,
-        config: &Config,
-    ) -> Result<Value, String> {
+    fn start(&self, tool: &ContextTool, config: &Config) -> Result<Value, String> {
         let session = self
             .client
-            .new_session(Path::new(cwd), &[context(tool)], RPC)
+            .new_session(&tool.cwd, &[context(tool)], RPC)
             .map_err(|e| format!("ACP session/new 失败：{e}"))?;
         shishi_acp::workspace::publish(&home()?, &session.session_id)?;
         selection(&self.client, &session.session_id, config)?;
         Ok(json!({"thread":{"id":session.session_id},"model":config.model}))
-    }
-    fn rename(&self, _: &str, _: &str) -> Result<(), String> {
-        Err("当前 Harness ACP 协议不提供会话重命名，标题未修改".into())
     }
     fn submit(
         &self,
@@ -450,28 +539,28 @@ impl AgentSession for DshAgent {
         let tid = turn.clone();
         let timeout = Duration::from_secs(config.ai_timeout_seconds);
         std::thread::spawn(move || {
-            let result=client.prompt(&thread,&text,timeout,&mut |event|{
-                if let AcpEvent::SessionUpdate{session_id,update}=event {
-                    if session_id!=thread{return}
-                    let mut map=history.lock().unwrap();let Some(row)=map.get_mut(&thread).and_then(|v|v.iter_mut().find(|v|v["id"]==tid))else{return};
-                    let items=row["items"].as_array_mut().unwrap();
-                    match &update {
-                        SessionUpdate::AgentMessageChunk{text}=>{
-                            if let Some(item)=items.iter_mut().find(|i|i["id"]=="answer") {let old=item["text"].as_str().unwrap_or("");item["text"]=json!(format!("{old}{text}"));}
-                            else {items.push(json!({"id":"answer","type":"agentMessage","phase":"final_answer","text":text}));}
-                        },
-                        SessionUpdate::ToolCall{tool_call_id,title,status,kind,raw_input}=>items.push(json!({"id":tool_call_id,"type":"mcpToolCall","status":status,"tool":title,"arguments":raw_input,"kind":kind})),
-                        SessionUpdate::ToolCallUpdate{tool_call_id,status,text}=>{if let Some(i)=items.iter_mut().find(|i|i["id"].as_str()==Some(tool_call_id.as_str())){i["status"]=json!(status);i["result"]=json!(text);}}, _=>{}
-                    }
-                    let notification = match &update {
-                        SessionUpdate::AgentMessageChunk { text } => Some(json!({"method":"item/agentMessage/delta","params":{"threadId":thread,"turnId":tid,"itemId":"answer","delta":text}})),
-                        SessionUpdate::ToolCall { tool_call_id, .. } | SessionUpdate::ToolCallUpdate { tool_call_id, .. } => items.iter().find(|i|i["id"].as_str()==Some(tool_call_id.as_str())).map(|item|json!({"method":"item/started","params":{"threadId":thread,"turnId":tid,"item":item}})),
-                        _ => None,
-                    };
-                    if let Some(notification) = notification {
-                        events.lock().unwrap().push(UsageEvent { notification, thread_id:thread.clone(), turn_id:Some(tid.clone()), usage:Value::Null });
-                        crate::codex_bridge::signal_activity();
-                    }
+            let emit = |update| {
+                events.lock().unwrap().push(AgentEvent {
+                    thread_id: thread.clone(),
+                    turn_id: tid.clone(),
+                    update,
+                })
+            };
+            let result = client.prompt(&thread, &text, timeout, &mut |event| {
+                let AcpEvent { session_id, update } = event;
+                if session_id != thread {
+                    return;
+                }
+                let mut map = history.lock().unwrap();
+                let Some(row) = map
+                    .get_mut(&thread)
+                    .and_then(|v| v.iter_mut().find(|v| v["id"] == tid))
+                else {
+                    return;
+                };
+                if let Some(update) = update_items(row["items"].as_array_mut().unwrap(), update) {
+                    emit(update);
+                    crate::codex_bridge::signal_activity();
                 }
             });
             let mut map = history.lock().unwrap();
@@ -493,19 +582,20 @@ impl AgentSession for DshAgent {
                             json!({"message":format!("Harness stopped: {}",prompt.stop_reason)});
                     }
                 }
-                events.lock().unwrap().push(UsageEvent { notification:json!({"method":"turn/completed","params":{"threadId":thread,"turn":row}}),thread_id:thread.clone(),turn_id:Some(tid.clone()),usage:Value::Null });
+                emit(AgentUpdate::Completed(row.clone()));
             }
             if let Ok(result) = result {
                 if let Some(u) = result.usage {
-                    events.lock().unwrap().push(UsageEvent{notification:Value::Null,thread_id:thread,turn_id:Some(tid),usage:json!({"per_turn":true,"last":{"inputTokens":u.input_tokens,"outputTokens":u.output_tokens,"cachedInputTokens":u.cached_read_tokens}})});
+                    emit(AgentUpdate::Usage {
+                        input: u.input_tokens,
+                        output: u.output_tokens,
+                        cached: u.cached_read_tokens,
+                    });
                 }
             }
             crate::codex_bridge::signal_activity();
         });
         Ok(json!({"turn":{"id":turn}}))
-    }
-    fn steer(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
-        Err("Harness ACP 不支持运行中追加；请中断后发送后续说明".into())
     }
     fn read(&self, thread: &str) -> Result<Value, String> {
         let session = self
@@ -544,20 +634,17 @@ impl AgentSession for DshAgent {
             .map_err(|e| e.to_string())?;
         Ok(json!({"thread":{"id":info.session_id,"cwd":info.cwd,"status":{"type":"idle"}}}))
     }
-    fn unsubscribe(&self, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn interrupt(&self, thread: &str, _: &str) -> Result<(), String> {
+    fn interrupt(&self, thread: &str) -> Result<(), String> {
         self.client.cancel_session(thread);
         Ok(())
     }
-    fn events(&self) -> Vec<UsageEvent> {
+    fn events(&self) -> Vec<AgentEvent> {
         std::mem::take(&mut *self.events.lock().unwrap())
     }
     fn requests(&self, thread: &str) -> Vec<Value> {
         self.client.permissions_for(thread).iter().map(|p|json!({"id":p.request_id.to_value(),"method":"dsh/tool/requestApproval","params":{"threadId":thread,"tool_call":p.raw["toolCall"],"dsh_options":p.options.iter().map(|o|json!({"id":o.option_id,"name":o.name,"kind":o.kind})).collect::<Vec<_>>()}})).collect()
     }
-    fn respond(&self, thread: &str, key: &str, _: &Value, answer: &Value) -> Result<(), String> {
+    fn respond(&self, thread: &str, key: &str, answer: &Value) -> Result<(), String> {
         let pending = self.client.permissions_for(thread);
         let p = pending
             .iter()
@@ -587,8 +674,71 @@ fn error_message(raw: &str) -> String {
     }
 }
 #[cfg(test)]
+#[path = "dsh_tests.rs"]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod error_tests {
     use super::*;
+    #[test]
+    fn streamed_answer_reuses_storage_and_retains_complete_unicode_text() {
+        let mut items = Vec::new();
+        update_items(
+            &mut items,
+            SessionUpdate::AgentMessageChunk {
+                text: "start:".into(),
+            },
+        );
+        let Value::String(buffer) = &mut items[0]["text"] else {
+            panic!("answer text")
+        };
+        buffer.reserve(100_000);
+        let pointer = buffer.as_ptr();
+        for _ in 0..10_000 {
+            assert!(
+                matches!(update_items(&mut items, SessionUpdate::AgentMessageChunk { text: "中文🙂".into() }), Some(AgentUpdate::MessageDelta { item_id, text }) if item_id == "answer" && text == "中文🙂")
+            );
+        }
+        assert_eq!(items.len(), 1);
+        let text = items[0]["text"].as_str().unwrap();
+        assert_eq!(text, format!("start:{}", "中文🙂".repeat(10_000)));
+        assert_eq!(
+            text.as_ptr(),
+            pointer,
+            "capacity is reused while appending chunks"
+        );
+        assert!(update_items(
+            &mut items,
+            SessionUpdate::AgentThoughtChunk {
+                text: "private".into()
+            }
+        )
+        .is_none());
+        assert_eq!(items.len(), 1);
+        let update = SessionUpdate::ToolCallUpdate {
+            tool_call_id: "tool".into(),
+            status: Some("completed".into()),
+            text: "合成结果🚀".into(),
+        };
+        assert!(update_items(&mut items, update.clone()).is_none());
+        let first = update_items(
+            &mut items,
+            SessionUpdate::ToolCall {
+                tool_call_id: "tool".into(),
+                title: Some("synthetic".into()),
+                status: Some("inProgress".into()),
+                kind: Some("read".into()),
+                raw_input: json!({"path":"fixture.txt"}),
+            },
+        );
+        assert!(matches!(first, Some(AgentUpdate::Item(item)) if item == items[1]));
+        let final_item = update_items(&mut items, update);
+        assert!(
+            matches!(final_item, Some(AgentUpdate::Item(item)) if item == items[1] && item["result"] == "合成结果🚀")
+        );
+        assert_eq!(items.len(), 2);
+    }
+
     #[test]
     fn refusal_is_explicit_but_unknown_internal_errors_stay_unknown() {
         assert!(error_message("ACP error -32603: Internal error: DeepSeek Messages stream: unsupported stop reason refusal").starts_with("供应商拒答"));

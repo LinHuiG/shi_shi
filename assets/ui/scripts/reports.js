@@ -1,6 +1,6 @@
 function reportCard(r) {
   const ai = r.ai_summary;
-  return `<div class="report-body">${r.remaining_events ? `<p class="helper archive-coverage">本批已提交，仍有 ${r.remaining_events} 条变更待处理；请以最近一次归档状态为准。</p>` : ''}<p class="helper">本批归档 ${r.archived_tasks || 0} 个事项${r.skipped_tasks ? ` · ${r.skipped_tasks} 个事项处理期间发生变化，保留到下次归档` : ''}</p><div class="report-counts"><span><b>${r.status_counts?.['待处理'] ?? r.tasks.filter((t) => t.status === '待处理').length}</b> 待处理</span><span><b>${r.status_counts?.['已完成'] ?? r.tasks.filter((t) => t.status === '已完成').length}</b> 已完成</span><span>${(r.delta || []).length} 条新增变更</span></div><section class="report-summary"><div class="row"><h3>AI 汇总</h3><span class="tiny">${r.summary_status === 'reused' ? '无新增变化 · 沿用上次汇总' : ''}</span></div>${
+  return `<div class="report-body">${r.remaining_events ? `<p class="helper archive-coverage">本批已提交，仍有 ${r.remaining_events} 条变更待处理；请以最近一次归档状态为准。</p>` : ''}<p class="helper">本批归档 ${r.archived_tasks || 0} 个事项${r.skipped_tasks ? ` · ${r.skipped_tasks} 个事项处理期间发生变化，保留到下次归档` : ''}</p><div class="report-counts"><span><b>${r.status_counts?.['待处理'] ?? r.tasks.filter((t) => t.status === '待处理').length}</b> 待处理</span><span><b>${r.status_counts?.['处理中'] ?? r.tasks.filter((t) => t.status === '处理中').length}</b> 处理中</span><span><b>${r.status_counts?.['已完成'] ?? r.tasks.filter((t) => t.status === '已完成').length}</b> 已完成</span><span>${(r.delta || []).length} 条新增变更</span></div><section class="report-summary"><div class="row"><h3>AI 汇总</h3><span class="tiny">${r.summary_status === 'reused' ? '无新增变化 · 沿用上次汇总' : ''}</span></div>${
     ai
       ? `<p class="summary-lead">${esc(ai.summary)}</p><div class="report-columns">${[
           ['completed', '已完成', 'green'],
@@ -29,10 +29,13 @@ function reportCard(r) {
 let archiveBannerTimer = null;
 function visibleArchiveAttempt(attempt, at = Date.now()) {
   if (!attempt) return false;
+  const outcome = state.report_outcome;
+  if (['failed', 'succeeded'].includes(attempt.status) && outcome &&
+      (outcome.kind !== 'archive' || outcome.id !== attempt.id)) return false;
   if (attempt.status !== 'succeeded') return true;
   const finished = Number(attempt.finished);
   const day = (t) => new Date(t).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
-  return finished > 0 && at >= finished && at - finished < 300000 && day(finished) === day(at);
+  return finished > 0 && at - finished < 300000 && day(finished) === day(at);
 }
 function renderReports() {
   clearTimeout(archiveBannerTimer);
@@ -51,9 +54,14 @@ function renderReports() {
   const attemptBanner = visible
     ? `<div class="box ${attempt.status === 'failed' ? 'error-box' : ''}"><b>${attempt.status === 'failed' ? (attempt.batches ? '归档部分已提交，后续未完成' : '最近一次归档失败，本次未提交') : attempt.status === 'succeeded' ? '归档完成' : '归档处理中'}</b>${attempt.error ? `<p>${esc(attempt.error)}</p>` : ''}<p class="tiny">${esc(date(attempt.finished || attempt.started || attempt.created))}</p><p class="helper">已处理 ${attempt.processed || 0} 条变更 · 已归档 ${attempt.archived_tasks || 0} 个事项 · 剩余 ${attempt.remaining || 0} 条${attempt.status === 'failed' ? '；已提交批次保留，未处理材料和游标保留；不会自动重试，请手动继续归档。' : ''}</p></div>`
     : '';
+  const outcome = state.report_outcome;
+  const failureBanner = outcome?.status === 'failed' &&
+    !(visible && outcome.kind === 'archive' && outcome.id === attempt.id)
+    ? `<div class="box error-box report-failure"><b>${esc(outcome.label)}失败</b>${outcome.error ? `<p>${esc(outcome.error)}</p>` : ''}<p class="tiny">${esc(date(outcome.finished))}</p></div>`
+    : '';
   setHtml(
     '#view',
-    `<div class="page report-page">${attemptBanner}${reports.length ? reports.map((r, i) => (i === 0 ? `<article class="report-card" data-report-key="${esc(r.id || String(r.time))}"><header><div class="tiny">最新汇总</div><h2>${esc(r.label)} <span>${esc(r.date)}</span></h2><time>${esc(date(r.time))}</time></header>${reportCard(r)}</article>` : `<details class="report-card report-history" data-report-key="${esc(r.id || String(r.time))}"><summary><span>${esc(r.label)}</span><time>${esc(date(r.time))}</time></summary>${reportCard(r)}</details>`)).join('') : empty('暂无归档汇总', '点击“手动归档”保存已结束事项并调用 AI 分析；自动执行时间可在设置中调整。')}</div>`,
+    `<div class="page report-page">${failureBanner}${attemptBanner}${reports.length ? reports.map((r, i) => (i === 0 ? `<article class="report-card" data-report-key="${esc(r.id || String(r.time))}"><header><div class="tiny">最新汇总</div><h2>${esc(r.label)} <span>${esc(r.date)}</span></h2><time>${esc(date(r.time))}</time></header>${reportCard(r)}</article>` : `<details class="report-card report-history" data-report-key="${esc(r.id || String(r.time))}"><summary><span>${esc(r.label)}</span><time>${esc(date(r.time))}</time></summary>${reportCard(r)}</details>`)).join('') : empty('暂无归档汇总', '点击“手动归档”保存已结束事项并调用 AI 分析；自动执行时间可在设置中调整。')}</div>`,
   );
 }
 
@@ -69,6 +77,7 @@ const actionNames = {
   settings: '修改设置',
   manual_edit: '人工编辑 / 补建',
   manual_status: '人工修改状态',
+  defer_resumed: '延后到期恢复处理',
   ai_create: 'AI 新建事项',
   ai_update: 'AI 更新事项',
   merge: '合并事项',

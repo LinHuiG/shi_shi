@@ -7,6 +7,80 @@ use crate::work_state::WorkSchedule;
 use chrono::{NaiveDate, TimeZone, Utc};
 use std::collections::BTreeMap;
 
+pub fn task(id: impl Into<String>, title: impl Into<String>) -> crate::model::Task {
+    crate::model::Task {
+        id: id.into(),
+        title: title.into(),
+        ..Default::default()
+    }
+}
+
+pub fn message(id: impl Into<String>, text: impl Into<String>, time: i64) -> crate::model::Message {
+    crate::model::Message {
+        id: id.into(),
+        text: text.into(),
+        time,
+        ..Default::default()
+    }
+}
+
+/// One fresh synthetic application per test. The caller retains its path for
+/// restart, fault injection and cleanup after all application handles close.
+pub fn app(prefix: &str) -> (std::path::PathBuf, App) {
+    let root = std::env::temp_dir().join(format!("{prefix}-{}", crate::model::id()));
+    let app = App::load(root.clone()).expect("load isolated test application");
+    (root, app)
+}
+
+/// Bind this before the App so its directory outlives every application handle.
+/// Dereferencing exposes only the path; cloning it does not clone cleanup ownership.
+pub struct TestRoot(std::path::PathBuf);
+impl std::ops::Deref for TestRoot {
+    type Target = std::path::PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        let result = std::fs::remove_dir_all(&self.0);
+        if !std::thread::panicking() {
+            result.expect("remove isolated test directory after closing its handles");
+        }
+    }
+}
+pub fn scoped_app(prefix: &str) -> (TestRoot, App) {
+    let (root, app) = app(prefix);
+    (TestRoot(root), app)
+}
+
+/// Exercise the real line receiver with a delayed first byte and a split frame.
+pub fn fragmented_json(
+    address: std::net::SocketAddr,
+    request: &serde_json::Value,
+) -> serde_json::Value {
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::Duration;
+    assert!(address.ip().is_loopback());
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut bytes = serde_json::to_vec(request).unwrap();
+    bytes.push(b'\n');
+    for fragment in bytes.chunks(bytes.len().div_ceil(2)) {
+        std::thread::sleep(Duration::from_millis(40));
+        stream.write_all(fragment).unwrap();
+    }
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
 /// Existing commit-failure regressions now fail the SQLite commit instead of
 /// obstructing the retired JSON temporary file.
 pub fn persistence_failure(root: &std::path::Path, blocked: bool) -> Result<(), String> {

@@ -39,8 +39,9 @@ public static class ShishiProcessArguments {
 }
 try {
     $target = [IO.Path]::GetFullPath((Join-Path $InstallDir 'shishi.exe'))
-    $matches = @(Get-Process -Name shishi -ErrorAction SilentlyContinue | Where-Object {
-        $_.Path -and [string]::Equals([IO.Path]::GetFullPath($_.Path), $target, [StringComparison]::OrdinalIgnoreCase)
+    $cliTarget = [IO.Path]::GetFullPath((Join-Path $InstallDir 'ss.exe'))
+    $matches = @(Get-Process -Name shishi,ss -ErrorAction SilentlyContinue | Where-Object {
+        $_.Path -and ($target -ieq [IO.Path]::GetFullPath($_.Path) -or $cliTarget -ieq [IO.Path]::GetFullPath($_.Path))
     })
     if ($Action -eq 'Probe') {
         if ($matches.Count -gt 0) { exit 10 }
@@ -54,7 +55,7 @@ try {
             if (-not $record) { continue }
             if (-not [string]::Equals($record.ExecutablePath,$target,[StringComparison]::OrdinalIgnoreCase) -or
                 -not (Get-ShishiHelperRole $record.CommandLine)) {
-                [Console]::Error.WriteLine('The desktop or an unknown process is still using this installation. Exit Shishi from the tray and retry.')
+                [Console]::Error.WriteLine('The desktop, CLI or an unknown process is still using this installation. Close both Shishi clients and retry.')
                 exit 10
             }
         }
@@ -63,14 +64,14 @@ try {
         # Recheck identity immediately before stopping; never close another installation.
         $current = Get-Process -Id $item.Id -ErrorAction SilentlyContinue
         if ($current -and $current.StartTime -eq $item.StartTime -and
-            [string]::Equals($current.Path, $target, [StringComparison]::OrdinalIgnoreCase)) {
+            [string]::Equals($current.Path, $item.Path, [StringComparison]::OrdinalIgnoreCase)) {
             Stop-Process -InputObject $current -Force
             if (-not $current.WaitForExit(10000)) { throw 'Timed out waiting for the application to exit' }
         }
     }
     if ($Action -eq 'ReleaseHelpers') {
-        $remaining=@(Get-Process -Name shishi -ErrorAction SilentlyContinue | Where-Object {
-            $_.Path -and [string]::Equals([IO.Path]::GetFullPath($_.Path),$target,[StringComparison]::OrdinalIgnoreCase)
+        $remaining=@(Get-Process -Name shishi,ss -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and ($target -ieq [IO.Path]::GetFullPath($_.Path) -or $cliTarget -ieq [IO.Path]::GetFullPath($_.Path))
         })
         if ($remaining.Count -gt 0) {
             [Console]::Error.WriteLine('A new process opened this installation while preparing the update. Please retry.')

@@ -7,7 +7,10 @@
 //! line, `\n` terminated, with no `Content-Length` header.
 
 use serde_json::{json, Value};
-use std::fmt;
+use std::{
+    fmt,
+    io::{self, BufRead},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RequestId {
@@ -30,18 +33,14 @@ impl RequestId {
             Self::String(s) => json!(s),
         }
     }
-
-    pub fn display(&self) -> String {
-        match self {
-            Self::Number(n) => n.to_string(),
-            Self::String(s) => s.clone(),
-        }
-    }
 }
 
 impl fmt::Display for RequestId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.display())
+        match self {
+            Self::Number(n) => write!(f, "{n}"),
+            Self::String(s) => f.write_str(s),
+        }
     }
 }
 
@@ -49,7 +48,6 @@ impl fmt::Display for RequestId {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
-    pub data: Option<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,46 +67,46 @@ pub enum Incoming {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FrameError {
+    #[error("empty JSON-RPC frame")]
     EmptyLine,
+    #[error("JSON-RPC frame is {bytes} bytes (limit {limit})")]
     TooLong { bytes: usize, limit: usize },
+    #[error("JSON-RPC frame is not JSON: {0}")]
     NotJson(String),
+    #[error("JSON-RPC frame is not an object")]
     NotObject,
+    #[error("JSON-RPC frame is not version 2.0")]
     BadVersion,
+    #[error("JSON-RPC frame has no method")]
     MissingMethod,
+    #[error("JSON-RPC id must be a string or integer")]
     BadId,
+    #[error("JSON-RPC response must contain exactly one of result/error")]
     BadResponse,
-    BadRequest,
 }
 
-impl fmt::Display for FrameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyLine => f.write_str("empty JSON-RPC frame"),
-            Self::TooLong { bytes, limit } => {
-                write!(f, "JSON-RPC frame is {bytes} bytes (limit {limit})")
-            }
-            Self::NotJson(message) => write!(f, "JSON-RPC frame is not JSON: {message}"),
-            Self::NotObject => f.write_str("JSON-RPC frame is not an object"),
-            Self::BadVersion => f.write_str("JSON-RPC frame is not version 2.0"),
-            Self::MissingMethod => f.write_str("JSON-RPC frame has no method"),
-            Self::BadId => f.write_str("JSON-RPC id must be a string or integer"),
-            Self::BadResponse => {
-                f.write_str("JSON-RPC response must contain exactly one of result/error")
-            }
-            Self::BadRequest => f.write_str("JSON-RPC request is missing a method"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
-
-fn parse_params(value: Option<&Value>) -> Value {
+fn parse_params(value: Option<Value>) -> Value {
     match value {
         None | Some(Value::Null) => json!({}),
-        Some(v) => v.clone(),
+        Some(v) => v,
     }
+}
+
+/// Retain at most `limit` bytes, consume the whole line, and report its full size.
+/// Callers either reject oversized frames or retain their prefix as diagnostics.
+pub(crate) fn read_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+    limit: usize,
+) -> io::Result<usize> {
+    line.clear();
+    let bytes = io::Read::take(&mut *reader, limit as u64).read_until(b'\n', line)?;
+    if bytes == limit && !line.ends_with(b"\n") {
+        return Ok(bytes.saturating_add(reader.skip_until(b'\n')?));
+    }
+    Ok(bytes)
 }
 
 /// Decode exactly one line. Batch arrays and JSON-RPC 1.0 are rejected: ACP
@@ -136,22 +134,24 @@ pub fn decode_line(line: &[u8], max_bytes: usize) -> Result<Incoming, FrameError
         }
         FrameError::NotJson(detail)
     })?;
-    let object = value.as_object().ok_or(FrameError::NotObject)?;
+    let Value::Object(mut object) = value else {
+        return Err(FrameError::NotObject);
+    };
     if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         return Err(FrameError::BadVersion);
     }
 
-    let method = object.get("method").and_then(Value::as_str);
-    let id_value = object.get("id");
-    let has_id = id_value.is_some_and(|value| !value.is_null());
+    let method = object.remove("method");
+    let id_value = object.remove("id");
+    let has_id = id_value.as_ref().is_some_and(|value| !value.is_null());
 
-    if let Some(method) = method {
+    if let Some(method) = method.as_ref().and_then(Value::as_str) {
         if method.is_empty() || method.len() > 256 {
             return Err(FrameError::MissingMethod);
         }
-        let params = parse_params(object.get("params"));
+        let params = parse_params(object.remove("params"));
         if has_id {
-            let id = RequestId::from_value(id_value.unwrap()).ok_or(FrameError::BadId)?;
+            let id = RequestId::from_value(&id_value.unwrap()).ok_or(FrameError::BadId)?;
             Ok(Incoming::Request {
                 id,
                 method: method.to_owned(),
@@ -165,14 +165,9 @@ pub fn decode_line(line: &[u8], max_bytes: usize) -> Result<Incoming, FrameError
         }
     } else {
         let id_value = id_value.ok_or(FrameError::BadResponse)?;
-        let id = RequestId::from_value(id_value).ok_or(FrameError::BadId)?;
-        let result = object.get("result");
-        let error = object.get("error");
-        match (result, error) {
-            (Some(result), None) => Ok(Incoming::Response {
-                id,
-                result: Ok(result.clone()),
-            }),
+        let id = RequestId::from_value(&id_value).ok_or(FrameError::BadId)?;
+        let result = match (object.remove("result"), object.remove("error")) {
+            (Some(result), None) => Ok(result),
             (None, Some(error)) => {
                 let error = error.as_object().ok_or(FrameError::BadResponse)?;
                 let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32603);
@@ -183,17 +178,11 @@ pub fn decode_line(line: &[u8], max_bytes: usize) -> Result<Incoming, FrameError
                     .chars()
                     .take(512)
                     .collect();
-                Ok(Incoming::Response {
-                    id,
-                    result: Err(RpcError {
-                        code,
-                        message,
-                        data: error.get("data").cloned(),
-                    }),
-                })
+                Err(RpcError { code, message })
             }
-            _ => Err(FrameError::BadResponse),
-        }
+            _ => return Err(FrameError::BadResponse),
+        };
+        Ok(Incoming::Response { id, result })
     }
 }
 
@@ -242,6 +231,54 @@ mod tests {
 
     fn id(value: i64) -> RequestId {
         RequestId::Number(value)
+    }
+
+    #[test]
+    fn bounded_reader_preserves_frames_and_drains_oversized_lines_across_chunks() {
+        use std::io::{BufReader, Read};
+        struct Interrupted<'a>(&'a [u8], bool);
+        impl Read for Interrupted<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.1 = !self.1;
+                if self.1 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    self.0.read(buffer)
+                }
+            }
+        }
+        let input = "\n中🙂文\r\nlonger than the limit\n尾".as_bytes();
+        for capacity in [1, 2, 7, 64] {
+            for limit in [0, 1, 2, 7, 64] {
+                let mut reader = BufReader::with_capacity(capacity, Interrupted(input, false));
+                let mut line = vec![];
+                for expected in input.split_inclusive(|b| *b == b'\n') {
+                    assert_eq!(
+                        read_line(&mut reader, &mut line, limit).unwrap(),
+                        expected.len()
+                    );
+                    assert_eq!(line, &expected[..expected.len().min(limit)]);
+                    assert!(line.len() <= limit);
+                }
+                assert_eq!(read_line(&mut reader, &mut line, limit).unwrap(), 0);
+                assert!(line.is_empty());
+            }
+        }
+        struct Failed;
+        impl Read for Failed {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        for limit in [2, 8] {
+            let mut reader = BufReader::new((&b"prefix"[..]).chain(Failed));
+            assert_eq!(
+                read_line(&mut reader, &mut vec![], limit)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::BrokenPipe
+            );
+        }
     }
 
     #[test]

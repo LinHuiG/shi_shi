@@ -36,24 +36,26 @@ impl App {
         self.update_run(&run.id, |r| {
             r.transport = "desktop".into();
             r.status = "submitting".into();
-            r.rounds.push(Round {
-                id: round_id.clone(),
-                question: prompt.into(),
-                status: "submitting".into(),
-                created: now(),
-                reserved: true,
-                ..Default::default()
-            });
+            r.rounds.push(
+                Round {
+                    id: round_id.clone(),
+                    question: prompt.into(),
+                    status: "submitting".into(),
+                    created: now(),
+                    reserved: true,
+                    ..Default::default()
+                }
+                .into(),
+            );
         })?;
-        let bridge = self.desktop(&self.run_connection(run)?);
+        let bridge = self.desktop(self.run_connection(run)?);
         self.ensure_run_open(&run.id)?;
         let result = bridge.create(&run.cwd, title, prompt, &run.model, &run.effort, context).and_then(|result| {
-            if result["threadId"].as_str().is_some_and(|s| uuid::Uuid::parse_str(s).is_ok()) { Ok(result) }
-            else { Err("提交结果待核实：桌面没有返回正式会话编号；请核对 Codex 后恢复同步，勿重复创建".into()) }
+            result["threadId"].as_str().filter(|s| uuid::Uuid::parse_str(s).is_ok())
+                .map(str::to_owned).ok_or_else(|| "提交结果待核实：桌面没有返回正式会话编号；请核对 Codex 后恢复同步，勿重复创建".into())
         });
         match result {
-            Ok(result) => {
-                let thread = result["threadId"].as_str().filter(|s| uuid::Uuid::parse_str(s).is_ok()).ok_or("提交结果待核实：桌面没有返回正式会话编号；请核对 Codex 后恢复同步，勿重复创建")?;
+            Ok(thread) => {
                 // Persist an acknowledged ID even if local completion happened
                 // while create was in flight. Never resurrect its watching flag.
                 let mut state = self.state.lock().unwrap();
@@ -64,7 +66,7 @@ impl App {
                     .iter_mut()
                     .find(|r| r.id == run.id)
                     .ok_or("处置记录不存在")?;
-                current.thread_id = thread.into();
+                current.thread_id = thread.clone();
                 if !current.stop_requested {
                     current.status = "inProgress".into();
                     current.error.clear();
@@ -103,7 +105,7 @@ impl App {
         }
         let _context = context_config(self, run)?;
         let snapshot = self
-            .desktop(&self.run_connection(run)?)
+            .desktop(self.run_connection(run)?)
             .read(&run.thread_id)?;
         self.followup_target(run)?;
         let busy = snapshot["thread"]["status"]["type"] == "active"
@@ -113,7 +115,7 @@ impl App {
         let cfg = if busy {
             self.state.lock().unwrap().config.for_kind("handling")
         } else {
-            self.reserve_ai(AiMode::Manual, None)?.for_kind("handling")
+            self.reserve_ai(AiMode::Manual)?.for_kind("handling")
         };
         let same_connection = ai_backend::connection(&cfg).ok().map(|c| c.cache_key())
             == Some(self.run_connection(run)?.cache_key());
@@ -137,14 +139,17 @@ impl App {
                     });
                 }
             } else {
-                r.rounds.push(Round {
-                    id: input_id.clone(),
-                    question: text.into(),
-                    status: "submitting".into(),
-                    reserved: true,
-                    created: now(),
-                    ..Default::default()
-                });
+                r.rounds.push(
+                    Round {
+                        id: input_id.clone(),
+                        question: text.into(),
+                        status: "submitting".into(),
+                        reserved: true,
+                        created: now(),
+                        ..Default::default()
+                    }
+                    .into(),
+                );
             }
             r.status = "submitting".into();
             r.error.clear();
@@ -152,7 +157,7 @@ impl App {
         })?;
         self.followup_target(run)?;
         let result =
-            self.desktop(&self.run_connection(run)?)
+            self.desktop(self.run_connection(run)?)
                 .send(&run.thread_id, text, model, effort);
         let uncertain = result
             .as_ref()
@@ -202,32 +207,23 @@ impl App {
     /// Called independently of the submission lock. A blocked read cannot keep
     /// the composer or local finish action locked.
     pub fn handling_sync_desktop(&self, task: Option<&str>) -> bool {
-        let runs = self
-            .state
-            .lock()
-            .unwrap()
-            .handling
-            .runs
-            .iter()
-            .filter(|r| {
-                is_desktop(r)
-                    && !r.stop_requested
-                    && r.watching
-                    && !r.thread_id.is_empty()
-                    && task.is_none_or(|t| t == r.task_id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let runs = self.state.lock().unwrap().handling.runs.clone();
         let mut changed = false;
-        for run in runs {
+        for run in runs.iter().filter(|r| {
+            is_desktop(r)
+                && !r.stop_requested
+                && r.watching
+                && !r.thread_id.is_empty()
+                && task.is_none_or(|t| t == r.task_id)
+        }) {
             let mut reading = self.desktop_reading.lock().unwrap();
             if !reading.insert(run.id.clone()) {
                 continue;
             }
             drop(reading);
             let result = self
-                .run_connection(&run)
-                .and_then(|c| self.desktop(&c).read(&run.thread_id));
+                .run_connection(run)
+                .and_then(|c| self.desktop(c).read(&run.thread_id));
             // Success and failure share the same stale-read boundary. Applying
             // once under the state lock preserves concurrent edits to the run.
             changed |= self
@@ -259,27 +255,25 @@ impl App {
         changed
     }
     pub(super) fn finish_desktop(&self, p: &Value) -> Result<Value, String> {
-        let mut state = self.state.lock().unwrap();
-        let mut next = state.clone();
-        let run = next
-            .handling
-            .runs
-            .iter_mut()
-            .find(|r| r.id == str_at(p, "run_id") && r.task_id == str_at(p, "task_id"))
-            .ok_or("处置目标已变化，请重新核对")?;
-        if !is_desktop(run) {
-            return Err("不是 Codex 桌面处置".into());
-        }
-        run.stop_requested = true;
-        run.watching = false;
-        run.status = "ended".into();
-        run.requests.clear();
-        run.error.clear();
-        run.waiting_on.clear();
-        run.updated = now();
-        self.save(&next)?;
-        *state = next;
-        Ok(json!(true))
+        self.commit_state(|next| {
+            let run = next
+                .handling
+                .runs
+                .iter_mut()
+                .find(|r| r.id == str_at(p, "run_id") && r.task_id == str_at(p, "task_id"))
+                .ok_or("处置目标已变化，请重新核对")?;
+            if !is_desktop(run) {
+                return Err("不是 Codex 桌面处置".into());
+            }
+            run.stop_requested = true;
+            run.watching = false;
+            run.status = "ended".into();
+            run.requests.clear();
+            run.error.clear();
+            run.waiting_on.clear();
+            run.updated = now();
+            Ok(json!(true))
+        })
     }
     pub(super) fn desktop_reconnect(&self, p: &Value) -> Result<Value, String> {
         let run = self.run(str_at(p, "task_id"))?;
@@ -291,7 +285,7 @@ impl App {
         };
         uuid::Uuid::parse_str(thread)
             .map_err(|_| "请核对 Codex 中已创建的会话编号；不会重复创建")?;
-        let snapshot = self.desktop(&self.run_connection(&run)?).read(thread)?;
+        let snapshot = self.desktop(self.run_connection(&run)?).read(thread)?;
         if !crate::desktop_bridge::same_path(str_at(&snapshot["thread"], "cwd"), &run.cwd) {
             return Err("此会话不属于本次所选目录".into());
         }
@@ -310,34 +304,11 @@ fn apply_desktop_snapshot(run: &mut Run, snapshot: &Value) {
     if run.stop_requested {
         return;
     }
-    let mut turns = snapshot["turns"].clone();
-    // Preserve the wire distinction in storage while projecting delegated text
-    // through the same bounded visible-input history as native desktop input.
-    for turn in turns.as_array_mut().into_iter().flatten() {
-        for item in turn["items"].as_array_mut().into_iter().flatten() {
-            if item["type"] != "functionCallOutput" {
-                continue;
-            }
-            let raw = item["output"]
-                .as_str()
-                .or_else(|| item["output"]["text"].as_str())
-                .unwrap_or("");
-            if !raw.starts_with("<codex_delegation>") {
-                continue;
-            }
-            if let Some((start, end)) = raw.find("<input>").zip(raw.rfind("</input>")) {
-                if end >= start + 7 {
-                    let text = raw[start + 7..end].to_owned();
-                    *item = json!({"type":"userMessage","id":item["id"],"origin":"delegation","content":[{"type":"text","text":text}]});
-                }
-            }
-        }
-    }
     if run.model_reported == Some(true) && run.last_reported_model.is_empty() {
         run.last_reported_model = run.model.clone();
         run.last_reported_effort = run.effort.clone();
     }
-    apply_history(run, &turns, &snapshot["thread"]);
+    apply_history(run, &snapshot["turns"], &snapshot["thread"]);
     run.sync_notice = snapshot["read_notice"].as_str().unwrap_or("").into();
     run.rounds
         .sort_by_key(|r| r.started_at.unwrap_or(r.created));

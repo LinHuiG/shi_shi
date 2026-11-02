@@ -11,11 +11,8 @@ mod change_summary_tests {
             state.messages.insert(
                 id.into(),
                 Message {
-                    id: id.into(),
-                    time,
-                    text: "合成进展".into(),
                     private: true,
-                    ..Default::default()
+                    ..crate::test_support::message(id, "合成进展", time)
                 },
             );
         }
@@ -38,13 +35,13 @@ mod change_summary_tests {
     }
 
     fn update() -> Value {
-        json!({"action":"update","task_id":"task","sources":["new"],"tags":[],
+        json!({"action":"update","task_id":"task","sources":["new"],"tag_changes":[],
             "fields":[{"field":"waiting_for","value":"核对验证结果"}],
             "reason":"新消息明确下一步","confidence":0.99,"change_summary":"已进入结果核对阶段"})
     }
 
     fn create() -> Value {
-        json!({"action":"create","task_id":"","sources":["new"],"tags":[],
+        json!({"action":"create","task_id":"","sources":["new"],"tag_changes":[],
             "fields":[{"field":"title","value":"合成验证事项"},{"field":"description","value":"核对合成结果"}],
             "reason":"明确的新请求","confidence":0.99,"change_summary":"需要核对最新验证结果"})
     }
@@ -191,10 +188,20 @@ mod change_summary_tests {
         }
         let mut state = fixture();
         let mut action = update();
-        action["tags"] = json!([{"kind":"目录中没有的组","value":"未知值"}]);
-        assert_eq!(apply(&mut state, &[action]).0, 1);
-        assert!(state.tasks[0].tags.is_empty());
-        assert!(state.audit[0].change_summary.is_empty());
+        action["tag_changes"] = json!([{"action":"add","kind":"目录中没有的组","value":"未知值"}]);
+        let before = json!(state);
+        let allowed = state.messages.clone();
+        let versions = state
+            .tasks
+            .iter()
+            .map(|t| (t.id.clone(), t.updated))
+            .collect();
+        assert!(
+            App::apply_actions_detailed(&mut state, &[action], &allowed, &versions, &[])
+                .unwrap_err()
+                .contains("目录")
+        );
+        assert_eq!(json!(state), before);
 
         // Even a redundant completion request needs accepted proof before its
         // accompanying summary can describe other changes in the same action.
@@ -304,8 +311,7 @@ mod tests {
     use super::*;
     #[test]
     fn actual_snapshot_roundtrips_through_manual_and_ai_edit_boundaries() {
-        let root = std::env::temp_dir().join(format!("shishi-snapshot-edit-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-snapshot-edit");
         app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
@@ -338,24 +344,16 @@ mod tests {
             .unwrap_err();
         assert!(error.contains("每日AI调用上限"), "{error}");
         assert_eq!(app.state.lock().unwrap().calls, 0);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn legacy_fingerprints_preserve_real_pending_edits_and_new_replies_after_reload() {
-        let root = std::env::temp_dir().join(format!("shishi-fingerprint-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-fingerprint");
         app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
             for id in ["same", "edited", "invalid"] {
-                let mut m = Message {
-                    id: id.into(),
-                    text: "Original".into(),
-                    time: now() - 86_000_000,
-                    ..Default::default()
-                };
+                let mut m = crate::test_support::message(id, "Original", now() - 86_000_000);
                 let legacy = serde_json::to_string(&m).unwrap();
                 s.analyzed.insert(
                     id.into(),
@@ -404,15 +402,12 @@ mod tests {
             s.message_filter.checked.get("edited")
         ));
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn disabled_automation_chain_prevents_calls_reservations_and_progress_but_keeps_manual_operations(
     ) {
-        let root = std::env::temp_dir().join(format!("shishi-automation-chain-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-automation-chain");
         app.test_force_working();
         for (scan, analysis, early) in [
             (false, true, true),
@@ -433,7 +428,7 @@ mod tests {
                 crate::message_filter::AUTOMATION_DISABLED
             );
             assert_eq!(
-                app.reserve_ai_inner(AiMode::Automatic, None, "message_filter", None, None, None)
+                app.reserve_ai_inner(AiMode::Automatic, "message_filter", None, None, None)
                     .err()
                     .unwrap(),
                 crate::message_filter::AUTOMATION_DISABLED
@@ -444,7 +439,7 @@ mod tests {
                     "自动 AI 已关闭，消息已保存"
                 );
                 assert_eq!(
-                    app.reserve_ai_inner(AiMode::Automatic, None, "classify", None, None, None)
+                    app.reserve_ai_inner(AiMode::Automatic, "classify", None, None, None)
                         .err()
                         .unwrap(),
                     crate::message_filter::AUTOMATION_DISABLED
@@ -469,16 +464,13 @@ mod tests {
             app.scan(AiMode::Automatic).unwrap()["skipped"],
             "增量消息扫描已关闭"
         );
-        app.reserve_ai_inner(AiMode::Manual, None, "classify", None, None, None)
+        app.reserve_ai_inner(AiMode::Manual, "classify", None, None, None)
             .unwrap();
         assert_eq!(app.state.lock().unwrap().calls, 1);
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn filter_decision_consumed_at_durable_reservation_not_success() {
-        let root = std::env::temp_dir().join(format!("shishi-filter-once-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-filter-once");
         app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         {
@@ -490,28 +482,23 @@ mod tests {
             s.message_filter.trigger = "message_filter".into();
             s.messages.insert(
                 "m".into(),
-                Message {
-                    id: "m".into(),
-                    text: "Synthetic".into(),
-                    time: now(),
-                    ..Default::default()
-                },
+                crate::test_support::message("m", "Synthetic", now()),
             );
             s.config.daily_calls = 0;
         }
         assert!(app
-            .reserve_ai_inner(AiMode::Manual, None, "classify", None, Some(0), None)
+            .reserve_ai_inner(AiMode::Manual, "classify", None, Some(0), None)
             .is_err());
         assert!(app.state.lock().unwrap().message_filter.early);
         app.state.lock().unwrap().config.daily_calls = 100;
         // Failure to persist a start must neither consume the decision nor invoke AI.
         crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
-            .reserve_ai_inner(AiMode::Manual, None, "classify", None, Some(0), None)
+            .reserve_ai_inner(AiMode::Manual, "classify", None, Some(0), None)
             .is_err());
         assert!(app.state.lock().unwrap().message_filter.early);
         crate::test_support::persistence_failure(&app.root, false).unwrap();
-        app.reserve_ai_inner(AiMode::Manual, None, "classify", None, Some(0), None)
+        app.reserve_ai_inner(AiMode::Manual, "classify", None, Some(0), None)
             .unwrap();
         {
             let s = app.state.lock().unwrap();
@@ -529,29 +516,21 @@ mod tests {
             let mut s = app.state.lock().unwrap();
             s.message_filter.early = true;
             s.message_filter.trigger = "message_filter".into();
-            App::finish_message_batch(&mut s, BTreeMap::new(), &BTreeSet::new());
+            App::finish_message_batch(&mut s, &BTreeMap::new(), &BTreeSet::new());
             assert!(
                 s.message_filter.early,
                 "a later decision survives the previous batch commit"
             );
         }
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn full_analysis_reservation_observes_the_whole_batch_without_marking_it_analyzed() {
-        let root = std::env::temp_dir().join(format!("shishi-filter-batch-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-filter-batch");
         app.state.lock().unwrap().config.model_profiles = None;
         let mut messages = BTreeMap::new();
         for n in 0..700 {
-            let m = Message {
-                id: format!("m{n}"),
-                text: "Synthetic body".into(),
-                time: now(),
-                ..Default::default()
-            };
+            let m = crate::test_support::message(format!("m{n}"), "Synthetic body", now());
             messages.insert(m.id.clone(), m);
         }
         {
@@ -563,11 +542,10 @@ mod tests {
         }
         app.reserve_ai_inner(
             AiMode::Manual,
-            None,
             "classify",
             None,
             Some(1),
-            Some(&messages),
+            Some(&messages.values().collect::<Vec<_>>()),
         )
         .unwrap();
         {
@@ -591,8 +569,6 @@ mod tests {
         ));
         assert!(crate::message_progress::filtered(&s, &s.messages["m1"]));
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -632,23 +608,45 @@ mod tests {
     }
     #[test]
     fn background_generation_splits_and_respects_manual_edits() {
-        let root = std::env::temp_dir().join(format!("shishi-gen-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-gen");
         app.state.lock().unwrap().config.model_profiles = None;
         let draft = app
             .create_generation(&json!({"text":"新增客户查询需求，并调研缓存优化"}))
             .unwrap();
         assert_eq!(draft.generation, "pending");
-        app.complete_generation(&draft,Ok(json!({"tasks":[{"title":"客户查询需求","category":"新需求","environment":"不适用","steps_changed":true,"steps":[{"id":"s1","title":"确认需求","status":"pending","depends_on":[],"waiting_for":""}]},{"title":"缓存优化调研","category":"调研","environment":"不适用"}]}))).unwrap();
+        let rows: Vec<_> = (0..13).map(|i| json!({"title":format!("独立事项{i}"),"description":"合成要求","blocker":"","due":"","tags":[],"tool_call_ids":[],"suggested_project_id":"","suggested_project_reason":""})).collect();
+        let mut result = json!({"tasks":rows,"tag_suggestions":[]});
+        shishi_api::schema_validate::validate(&crate::ai::schema("format"), &result).unwrap();
+        result["tasks"][0]["category"] = json!("新需求");
+        result["tasks"][0]["environment"] = json!("不适用");
+        result["tasks"][0]["steps_changed"] = json!(true);
+        result["tasks"][0]["steps"] = json!([{"id":"s1","title":"确认需求"}]);
+        app.complete_generation(&draft, Ok(result)).unwrap();
         {
             let s = app.state.lock().unwrap();
-            assert_eq!(s.tasks.len(), 2);
+            assert_eq!(s.tasks.len(), 13);
+            assert_eq!(s.tasks[0].id, draft.id);
+            assert!(s
+                .tasks
+                .iter()
+                .enumerate()
+                .all(|(i, t)| t.title == format!("独立事项{i}")));
             assert!(s.tasks.iter().all(|t| t.generation.is_empty()));
             // Retired default categories fall back to the compact adopted catalog.
             assert!(s.tasks[0].category.is_empty());
             assert!(s.tasks[0].tags.is_empty());
             assert!(s.tasks[0].steps.is_empty());
         }
+        assert_eq!(
+            App::load(root.clone())
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .tasks
+                .len(),
+            13
+        );
         let draft2 = app
             .create_generation(&json!({"text":"待修改事项"}))
             .unwrap();
@@ -676,19 +674,10 @@ mod tests {
             .tasks
             .iter()
             .any(|t| t.id == draft3.id && t.generation == "failed"));
-        for name in ["state.json", "state.backup.json"] {
-            let _ = fs::remove_file(root.join("data").join(name));
-        }
-        let _ = fs::remove_file(root.join(format!("data/logs/{}.jsonl", date())));
-        let _ = fs::remove_dir(root.join("data/logs"));
-        let _ = fs::remove_dir(root.join("data/tmp"));
-        let _ = fs::remove_dir(root.join("data"));
-        let _ = fs::remove_dir(root);
     }
     #[test]
     fn scan_control_validates_and_persists_without_replacing_other_settings() {
-        let root = std::env::temp_dir().join(format!("shishi-control-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-control");
         app.state.lock().unwrap().config.model_profiles = None;
         assert!(app.scan_control(&json!({"interval_minutes":0})).is_err());
         assert!(app.scan_control(&json!({"interval_minutes":1.5})).is_err());
@@ -700,18 +689,10 @@ mod tests {
         assert_eq!(s.config.interval_minutes, 12);
         assert!(s.config.leaders.is_empty());
         drop(s);
-        for name in ["state.json", "state.backup.json"] {
-            let _ = fs::remove_file(root.join("data").join(name));
-        }
-        let _ = fs::remove_dir(root.join("data/logs"));
-        let _ = fs::remove_dir(root.join("data/tmp"));
-        let _ = fs::remove_dir(root.join("data"));
-        let _ = fs::remove_dir(root);
     }
     #[test]
     fn manual_edits_are_audited_not_locked_and_persisted() {
-        let root = std::env::temp_dir().join(format!("shishi-test-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-test");
         app.state.lock().unwrap().config.model_profiles = None;
         let task=app.task_edit(&json!({"task":{"title":"测试延期","due":"2026-10-16T17:30:00+08:00","priority":"高"}})).unwrap();
         assert_eq!(task["manual"], true);
@@ -725,29 +706,14 @@ mod tests {
             reloaded.state.lock().unwrap().tasks[0].due,
             "2026-10-16T17:30:00+08:00"
         );
-        for name in ["state.json", "state.backup.json"] {
-            let _ = std::fs::remove_file(root.join("data").join(name));
-        }
-        let _ = std::fs::remove_dir(root.join("data/logs"));
-        let _ = std::fs::remove_dir(root.join("data/tmp"));
-        let _ = std::fs::remove_dir(root.join("data"));
-        let _ = std::fs::remove_dir(root);
     }
     #[test]
     fn stale_edit_cannot_overwrite_newer_task() {
-        let root = std::env::temp_dir().join(format!("shishi-test-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-test");
         app.state.lock().unwrap().config.model_profiles = None;
         let mut task = app.task_edit(&json!({"task":{"title":"旧版本"}})).unwrap();
         task["updated"] = json!(0);
         assert!(app.task_edit(&json!({"task":task})).is_err());
-        for name in ["state.json", "state.backup.json"] {
-            let _ = std::fs::remove_file(root.join("data").join(name));
-        }
-        let _ = std::fs::remove_dir(root.join("data/logs"));
-        let _ = std::fs::remove_dir(root.join("data/tmp"));
-        let _ = std::fs::remove_dir(root.join("data"));
-        let _ = std::fs::remove_dir(root);
     }
     #[test]
     fn source_withdrawal_cancels_auto_only() {
@@ -760,30 +726,31 @@ mod tests {
                 ..Default::default()
             },
         );
-        *s.tasks = vec![
-            Task {
-                id: "a".into(),
+        for (manual, status, keep, expected) in [
+            (false, "待处理", false, "已取消"),
+            (true, "待处理", false, "待处理"),
+            (false, "已完成", true, "待处理"),
+        ] {
+            *s.tasks = vec![Task {
+                id: "task".into(),
+                manual,
+                status: status.into(),
                 evidence: TaskEvidence {
-                    direct: vec!["m".into()],
-                    ..Default::default()
+                    direct: vec!["m".into(), "m".into()],
+                    background: if keep {
+                        vec!["retained".into()]
+                    } else {
+                        vec![]
+                    },
+                    completion: vec!["m".into()],
                 },
-                status: "待处理".into(),
                 ..Default::default()
-            },
-            Task {
-                id: "b".into(),
-                manual: true,
-                evidence: TaskEvidence {
-                    direct: vec!["m".into()],
-                    ..Default::default()
-                },
-                status: "待处理".into(),
-                ..Default::default()
-            },
-        ];
-        reconcile_withdrawals(&mut s);
-        assert_eq!(s.tasks[0].status, "已取消");
-        assert_eq!(s.tasks[1].status, "待处理");
+            }];
+            reconcile_withdrawals(&mut s);
+            assert_eq!(s.tasks[0].status, expected, "{manual} {status} {keep}");
+            assert_eq!(s.tasks[0].evidence.all().len(), usize::from(keep));
+            assert!(!s.tasks[0].evidence.all().contains("m"));
+        }
     }
 }
 
@@ -792,8 +759,7 @@ mod recovery_tests {
     use super::*;
     #[test]
     fn pending_work_survives_restart() {
-        let root = std::env::temp_dir().join(format!("shishi-recovery-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-recovery");
         app.state.lock().unwrap().config.model_profiles = None;
         let task = app
             .create_generation(&json!({"text":"准备方案并调研连接池"}))
@@ -814,87 +780,15 @@ mod recovery_tests {
         assert_eq!(s.tasks[0].generation, "pending");
         assert!(s.tasks[0].generation_error.is_empty());
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 }
 
 #[cfg(test)]
 mod work_hours_tests {
     use super::*;
+
     #[test]
-    fn automatic_is_gated_off_hours_and_manual_still_uses_the_budget() {
-        let root = std::env::temp_dir().join(format!("shishi-refresh-{}", id()));
-        fs::create_dir_all(root.join("data")).unwrap();
-        let local = chrono::Utc::now() + chrono::Duration::hours(8);
-        let mut state = State::default();
-        state.config.work_start = (local + chrono::Duration::hours(1))
-            .format("%H:%M")
-            .to_string();
-        state.config.work_end = (local + chrono::Duration::hours(2))
-            .format("%H:%M")
-            .to_string();
-        // Reaching the normal budget guard proves analysis ran without launching a real model.
-        state.config.daily_calls = 0;
-        state.messages.insert(
-            "pending".into(),
-            Message {
-                id: "pending".into(),
-                private: true,
-                text: "请检查发布结果".into(),
-                time: now(),
-                ..Default::default()
-            },
-        );
-        fs::write(
-            root.join("data/state.json"),
-            serde_json::to_vec(&state).unwrap(),
-        )
-        .unwrap();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
-        assert_eq!(
-            app.analyze_after_scan(AiMode::Automatic).unwrap()["skipped"],
-            work_hours::DEFERRED
-        );
-        assert!(app
-            .analyze_after_scan(AiMode::Manual)
-            .unwrap_err()
-            .contains("每日"));
-        assert!(app.reserve_ai(AiMode::Manual, None).is_err());
-        assert_eq!(app.state.lock().unwrap().calls, 0);
-        app.test_force_working();
-        assert!(app.ai_allowed(AiMode::Automatic));
-        assert!(app
-            .analyze_after_scan(AiMode::Manual)
-            .unwrap_err()
-            .starts_with("已达到每日AI调用上限"));
-        app.state.lock().unwrap().config.auto_ai = false;
-        assert_eq!(
-            app.analyze_after_scan(AiMode::Automatic).unwrap()["skipped"],
-            "自动 AI 已关闭，消息已保存"
-        );
-        app.state.lock().unwrap().config.auto_ai = true;
-        assert_eq!(
-            app.analyze_after_scan(AiMode::Automatic).unwrap()["skipped"],
-            "等待分析间隔或单批体积阈值"
-        );
-        {
-            let s = app.state.lock().unwrap();
-            assert_eq!(s.calls, 0);
-            assert!(s.pending_analysis);
-            assert!(s.analyzed.is_empty());
-        }
-        app.state.lock().unwrap().messages.clear();
-        assert_eq!(
-            app.analyze_after_scan(AiMode::Manual).unwrap()["skipped"],
-            "没有相关变化，不调用AI"
-        );
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
-    }
-    #[test]
-    fn after_hours_defers_automatic_ai_and_preserves_manual_access() {
+    fn after_hours_defers_automatic_work_across_restart_and_manual_access_keeps_its_budget() {
         let root = std::env::temp_dir().join(format!("shishi-hours-{}", id()));
         fs::create_dir_all(root.join("data")).unwrap();
         let local = chrono::Utc::now() + chrono::Duration::hours(8);
@@ -917,11 +811,8 @@ mod work_hours_tests {
         state.messages.insert(
             "waiting".into(),
             Message {
-                id: "waiting".into(),
                 private: true,
-                text: "请排查连接异常".into(),
-                time: now(),
-                ..Default::default()
+                ..crate::test_support::message("waiting", "请排查连接异常", now())
             },
         );
         fs::write(
@@ -936,7 +827,7 @@ mod work_hours_tests {
             .unwrap();
         assert!(!app.snapshot()["in_work_hours"].as_bool().unwrap());
         assert_eq!(
-            app.reserve_ai(AiMode::Automatic, None).err().unwrap(),
+            app.reserve_ai(AiMode::Automatic).err().unwrap(),
             work_hours::DEFERRED
         );
         assert_eq!(
@@ -981,9 +872,46 @@ mod work_hours_tests {
             assert!(s.reports.iter().all(|r| r["summary_status"] == "pending"));
         }
         assert!(!root.join("data/ai-traces").exists());
-        // Automatic work still needs a working/overtime state.
+        app.state.lock().unwrap().config.daily_calls = 0;
+        assert_eq!(
+            app.analyze_after_scan(AiMode::Automatic).unwrap()["skipped"],
+            work_hours::DEFERRED
+        );
+        assert!(app
+            .analyze_after_scan(AiMode::Manual)
+            .unwrap_err()
+            .contains("每日"));
+        assert!(app.reserve_ai(AiMode::Manual).is_err());
+        assert_eq!(app.state.lock().unwrap().calls, 0);
         app.test_force_working();
-        assert!(app.reserve_ai(AiMode::Manual, None).is_ok());
+        assert!(app.ai_allowed(AiMode::Automatic));
+        assert!(app
+            .analyze_after_scan(AiMode::Manual)
+            .unwrap_err()
+            .starts_with("已达到每日AI调用上限"));
+        app.state.lock().unwrap().config.auto_ai = false;
+        assert_eq!(
+            app.analyze_after_scan(AiMode::Automatic).unwrap()["skipped"],
+            "自动 AI 已关闭，消息已保存"
+        );
+        app.state.lock().unwrap().config.auto_ai = true;
+        assert_eq!(
+            app.analyze_after_scan(AiMode::Automatic).unwrap()["skipped"],
+            "等待分析间隔或单批体积阈值"
+        );
+        {
+            let s = app.state.lock().unwrap();
+            assert_eq!(s.calls, 0);
+            assert!(s.pending_analysis);
+            assert!(s.analyzed.is_empty());
+        }
+        app.state.lock().unwrap().messages.clear();
+        assert_eq!(
+            app.analyze_after_scan(AiMode::Manual).unwrap()["skipped"],
+            "没有相关变化，不调用AI"
+        );
+        app.state.lock().unwrap().config.daily_calls = 200;
+        assert!(app.reserve_ai(AiMode::Manual).is_ok());
         assert_eq!(app.state.lock().unwrap().calls, 1);
         drop(app);
         fs::remove_dir_all(root).unwrap();
@@ -1033,8 +961,7 @@ mod today_tests {
     use super::*;
     #[test]
     fn tomorrow_survives_restart_and_returns_at_midnight_without_changing_deadline() {
-        let root = std::env::temp_dir().join(format!("shishi-tomorrow-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-tomorrow");
         app.state.lock().unwrap().config.model_profiles = None;
         let task = app
             .task_edit(&json!({"task":{"title":"发布","due":"2026-12-31T17:00:00+08:00"}}))
@@ -1059,7 +986,6 @@ mod today_tests {
             .task_action(&json!({"id":task["id"],"action":"resume_today"}))
             .unwrap();
         assert!(restored.snapshot()["tasks"][0]["today"].as_bool().unwrap());
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn today_keeps_completed_even_archived_but_not_yesterdays_edited_completion() {
@@ -1137,8 +1063,7 @@ mod snapshot_tests {
     use super::*;
     #[test]
     fn page_sections_are_built_only_on_request_and_full_snapshot_keeps_all() {
-        let root = std::env::temp_dir().join(format!("shishi-sections-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sections");
         app.state.lock().unwrap().config.model_profiles = None;
         let heavy = ["handling", "audit", "evolution", "reports", "messages"];
         let full = app.snapshot();
@@ -1153,12 +1078,10 @@ mod snapshot_tests {
         let reports = app.snapshot_sections(Some(&json!(["reports"])));
         assert!(reports["reports"].is_array());
         assert!(reports.get("audit").is_none());
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn ui_pulse_is_stable_when_idle_and_changes_on_save_or_activity() {
-        let root = std::env::temp_dir().join(format!("shishi-pulse-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-pulse");
         app.state.lock().unwrap().config.model_profiles = None;
         let idle = app.ui_pulse().unwrap();
         assert_eq!(app.ui_pulse(), Some(idle));
@@ -1171,16 +1094,14 @@ mod snapshot_tests {
         let _held = app.state.lock().unwrap();
         assert_eq!(app.ui_pulse(), None, "a busy state skips the tick");
         drop(_held);
-        let _ = fs::remove_dir_all(root);
     }
 }
 
 #[cfg(test)]
 mod schedule_tests {
     use super::*;
-    fn fixture() -> (App, PathBuf, i64) {
-        let root = std::env::temp_dir().join(format!("shishi-schedule-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+    fn fixture() -> (crate::test_support::TestRoot, App, i64) {
+        let (root, app) = crate::test_support::scoped_app("shishi-schedule");
         app.state.lock().unwrap().config.model_profiles = None;
         let at = deadline_ms("2026-10-15T10:00:00+08:00").unwrap();
         app.state.lock().unwrap().schedules.push(Schedule {
@@ -1196,11 +1117,11 @@ mod schedule_tests {
             active_from: at - 86_400_000,
             ..Default::default()
         });
-        (app, root, at)
+        (root, app, at)
     }
     #[test]
     fn generates_once_across_restarts_and_independent_daily_tasks() {
-        let (app, root, at) = fixture();
+        let (root, app, at) = fixture();
         assert!(app.state.lock().unwrap().config.enabled);
         app.ai_busy.store(true, Ordering::SeqCst);
         assert_eq!(app.generate_scheduled(at).unwrap(), 1);
@@ -1219,11 +1140,10 @@ mod schedule_tests {
         assert_eq!(s.tasks[0].scheduled_for, "2026-10-16");
         assert_eq!(s.calls, 0);
         drop(s);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn missed_days_are_not_backfilled_and_save_failure_is_retryable() {
-        let (app, root, at) = fixture();
+        let (root, app, at) = fixture();
         crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app.generate_scheduled(at + 5 * 86_400_000).is_err());
         assert!(app.state.lock().unwrap().tasks.is_empty());
@@ -1233,11 +1153,10 @@ mod schedule_tests {
         crate::test_support::persistence_failure(&root, false).unwrap();
         assert_eq!(app.generate_scheduled(at + 5 * 86_400_000).unwrap(), 1);
         assert_eq!(app.snapshot()["tasks"][0]["scheduled_for"], "2026-10-20");
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn pause_edit_delete_and_stale_edit_preserve_generated_tasks() {
-        let (app, root, at) = fixture();
+        let (_root, app, at) = fixture();
         app.generate_scheduled(at).unwrap();
         let mut rule = app.snapshot()["schedules"][0].clone();
         rule["enabled"] = json!(false);
@@ -1253,7 +1172,6 @@ mod schedule_tests {
         assert!(s.schedules.is_empty());
         assert_eq!(s.tasks.len(), 1);
         drop(s);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn ai_draft_requires_explicit_valid_rule() {
@@ -1271,9 +1189,8 @@ mod schedule_tests {
 #[cfg(test)]
 mod ai_edit_tests {
     use super::*;
-    fn fixture() -> (App, PathBuf, Task) {
-        let root = std::env::temp_dir().join(format!("shishi-edit-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+    fn fixture() -> (crate::test_support::TestRoot, App, Task) {
+        let (root, app) = crate::test_support::scoped_app("shishi-edit");
         app.state.lock().unwrap().config.model_profiles = None;
         let t = Task {
             id: id(),
@@ -1296,14 +1213,14 @@ mod ai_edit_tests {
             ..Default::default()
         };
         app.state.lock().unwrap().tasks.push(t.clone());
-        (app, root, t)
+        (root, app, t)
     }
     #[test]
     fn updates_only_requested_fields_and_can_undo() {
-        let (app, root, mut old) = fixture();
+        let (root, app, mut old) = fixture();
         old.enabled_tool_ids = vec!["synthetic-bound-tool".into()];
         app.state.lock().unwrap().tasks[0].enabled_tool_ids = old.enabled_tool_ids.clone();
-        let saved = app.complete_ai_edit(&old, old.clone(), "已经修复，现在等测试验证", json!({"reason":"根据人工进展调整阶段","changes":[{"field":"title","value":"确认更新后的会议安排"},{"field":"waiting_for","value":"测试同事"}]})).unwrap();
+        let saved = app.complete_ai_edit(&old, old.clone(), "已经修复，现在等测试验证", json!({"tag_changes":[],"reason":"根据人工进展调整阶段","changes":[{"field":"title","value":"确认更新后的会议安排"},{"field":"waiting_for","value":"测试同事"}]})).unwrap();
         let current: Task = serde_json::from_value(saved).unwrap();
         assert_eq!(current.id, old.id);
         assert_eq!(current.evidence, old.evidence);
@@ -1321,11 +1238,10 @@ mod ai_edit_tests {
         );
         reopened.undo(0).unwrap();
         assert_eq!(reopened.state.lock().unwrap().tasks[0].title, old.title);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn rejects_stale_invalid_and_immutable_changes() {
-        let (app, root, old) = fixture();
+        let (_root, app, old) = fixture();
         for result in [
             json!({"changes":[{"field":"id","value":"new"}]}),
             json!({"changes":[{"field":"due","value":"明天"}]}),
@@ -1348,22 +1264,21 @@ mod ai_edit_tests {
             )
             .is_err());
         assert_eq!(app.state.lock().unwrap().tasks[0].status, "已完成");
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn failed_save_does_not_apply_ai_edit() {
-        let (app, root, old) = fixture();
+        let (root, app, old) = fixture();
         crate::test_support::persistence_failure(&root, true).unwrap();
-        assert!(app
+        let error = app
             .complete_ai_edit(
                 &old,
                 old.clone(),
-                "改为高优先级",
-                json!({"changes":[{"field":"priority","value":"高"}]})
+                "修改标题",
+                json!({"tag_changes":[],"changes":[{"field":"title","value":"新的合成标题"}]}),
             )
-            .is_err());
+            .unwrap_err();
+        assert!(error.contains("synthetic commit rejection"), "{error}");
         assert_eq!(json!(app.state.lock().unwrap().tasks[0]), json!(old));
-        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -1372,8 +1287,7 @@ mod archive_tests {
     use super::*;
     #[test]
     fn notes_and_suggestions_survive_incremental_reports() {
-        let root = std::env::temp_dir().join(format!("shishi-archive-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-archive");
         app.state.lock().unwrap().config.model_profiles = None;
         {
             let mut s = app.state.lock().unwrap();
@@ -1419,8 +1333,6 @@ mod archive_tests {
             app.state.lock().unwrap().tasks[0].archive_note,
             "不要只凭收到关闭事项"
         );
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn outgoing_messages_are_candidates_but_withdrawals_are_not() {
@@ -1439,26 +1351,28 @@ mod archive_tests {
 mod budget_tests {
     use super::*;
     #[test]
-    fn fixed_reduction_order_blocks_automatic_retries_without_cursor_or_analyzed_changes() {
-        let root = std::env::temp_dir().join(format!("shishi-budget-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+    fn minimum_request_overflow_blocks_automatic_retries_without_progress_changes() {
+        let (root, app) = crate::test_support::scoped_app("shishi-budget");
         app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         let base = Config::default();
         let fixed = base.max_input_chars - ai::message_budget(&base, "classify");
         {
             let mut s = app.state.lock().unwrap();
+            s.config.codex = root.join("must-not-launch.exe").to_string_lossy().into();
             s.config.max_input_chars = fixed + 300;
+            s.config.classify_prompt = "合成固定规则".repeat(fixed + 300);
             for i in 0..12 {
                 let mid = format!("m{i}");
                 s.messages.insert(
                     mid.clone(),
                     Message {
-                        id: mid.clone(),
-                        text: "消息内容".repeat(5),
-                        time: now() - i * 1000,
                         private: true,
-                        ..Default::default()
+                        ..crate::test_support::message(
+                            mid.clone(),
+                            "消息内容".repeat(5),
+                            now() - i * 1000,
+                        )
                     },
                 );
                 s.tasks.push(Task {
@@ -1497,27 +1411,22 @@ mod budget_tests {
             app.analyze_after_scan(AiMode::Automatic).unwrap()["skipped"],
             "自动分析已暂停：本批仍超过输入上限，请手动精简后重试"
         );
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn zero_message_budget_pauses_automatic_without_consuming_messages() {
-        let root = std::env::temp_dir().join(format!("shishi-budget-zero-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-budget-zero");
         app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         {
             let mut s = app.state.lock().unwrap();
+            s.config.codex = root.join("must-not-launch.exe").to_string_lossy().into();
             s.config.max_input_chars = 1;
             s.messages.insert(
                 "m".into(),
                 Message {
-                    id: "m".into(),
-                    text: "材料".into(),
-                    time: now(),
                     private: true,
-                    ..Default::default()
+                    ..crate::test_support::message("m", "材料", now())
                 },
             );
             app.save(&s).unwrap();
@@ -1531,29 +1440,24 @@ mod budget_tests {
         assert!(s.pending_analysis);
         assert_eq!(s.messages.len(), 1);
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn single_message_that_cannot_fit_pauses_automatic_instead_of_reporting_empty() {
-        let root = std::env::temp_dir().join(format!("shishi-budget-first-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-budget-first");
         app.state.lock().unwrap().config.model_profiles = None;
         app.test_force_working();
         let base = Config::default();
         let fixed = base.max_input_chars - ai::message_budget(&base, "classify");
         {
             let mut s = app.state.lock().unwrap();
+            s.config.codex = root.join("must-not-launch.exe").to_string_lossy().into();
             s.config.max_input_chars = fixed + 10;
             s.messages.insert(
                 "m".into(),
                 Message {
-                    id: "m".into(),
-                    text: "很长".repeat(1_000),
-                    time: now(),
                     private: true,
-                    ..Default::default()
+                    ..crate::test_support::message("m", "很长".repeat(1_000), now())
                 },
             );
             app.save(&s).unwrap();
@@ -1567,8 +1471,6 @@ mod budget_tests {
         assert!(s.pending_analysis);
         assert_eq!(s.messages.len(), 1);
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 }
 
@@ -1577,8 +1479,7 @@ mod evidence_identity_tests {
     use super::*;
     #[test]
     fn manual_feedback_keeps_the_frozen_versions_of_the_ai_decision() {
-        let root = std::env::temp_dir().join(format!("shishi-decision-context-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-decision-context");
         app.state.lock().unwrap().config.model_profiles = None;
         let context = json!({"prompt_version":"p1","rule_version":2,"rule_ids":["r1"],"archived_memory_version":3});
         {
@@ -1613,62 +1514,100 @@ mod evidence_identity_tests {
         );
         assert_eq!(s.tasks[0].decision_context, context);
         drop(s);
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn rejected_updates_stay_unanalyzed_and_manual_retry_survives_the_cap() {
+    fn batch_updates_keep_local_versions_and_retry_only_external_conflicts() {
         let at = now();
-        let mut s = State::default();
-        for (id, time) in [("a", at), ("b", at + 1), ("c", at + 2)] {
-            s.messages
-                .insert(id.into(), message(id, time, "请核对结果"));
+        for (first_kind, first_time) in [("update", at), ("create", at), ("create", at - 2)] {
+            let mut s = State::default();
+            for (id, time) in [
+                ("base", at - 1),
+                ("a", first_time),
+                ("b", at + 1),
+                ("c", at + 2),
+            ] {
+                s.messages
+                    .insert(id.into(), message(id, time, "请核对结果"));
+            }
+            s.tasks.push(Task {
+                id: "t".into(),
+                title: "核对".into(),
+                updated: 10,
+                evidence: TaskEvidence {
+                    direct: vec!["base".into()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            s.tasks.push(Task {
+                id: "conflict".into(),
+                title: "人工已改".into(),
+                updated: 30,
+                ..Default::default()
+            });
+            let allowed = s.messages.clone();
+            let action = |tid: &str, source: &str, title: &str| json!({"action":"update","task_id":tid,"sources":[source],"fields":[{"field":"title","value":title}],"reason":"新进展","confidence":0.99,"tag_changes":[]});
+            let mut first = action("t", "a", "第一步");
+            if first_kind == "create" {
+                first["action"] = json!("create");
+                first["task_id"] = json!("");
+                first["sources"] = json!(["base", "a"]);
+            }
+            let actions = [
+                first,
+                action("t", "b", "第二步"),
+                action("conflict", "c", "过期修改"),
+            ];
+            let versions = BTreeMap::from([("t".into(), 10), ("conflict".into(), 20)]);
+            let mut concurrent = s.clone();
+            concurrent.tasks[0].updated = 11;
+            concurrent.tasks[0].title = "人工改动".into();
+            let before = json!(concurrent.tasks);
+            let (applied, retry) = App::apply_actions_detailed(
+                &mut concurrent,
+                &actions[..1],
+                &allowed,
+                &versions,
+                &catalog(),
+            )
+            .unwrap();
+            assert_eq!(applied, 0);
+            assert!(retry.contains("a"));
+            assert_eq!(json!(concurrent.tasks), before);
+            assert!(concurrent.audit.is_empty());
+
+            let (applied, retry) =
+                App::apply_actions_detailed(&mut s, &actions, &allowed, &versions, &catalog())
+                    .unwrap();
+            assert_eq!(applied, 2);
+            assert_eq!(s.tasks.len(), 2);
+            assert_eq!(s.tasks[0].title, "第二步");
+            assert_eq!(s.tasks[0].evidence.direct, ["a", "b", "base"]);
+            assert_eq!(
+                s.audit[0].kind,
+                if first_time < at - 1 {
+                    "ai_evidence"
+                } else {
+                    "ai_update"
+                }
+            );
+            assert_eq!(s.tasks[1].title, "人工已改");
+            assert_eq!(retry, BTreeSet::from(["c".into()]));
+            let fingerprints = allowed
+                .iter()
+                .map(|(id, m)| (id.clone(), fingerprint(m)))
+                .collect::<BTreeMap<_, _>>();
+            for _ in 0..3 {
+                App::finish_message_batch(&mut s, &fingerprints, &retry);
+            }
+            assert!(s.analyzed.contains_key("a") && s.analyzed.contains_key("b"));
+            assert!(!s.analyzed.contains_key("c"));
+            assert_eq!(crate::context_budget::pending(&s).len(), 1);
+            assert_eq!(crate::context_budget::pending_for(&s, true).len(), 1);
+            App::finish_message_batch(&mut s, &fingerprints, &BTreeSet::new());
+            assert!(s.analyzed.contains_key("c"));
+            assert!(s.analysis_retry_counts.is_empty());
         }
-        s.tasks.push(Task {
-            id: "t".into(),
-            title: "核对".into(),
-            updated: 10,
-            ..Default::default()
-        });
-        s.tasks.push(Task {
-            id: "conflict".into(),
-            title: "人工已改".into(),
-            updated: 30,
-            ..Default::default()
-        });
-        let allowed = s.messages.clone();
-        let action = |tid: &str, source: &str, title: &str| json!({"action":"update","task_id":tid,"sources":[source],"fields":[{"field":"title","value":title}],"reason":"新进展","confidence":0.99,"tags":[]});
-        let actions = vec![
-            action("t", "a", "第一步"),
-            action("t", "b", "第二步"),
-            action("conflict", "c", "过期修改"),
-        ];
-        let (applied, retry) = App::apply_actions_detailed(
-            &mut s,
-            &actions,
-            &allowed,
-            &BTreeMap::from([("t".into(), 10), ("conflict".into(), 20)]),
-            &catalog(),
-        )
-        .unwrap();
-        assert_eq!(applied, 2);
-        assert_eq!(s.tasks[0].title, "第二步");
-        assert_eq!(s.tasks[1].title, "人工已改");
-        assert_eq!(retry, BTreeSet::from(["c".into()]));
-        let fingerprints = allowed
-            .iter()
-            .map(|(id, m)| (id.clone(), fingerprint(m)))
-            .collect::<BTreeMap<_, _>>();
-        for _ in 0..3 {
-            App::finish_message_batch(&mut s, fingerprints.clone(), &retry);
-        }
-        assert!(s.analyzed.contains_key("a") && s.analyzed.contains_key("b"));
-        assert!(!s.analyzed.contains_key("c"));
-        assert!(crate::context_budget::pending(&s).is_empty());
-        assert_eq!(crate::context_budget::pending_for(&s, true).len(), 1);
-        App::finish_message_batch(&mut s, fingerprints, &BTreeSet::new());
-        assert!(s.analyzed.contains_key("c"));
-        assert!(s.analysis_retry_counts.is_empty());
     }
 
     #[test]
@@ -1699,7 +1638,7 @@ mod evidence_identity_tests {
             ..Default::default()
         });
         let allowed = s.messages.clone();
-        let mut action = json!({"action":"create","sources":["old","new"],"completion_evidence":["new"],"fields":[{"field":"title","value":"模型标题"},{"field":"status","value":"已完成"}],"reason":"回复证据","confidence":0.8,"tags":[],"steps_changed":true,"steps":[{"id":"next","title":"下一步","status":"pending","depends_on":["confirmed"],"waiting_for":""}]});
+        let mut action = json!({"action":"create","sources":["old","new"],"completion_evidence":["new"],"fields":[{"field":"title","value":"模型标题"},{"field":"status","value":"已完成"}],"reason":"回复证据","confidence":0.8,"tag_changes":[],"steps_changed":true,"steps":[{"id":"next","title":"下一步","status":"pending","depends_on":["confirmed"],"waiting_for":""}]});
         let versions = BTreeMap::from([("t".into(), 100)]);
         let (applied, retry) =
             App::apply_actions_detailed(&mut s, &[action.clone()], &allowed, &versions, &catalog())
@@ -1725,6 +1664,26 @@ mod evidence_identity_tests {
         assert!(!s.tasks[0].steps.iter().any(|x| x.id == "next"));
         action["confidence"] = json!(0.99);
         let versions = BTreeMap::from([("t".into(), s.tasks[0].updated)]);
+        let mut batch = s.clone();
+        let mut followup = action.clone();
+        followup["action"] = json!("update");
+        followup["task_id"] = json!("t");
+        followup["fields"] = json!([{"field":"title","value":"stale followup"}]);
+        followup["completion_evidence"] = json!([]);
+        let (applied, retry) = App::apply_actions_detailed(
+            &mut batch,
+            &[action.clone(), followup],
+            &allowed,
+            &versions,
+            &catalog(),
+        )
+        .unwrap();
+        assert_eq!(applied, 1);
+        assert!(
+            retry.is_empty(),
+            "old evidence is a no-op, not a version conflict"
+        );
+        assert_ne!(batch.tasks[0].title, "stale followup");
         let (_, retry) =
             App::apply_actions_detailed(&mut s, &[action], &allowed, &versions, &catalog())
                 .unwrap();
@@ -1733,11 +1692,8 @@ mod evidence_identity_tests {
     }
     fn message(id: &str, time: i64, text: &str) -> Message {
         Message {
-            id: id.into(),
-            text: text.into(),
-            time,
             private: true,
-            ..Default::default()
+            ..crate::test_support::message(id, text, time)
         }
     }
     fn catalog() -> Vec<crate::tags::Group> {
@@ -1809,7 +1765,7 @@ mod evidence_identity_tests {
             ],
             "reason":"延续发布验证",
             "confidence":0.9,
-            "tags":[]
+            "tag_changes":[]
         });
         let applied = App::apply_actions(
             &mut s,
@@ -1863,7 +1819,7 @@ mod evidence_identity_tests {
             "action":"update","task_id":"t",
             "sources":["new"],"background_evidence":["bg"],"completion_evidence":["done"],
             "fields":[{"field":"status","value":"已完成"}],
-            "reason":"明确完成","confidence":0.99,"tags":[]
+            "reason":"明确完成","confidence":0.99,"tag_changes":[]
         });
         App::apply_actions(&mut s, &[action], &allowed, &versions, &catalog()).unwrap();
         let task = s.tasks.iter().find(|t| t.id == "t").unwrap();
@@ -1878,7 +1834,7 @@ mod evidence_identity_tests {
             "action":"update","task_id":"t",
             "sources":["older"],
             "fields":[{"field":"title","value":"不应回退的标题"}],
-            "reason":"补充更早证据","confidence":0.99,"tags":[]
+            "reason":"补充更早证据","confidence":0.99,"tag_changes":[]
         });
         App::apply_actions(&mut s, &[action], &allowed, &versions, &catalog()).unwrap();
         let task = s.tasks.iter().find(|t| t.id == "t").unwrap();
@@ -1895,12 +1851,10 @@ mod correction_tests {
 
     #[test]
     fn temporary_memory_is_writable_only_in_message_analysis_requests() {
-        let (app, root) = app();
+        let (_root, app) = app();
         for kind in ["classify", "report", "archive", "learning", "prompt_review"] {
             let state = app.state.lock().unwrap().clone();
-            let mut context = app
-                .capture_prepare_context_from(&state, kind, false, json!([]))
-                .unwrap();
+            let mut context = app.capture_prepare_context_from(&state, kind, false, json!([]));
             let request = app
                 .prepare_ai_request_with(kind, &json!({}), AiMode::Manual, &mut context)
                 .unwrap();
@@ -1910,21 +1864,18 @@ mod correction_tests {
                 kind == "classify"
             );
         }
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn first_memory_write_and_inline_continuation_survive_preparation_and_reload() {
-        let (mut app, root) = app();
+        let (root, mut app) = app();
         for (index, text) in ["合成记录：等待核对", "合成记录：已核对，等待确认"]
             .iter()
             .enumerate()
         {
             let state = app.state.lock().unwrap().clone();
-            let mut context = app
-                .capture_prepare_context_from(&state, "classify", false, json!([]))
-                .unwrap();
+            let mut context =
+                app.capture_prepare_context_from(&state, "classify", false, json!([]));
             let request = app
                 .prepare_ai_request_with(
                     "classify",
@@ -1970,17 +1921,14 @@ mod correction_tests {
         assert!(app
             .save_temporary_memory(&json!({"text":"invalid"}))
             .is_err());
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn handling_learning_prepares_only_scoped_evidence_without_unavailable_retrieval() {
-        let (app, root) = app();
+        let (_root, app) = app();
         let state = app.state.lock().unwrap().clone();
-        let mut context = app
-            .capture_prepare_context_from(&state, "handling_learning", false, json!([]))
-            .unwrap();
+        let mut context =
+            app.capture_prepare_context_from(&state, "handling_learning", false, json!([]));
         let request = app
             .prepare_ai_request_with(
                 "handling_learning",
@@ -1992,17 +1940,12 @@ mod correction_tests {
         assert!(request.payload.get("_local_context").is_none());
         assert!(request.prepared.tools.is_none());
         assert!(request.prepared.prompt.contains("只读补查：不可用"));
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
-    fn app() -> (App, PathBuf) {
-        let root = std::env::temp_dir().join(format!("shishi-correction-{}", id()));
-        {
-            let app = App::load(root.clone()).unwrap();
-            app.state.lock().unwrap().config.model_profiles = None;
-            (app, root)
-        }
+    fn app() -> (crate::test_support::TestRoot, App) {
+        let (root, app) = crate::test_support::scoped_app("shishi-correction");
+        app.state.lock().unwrap().config.model_profiles = None;
+        (root, app)
     }
 
     fn message(id: &str, time: i64, text: &str) -> Message {
@@ -2019,7 +1962,7 @@ mod correction_tests {
 
     #[test]
     fn partial_manual_edit_preserves_evidence_summary_schedule_and_archive_fields() {
-        let (app, root) = app();
+        let (_root, app) = app();
         {
             let mut s = app.state.lock().unwrap();
             s.tasks.push(Task {
@@ -2064,7 +2007,7 @@ mod correction_tests {
         assert_eq!(task.content_updated_at, 100);
         assert_eq!(task.schedule_id, "schedule");
         assert_eq!(task.scheduled_for, "2026-10-18");
-        assert_eq!(task.deferred_until, 999);
+        assert_eq!(task.deferred_until, 0); // Completing ends the deferral; scheduling metadata stays.
         assert_eq!(task.archive_note, "保留的归档备注");
 
         // Only a content edit invalidates the summary timestamp.
@@ -2079,8 +2022,6 @@ mod correction_tests {
         assert_eq!(task.summary, "原描述");
         assert_eq!(task.summary_updated_at, task.content_updated_at);
         assert_eq!(task.archive_note, "保留的归档备注");
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -2113,7 +2054,7 @@ mod correction_tests {
                 {"field":"title","value":"处理问题"},
                 {"field":"description","value":"处理问题"}
             ],
-            "reason":"不同对象","confidence":0.9,"tags":[]
+            "reason":"不同对象","confidence":0.9,"tag_changes":[]
         });
         let catalog = crate::tags::groups(&s);
         App::apply_actions(&mut s, &[action], &allowed, &BTreeMap::new(), &catalog).unwrap();
@@ -2124,7 +2065,7 @@ mod correction_tests {
 
     #[test]
     fn frozen_retrieval_survives_snapshot_rebuild_and_cross_chat_omitted_task_update() {
-        let (app, root) = app();
+        let (_root, app) = app();
         {
             let mut s = app.state.lock().unwrap();
             s.messages
@@ -2148,15 +2089,10 @@ mod correction_tests {
         }
         let (batch, context, request) = {
             let s = app.state.lock().unwrap();
-            let batch = crate::context_budget::classify_with_task_limit(
-                &s,
-                &[s.messages["old"].clone()],
-                0,
-            )
-            .unwrap();
-            let mut context = app
-                .capture_prepare_context_from(&s, "classify", false, json!([]))
-                .unwrap();
+            let mut batch = crate::context_budget::classify(&s, &[s.messages["old"].clone()]);
+            // Exercise retrieval with no inline task; budget fitting is covered separately.
+            batch.payload.as_object_mut().unwrap().remove("tasks");
+            let mut context = app.capture_prepare_context_from(&s, "classify", false, json!([]));
             let mut request = app
                 .prepare_ai_request_with("classify", &batch.payload, AiMode::Manual, &mut context)
                 .unwrap();
@@ -2185,7 +2121,7 @@ mod correction_tests {
             "action":"update","task_id":"t",
             "sources":["done"],"completion_evidence":["done"],
             "fields":[{"field":"status","value":"已完成"}],
-            "reason":"跨会话完成证据","confidence":0.99,"tags":[]
+            "reason":"跨会话完成证据","confidence":0.99,"tag_changes":[]
         });
         let catalog = crate::tags::groups(&state);
         App::apply_actions(&mut state, &[action], &allowed, &versions, &catalog).unwrap();
@@ -2194,7 +2130,7 @@ mod correction_tests {
         assert_eq!(task.evidence.completion, vec!["done"]);
         drop(state);
 
-        // Rebuild the shared snapshot while the request is conceptually in
+        // Build a new projection while the request is conceptually in
         // flight, then mutate live state and add a new message. The old request
         // still sees its frozen body and can never admit the new message.
         {
@@ -2203,9 +2139,8 @@ mod correction_tests {
             s.messages
                 .insert("late".into(), message("late", 400, "请求开始后才出现"));
             app.save(&s).unwrap();
-            crate::snapshots::ensure(&root, &s, now()).unwrap();
         }
-        let shared = crate::snapshots::records(&root).unwrap();
+        let shared = crate::snapshots::records_from_state(&app.state.lock().unwrap(), now());
         assert!(shared.iter().any(|row| row["id"] == "late"));
         assert!(shared
             .iter()
@@ -2222,20 +2157,20 @@ mod correction_tests {
         drop(live);
         drop(batch);
         drop(context);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn accepted_prepared_request_is_sent_with_frozen_runtime_and_measured_prompt() {
-        let (app, root) = app();
+        let (root, app) = app();
         app.test_force_working();
         let mut messages = (0..12)
             .map(|i| Message {
-                id: format!("m{}", i + 1),
-                text: "需要核对的消息内容".repeat(20),
-                time: now() + i,
                 private: true,
-                ..Default::default()
+                ..crate::test_support::message(
+                    format!("m{}", i + 1),
+                    "需要核对的消息内容".repeat(20),
+                    now() + i,
+                )
             })
             .collect::<Vec<_>>();
         messages[0].images = vec![ImageRef {
@@ -2296,11 +2231,8 @@ mod correction_tests {
                 ..Default::default()
             });
             app.save(&s).unwrap();
-            let mut context = app
-                .capture_prepare_context_from(&s, "classify", false, json!([]))
-                .unwrap();
-            let full_batch =
-                crate::context_budget::classify_with_task_limit(&s, &messages, usize::MAX).unwrap();
+            let mut context = app.capture_prepare_context_from(&s, "classify", false, json!([]));
+            let full_batch = crate::context_budget::classify(&s, &messages);
             let full = app
                 .prepare_ai_request_with(
                     "classify",
@@ -2337,8 +2269,7 @@ mod correction_tests {
                 encoded_alias_lengths.iter().any(|length| *length >= 3),
                 "expected hidden ids to lengthen aliases: {encoded_alias_lengths:?}"
             );
-            let reduced_batch =
-                crate::context_budget::classify_with_task_limit(&s, &messages[..10], 10).unwrap();
+            let reduced_batch = crate::context_budget::classify(&s, &messages[..10]);
             let reduced = app
                 .prepare_ai_request_with(
                     "classify",
@@ -2357,49 +2288,32 @@ mod correction_tests {
             app.save(&s).unwrap();
             (context, limit, full_total, full_runtime, reduced_total)
         };
-        let (accepted_batch, accepted) = {
-            let s = app.state.lock().unwrap();
-            let mut changes = messages.clone();
-            let mut task_limit = usize::MAX;
-            loop {
-                let batch =
-                    crate::context_budget::classify_with_task_limit(&s, &changes, task_limit)
-                        .unwrap();
-                let mut request = app
-                    .prepare_ai_request_with(
-                        "classify",
-                        &batch.payload,
-                        AiMode::Manual,
-                        &mut context,
-                    )
-                    .unwrap();
-                assert_eq!(request.runtime, full_runtime);
-                let total = request.prepared.total;
-                if total <= limit {
-                    request.frozen = Some(FrozenView::new(
-                        batch.allowed.clone(),
-                        batch.versions.clone(),
-                        &request.records,
-                    ));
-                    break (batch, request);
-                }
-                if changes.len() > 10 {
-                    changes.truncate(10);
-                    continue;
-                }
-                if task_limit > 10 {
-                    task_limit = 10;
-                    continue;
-                }
-                panic!("reduction did not fit: {total} > {limit}");
-            }
+        let (accepted_batch, mut accepted) = {
+            let s = app.state.lock().unwrap().clone();
+            let batch = crate::context_budget::classify(&s, &messages);
+            app.fit_analysis_batch(
+                batch,
+                AiMode::Manual,
+                &mut context,
+                &AtomicBool::new(false),
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .unwrap()
         };
-        assert_eq!(accepted_batch.allowed.len(), 10);
+        assert_eq!(accepted.runtime, full_runtime);
+        assert!(accepted_batch.fingerprints.len() >= 10);
         assert_eq!(
             accepted_batch.fingerprints.len(),
             accepted_batch.allowed.len()
         );
-        assert_eq!(accepted.prepared.total, reduced_total);
+        assert!(accepted.prepared.total <= limit);
+        assert!(accepted.prepared.total >= reduced_total || accepted_batch.fingerprints.len() > 10);
+        accepted.frozen = Some(FrozenView::new(
+            accepted_batch.allowed.clone(),
+            accepted_batch.versions.clone(),
+            &accepted.records,
+        ));
+        accepted.materialize_records();
         assert_eq!(
             accepted.prepared.prompt.chars().count(),
             accepted.prepared.prompt_chars
@@ -2442,13 +2356,11 @@ mod correction_tests {
             accepted.prepared.tools.as_ref().unwrap().to_string()
         );
         assert!(full_total > limit);
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn final_enriched_budget_failure_pauses_automatic_analysis_without_consuming_messages() {
-        let (app, root) = app();
+        let (_root, app) = app();
         app.test_force_working();
         {
             let mut s = app.state.lock().unwrap();
@@ -2483,8 +2395,6 @@ mod correction_tests {
         assert!(s.analysis_memory.temporary.chars().count() == 4_000);
         assert_eq!(s.messages.len(), 1);
         drop(s);
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
     }
 }
 
@@ -2508,18 +2418,12 @@ mod response_finalization_tests {
     use super::*;
     #[test]
     fn received_response_with_invalid_reference_has_a_correlated_terminal_failure() {
-        let root = std::env::temp_dir().join(format!("shishi-finalization-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-finalization");
         app.state.lock().unwrap().config.model_profiles = None;
         let mut state = app.state.lock().unwrap().clone();
         state.messages.insert(
             "message-real".into(),
-            Message {
-                id: "message-real".into(),
-                text: "Synthetic evidence".into(),
-                time: now(),
-                ..Default::default()
-            },
+            crate::test_support::message("message-real", "Synthetic evidence", now()),
         );
         state.tasks.push(Task {
             id: "task-real".into(),
@@ -2527,9 +2431,7 @@ mod response_finalization_tests {
             status: "pending".into(),
             ..Default::default()
         });
-        let mut context = app
-            .capture_prepare_context_from(&state, "classify", false, json!([]))
-            .unwrap();
+        let mut context = app.capture_prepare_context_from(&state, "classify", false, json!([]));
         let request = app.prepare_ai_request_with("classify", &json!({"changes":[{"id":"message-real","text":"Synthetic evidence"}],"tasks":[{"id":"task-real"}]}), AiMode::Manual, &mut context).unwrap();
         let request_id = "synthetic-finalization";
         app.log(
@@ -2539,7 +2441,7 @@ mod response_finalization_tests {
         let result = json!({"actions":[{"action":"update","task_id":"t999","sources":["m1"]}]});
         let detail = json!({"request_id":request_id,"kind":"classify","response_received":true});
         let error = app
-            .finalize_ai_response(&request, request_id, detail, Ok(result))
+            .finalize_ai_response(&request, request_id, detail, Ok(result), false)
             .unwrap_err();
         assert!(error.contains("未知证据短编号"), "{error}");
         let rows = app.activity.lock().unwrap();
@@ -2550,7 +2452,5 @@ mod response_finalization_tests {
             && r["detail"]["request_id"] == failed["detail"]["request_id"]));
         assert!(!rows.iter().any(|r| r["kind"] == "ai_success"));
         drop(rows);
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

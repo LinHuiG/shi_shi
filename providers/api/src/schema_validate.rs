@@ -13,7 +13,6 @@
 //! array and object limits prevent unbounded recursion or traversal.
 
 use serde_json::Value;
-use std::fmt;
 
 pub const MAX_SCHEMA_DEPTH: usize = 32;
 pub const MAX_SCHEMA_NODES: usize = 20_000;
@@ -31,14 +30,16 @@ const MAX_PATH_CHARS: usize = 512;
 
 /// A schema validation failure. `Display` contains only the schema path and the
 /// failed constraint; input values are never formatted into it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("schema at {path}: {constraint}")]
 pub struct ValidationError {
     path: String,
     constraint: String,
 }
 
 impl ValidationError {
-    fn new(path: impl Into<String>, constraint: impl Into<String>) -> Self {
+    /// Host validation must describe the violated rule, never include input values.
+    pub fn new(path: impl Into<String>, constraint: impl Into<String>) -> Self {
         Self {
             path: truncate_path(path.into()),
             constraint: truncate_text(constraint.into(), MAX_PATH_CHARS),
@@ -54,14 +55,6 @@ impl ValidationError {
     }
 }
 
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "schema at {}: {}", self.path, self.constraint)
-    }
-}
-
-impl std::error::Error for ValidationError {}
-
 /// Validate a schema against the supported subset before using it for any
 /// request. Unsupported validation keywords fail closed.
 pub fn check_schema(schema: &Value) -> Result<(), ValidationError> {
@@ -71,25 +64,44 @@ pub fn check_schema(schema: &Value) -> Result<(), ValidationError> {
 
 /// Check the schema and then validate one instance.
 pub fn validate(schema: &Value, instance: &Value) -> Result<(), ValidationError> {
-    check_schema(schema)?;
-    let mut nodes = 0usize;
-    validate_at(schema, instance, "$", 0, &mut nodes)
+    CheckedSchema::new(schema)?.validate(instance)
+}
+
+fn validate_checked(schema: &Value, instance: &Value) -> Result<(), ValidationError> {
+    validate_at(schema, instance, "$", 0, &mut 0)
 }
 
 /// Accept output with explicit scalar defaults, then validate it strictly.
 /// Defaults are opt-in presentation fallbacks, never inferred from a type.
 /// Tool arguments continue to use `validate` and cannot use this repair path.
-pub fn validate_output(schema: &Value, mut value: Value) -> Result<Value, ValidationError> {
-    check_schema(schema)?;
-    output_defaults(schema, &mut value, 0, &mut 0)?;
-    validate(schema, &value)?;
-    Ok(value)
+pub fn validate_output(schema: &Value, value: Value) -> Result<Value, ValidationError> {
+    CheckedSchema::new(schema)?.output(value)
+}
+
+/// A borrowed, immutable schema checked once for an entire model/tool loop.
+pub(crate) struct CheckedSchema<'a>(&'a Value);
+
+impl<'a> CheckedSchema<'a> {
+    pub(crate) fn new(schema: &'a Value) -> Result<Self, ValidationError> {
+        check_schema(schema)?;
+        Ok(Self(schema))
+    }
+
+    pub(crate) fn validate(&self, instance: &Value) -> Result<(), ValidationError> {
+        validate_checked(self.0, instance)
+    }
+
+    pub(crate) fn output(&self, mut value: Value) -> Result<Value, ValidationError> {
+        output_defaults(self.0, &mut value, 0, &mut 0)?;
+        self.validate(&value)?;
+        Ok(value)
+    }
 }
 
 fn scalar_default(schema: &Value) -> Option<&Value> {
-    schema
-        .get("default")
-        .filter(|value| !value.is_array() && !value.is_object() && validate(schema, value).is_ok())
+    schema.get("default").filter(|value| {
+        !value.is_array() && !value.is_object() && validate_checked(schema, value).is_ok()
+    })
 }
 
 fn output_defaults(
@@ -103,7 +115,7 @@ fn output_defaults(
         return Err(ValidationError::new("$", "output traversal limit exceeded"));
     }
     if let Some(default) = scalar_default(schema) {
-        if validate(schema, value).is_err() {
+        if validate_checked(schema, value).is_err() {
             *value = default.clone();
             return Ok(());
         }
@@ -198,15 +210,7 @@ fn check_schema_at(
         }
     };
 
-    let mut types: Option<Vec<&str>> = None;
-    let mut has_properties = false;
-    let mut has_required = false;
-    let mut has_additional = false;
-    let mut has_items = false;
-    let mut has_string_bound = false;
-    let mut has_array_bound = false;
-    let mut has_object_bound = false;
-    let mut has_number_bound = false;
+    let mut types: Option<&[Value]> = None;
 
     for (keyword, value) in object {
         match keyword.as_str() {
@@ -217,7 +221,6 @@ fn check_schema_at(
                 types = Some(parse_types(value, path)?);
             }
             "properties" => {
-                has_properties = true;
                 let properties = value
                     .as_object()
                     .ok_or_else(|| ValidationError::new(path, "properties must be an object"))?;
@@ -239,7 +242,6 @@ fn check_schema_at(
                 }
             }
             "required" => {
-                has_required = true;
                 let required = value.as_array().ok_or_else(|| {
                     ValidationError::new(path, "required must be an array of property names")
                 })?;
@@ -262,26 +264,8 @@ fn check_schema_at(
                     }
                 }
             }
-            "additionalProperties" => {
-                has_additional = true;
-                if !matches!(value, Value::Bool(_) | Value::Object(_)) {
-                    return Err(ValidationError::new(
-                        path,
-                        "additionalProperties must be a boolean or schema",
-                    ));
-                }
-                if value.is_object() {
-                    check_schema_at(
-                        value,
-                        &format!("{path}.additionalProperties"),
-                        depth + 1,
-                        nodes,
-                    )?;
-                }
-            }
-            "items" => {
-                has_items = true;
-                if value.is_array() {
+            "additionalProperties" | "items" => {
+                if keyword == "items" && value.is_array() {
                     return Err(ValidationError::new(
                         path,
                         "items tuple form is not supported; use one items schema",
@@ -290,10 +274,12 @@ fn check_schema_at(
                 if !matches!(value, Value::Bool(_) | Value::Object(_)) {
                     return Err(ValidationError::new(
                         path,
-                        "items must be a boolean or schema",
+                        format!("{keyword} must be a boolean or schema"),
                     ));
                 }
-                check_schema_at(value, &format!("{path}.items"), depth + 1, nodes)?;
+                if value.is_object() || keyword == "items" {
+                    check_schema_at(value, &format!("{path}.{keyword}"), depth + 1, nodes)?;
+                }
             }
             "enum" => {
                 let values = value
@@ -302,31 +288,20 @@ fn check_schema_at(
                 if values.len() > MAX_ENUM_VALUES {
                     return Err(ValidationError::new(path, "enum value limit exceeded"));
                 }
-                let encoded = serde_json::to_vec(value).unwrap_or_default();
-                if encoded.len() > MAX_ENUM_BYTES {
+                if !crate::json::fits_bytes(value, MAX_ENUM_BYTES) {
                     return Err(ValidationError::new(path, "enum payload limit exceeded"));
                 }
             }
             "const" => {
-                let encoded = serde_json::to_vec(value).unwrap_or_default();
-                if encoded.len() > MAX_CONST_BYTES {
+                if !crate::json::fits_bytes(value, MAX_CONST_BYTES) {
                     return Err(ValidationError::new(path, "const payload limit exceeded"));
                 }
             }
-            "minLength" | "maxLength" => {
-                has_string_bound = true;
-                parse_bound(value, keyword, path)?;
-            }
-            "minItems" | "maxItems" => {
-                has_array_bound = true;
-                parse_bound(value, keyword, path)?;
-            }
-            "minProperties" | "maxProperties" => {
-                has_object_bound = true;
+            "minLength" | "maxLength" | "minItems" | "maxItems" | "minProperties"
+            | "maxProperties" => {
                 parse_bound(value, keyword, path)?;
             }
             "minimum" | "maximum" => {
-                has_number_bound = true;
                 if value.as_f64().is_none() {
                     return Err(ValidationError::new(
                         path,
@@ -334,118 +309,105 @@ fn check_schema_at(
                     ));
                 }
             }
-            other => {
-                let _ = other;
+            _ => {
                 return Err(ValidationError::new(path, "unsupported schema keyword"));
             }
         }
     }
 
-    // Fail closed instead of accepting a schema whose keyword semantics would be
-    // ambiguous without an explicit type.
-    if types.is_none()
-        && (has_properties
-            || has_required
-            || has_additional
-            || has_items
-            || has_string_bound
-            || has_array_bound
-            || has_object_bound
-            || has_number_bound)
-    {
-        return Err(ValidationError::new(
-            path,
-            "typed schema keywords require an explicit type",
-        ));
+    // Each typed keyword must have an explicit compatible type.
+    for (keys, allowed, message) in [
+        (
+            &["properties"][..],
+            &["object"][..],
+            "properties requires type object",
+        ),
+        (
+            &["required"][..],
+            &["object"][..],
+            "required requires type object",
+        ),
+        (
+            &["additionalProperties"][..],
+            &["object"][..],
+            "additionalProperties requires type object",
+        ),
+        (&["items"][..], &["array"][..], "items requires type array"),
+        (
+            &["minLength", "maxLength"][..],
+            &["string"][..],
+            "length bounds require type string",
+        ),
+        (
+            &["minItems", "maxItems"][..],
+            &["array"][..],
+            "item bounds require type array",
+        ),
+        (
+            &["minProperties", "maxProperties"][..],
+            &["object"][..],
+            "property bounds require type object",
+        ),
+        (
+            &["minimum", "maximum"][..],
+            &["number", "integer"][..],
+            "numeric bounds require type number or integer",
+        ),
+    ] {
+        if keys.iter().any(|key| object.contains_key(*key)) {
+            let types = types.as_ref().ok_or_else(|| {
+                ValidationError::new(path, "typed schema keywords require an explicit type")
+            })?;
+            if !types
+                .iter()
+                .any(|kind| allowed.contains(&kind.as_str().unwrap()))
+            {
+                return Err(ValidationError::new(path, message));
+            }
+        }
     }
-    if let Some(types) = &types {
-        if has_properties && !types.contains(&"object") {
-            return Err(ValidationError::new(
-                path,
-                "properties requires type object",
-            ));
-        }
-        if has_required && !types.contains(&"object") {
-            return Err(ValidationError::new(path, "required requires type object"));
-        }
-        if has_additional && !types.contains(&"object") {
-            return Err(ValidationError::new(
-                path,
-                "additionalProperties requires type object",
-            ));
-        }
-        if has_items && !types.contains(&"array") {
-            return Err(ValidationError::new(path, "items requires type array"));
-        }
-        if has_string_bound && !types.contains(&"string") {
-            return Err(ValidationError::new(
-                path,
-                "length bounds require type string",
-            ));
-        }
-        if has_array_bound && !types.contains(&"array") {
-            return Err(ValidationError::new(path, "item bounds require type array"));
-        }
-        if has_object_bound && !types.contains(&"object") {
-            return Err(ValidationError::new(
-                path,
-                "property bounds require type object",
-            ));
-        }
-        if has_number_bound && !types.iter().any(|t| *t == "number" || *t == "integer") {
-            return Err(ValidationError::new(
-                path,
-                "numeric bounds require type number or integer",
-            ));
+    for (min, max) in [
+        ("minLength", "maxLength"),
+        ("minItems", "maxItems"),
+        ("minProperties", "maxProperties"),
+        ("minimum", "maximum"),
+    ] {
+        if object
+            .get(min)
+            .and_then(Value::as_f64)
+            .zip(object.get(max).and_then(Value::as_f64))
+            .is_some_and(|(min, max)| min > max)
+        {
+            return Err(ValidationError::new(path, format!("{min} exceeds {max}")));
         }
     }
 
-    if let (Some(min), Some(max)) = (
-        object.get("minLength").and_then(Value::as_u64),
-        object.get("maxLength").and_then(Value::as_u64),
-    ) {
-        if min > max {
-            return Err(ValidationError::new(path, "minLength exceeds maxLength"));
-        }
-    }
-    if let (Some(min), Some(max)) = (
-        object.get("minItems").and_then(Value::as_u64),
-        object.get("maxItems").and_then(Value::as_u64),
-    ) {
-        if min > max {
-            return Err(ValidationError::new(path, "minItems exceeds maxItems"));
-        }
-    }
-    if let (Some(min), Some(max)) = (
-        object.get("minProperties").and_then(Value::as_u64),
-        object.get("maxProperties").and_then(Value::as_u64),
-    ) {
-        if min > max {
-            return Err(ValidationError::new(
-                path,
-                "minProperties exceeds maxProperties",
-            ));
-        }
-    }
-    if let (Some(min), Some(max)) = (
-        object.get("minimum").and_then(Value::as_f64),
-        object.get("maximum").and_then(Value::as_f64),
-    ) {
-        if min > max {
-            return Err(ValidationError::new(path, "minimum exceeds maximum"));
+    Ok(())
+}
+
+fn validate_bounds(
+    schema: &Value,
+    min: &str,
+    max: &str,
+    value: f64,
+    path: &str,
+) -> Result<(), ValidationError> {
+    for (key, lower) in [(min, true), (max, false)] {
+        if schema
+            .get(key)
+            .and_then(Value::as_f64)
+            .is_some_and(|bound| if lower { value < bound } else { value > bound })
+        {
+            return Err(ValidationError::new(path, format!("{key} constraint")));
         }
     }
     Ok(())
 }
 
-fn parse_types<'a>(value: &'a Value, path: &str) -> Result<Vec<&'a str>, ValidationError> {
+fn parse_types<'a>(value: &'a Value, path: &str) -> Result<&'a [Value], ValidationError> {
     let names = match value {
-        Value::String(name) => vec![name.as_str()],
-        Value::Array(items) if !items.is_empty() && items.len() <= 7 => items
-            .iter()
-            .map(|item| item.as_str())
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| ValidationError::new(path, "type entries must be strings"))?,
+        Value::String(_) => std::slice::from_ref(value),
+        Value::Array(items) if !items.is_empty() && items.len() <= 7 => items,
         _ => {
             return Err(ValidationError::new(
                 path,
@@ -453,15 +415,17 @@ fn parse_types<'a>(value: &'a Value, path: &str) -> Result<Vec<&'a str>, Validat
             ))
         }
     };
-    let mut seen = std::collections::BTreeSet::new();
-    for name in &names {
+    if names.iter().any(|name| !name.is_string()) {
+        return Err(ValidationError::new(path, "type entries must be strings"));
+    }
+    for (index, name) in names.iter().enumerate() {
         if !matches!(
-            *name,
+            name.as_str().unwrap(),
             "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
         ) {
             return Err(ValidationError::new(path, "unsupported type name"));
         }
-        if !seen.insert(*name) {
+        if names[..index].contains(name) {
             return Err(ValidationError::new(path, "duplicate type name"));
         }
     }
@@ -528,11 +492,21 @@ fn validate_at(
     };
 
     if let Some(type_value) = object.get("type") {
-        let types = parse_types(type_value, path)?;
-        if !types.iter().any(|kind| matches_type(kind, instance)) {
+        // The immutable schema was checked at the public boundary.
+        let types = type_value.as_str().into_iter().chain(
+            type_value
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str),
+        );
+        if !types.clone().any(|kind| matches_type(kind, instance)) {
             return Err(ValidationError::new(
                 path,
-                format!("type must be one of: {}", types.join(", ")),
+                format!(
+                    "type must be one of: {}",
+                    types.collect::<Vec<_>>().join(", ")
+                ),
             ));
         }
     }
@@ -550,16 +524,13 @@ fn validate_at(
 
     match instance {
         Value::Object(values) => {
-            if let Some(min) = object.get("minProperties").and_then(Value::as_u64) {
-                if (values.len() as u64) < min {
-                    return Err(ValidationError::new(path, "minProperties constraint"));
-                }
-            }
-            if let Some(max) = object.get("maxProperties").and_then(Value::as_u64) {
-                if values.len() as u64 > max {
-                    return Err(ValidationError::new(path, "maxProperties constraint"));
-                }
-            }
+            validate_bounds(
+                schema,
+                "minProperties",
+                "maxProperties",
+                values.len() as f64,
+                path,
+            )?;
             if let Some(required) = object.get("required").and_then(Value::as_array) {
                 for name in required {
                     let name = name.as_str().unwrap_or("");
@@ -585,31 +556,18 @@ fn validate_at(
                     }
                 }
             }
+            let mut extra = values.iter().filter(|(name, _)| {
+                !properties.is_some_and(|properties| properties.contains_key(*name))
+            });
             match object.get("additionalProperties") {
-                Some(Value::Bool(false)) => {
-                    if let Some(properties) = properties {
-                        if let Some(extra) =
-                            values.keys().find(|key| !properties.contains_key(*key))
-                        {
-                            let _ = extra;
-                            return Err(ValidationError::new(
-                                path,
-                                "additionalProperties: unexpected property is not allowed",
-                            ));
-                        }
-                    } else if !values.is_empty() {
-                        return Err(ValidationError::new(
-                            path,
-                            "additionalProperties: unexpected property is not allowed",
-                        ));
-                    }
+                Some(Value::Bool(false)) if extra.next().is_some() => {
+                    return Err(ValidationError::new(
+                        path,
+                        "additionalProperties: unexpected property is not allowed",
+                    ));
                 }
-                Some(Value::Object(_)) => {
-                    let additional = &object["additionalProperties"];
-                    for (name, child) in values {
-                        if properties.is_some_and(|properties| properties.contains_key(name)) {
-                            continue;
-                        }
+                Some(additional @ Value::Object(_)) => {
+                    for (_, child) in extra {
                         validate_at(additional, child, &format!("{path}.*"), depth + 1, nodes)?;
                     }
                 }
@@ -617,16 +575,7 @@ fn validate_at(
             }
         }
         Value::Array(items) => {
-            if let Some(min) = object.get("minItems").and_then(Value::as_u64) {
-                if (items.len() as u64) < min {
-                    return Err(ValidationError::new(path, "minItems constraint"));
-                }
-            }
-            if let Some(max) = object.get("maxItems").and_then(Value::as_u64) {
-                if items.len() as u64 > max {
-                    return Err(ValidationError::new(path, "maxItems constraint"));
-                }
-            }
+            validate_bounds(schema, "minItems", "maxItems", items.len() as f64, path)?;
             if let Some(child_schema) = object.get("items") {
                 for (index, child) in items.iter().enumerate() {
                     validate_at(
@@ -639,30 +588,15 @@ fn validate_at(
                 }
             }
         }
-        Value::String(text) => {
-            let length = text.chars().count() as u64;
-            if let Some(min) = object.get("minLength").and_then(Value::as_u64) {
-                if length < min {
-                    return Err(ValidationError::new(path, "minLength constraint"));
-                }
-            }
-            if let Some(max) = object.get("maxLength").and_then(Value::as_u64) {
-                if length > max {
-                    return Err(ValidationError::new(path, "maxLength constraint"));
-                }
-            }
-        }
+        Value::String(text) => validate_bounds(
+            schema,
+            "minLength",
+            "maxLength",
+            text.chars().count() as f64,
+            path,
+        )?,
         Value::Number(number) => {
-            if let Some(min) = object.get("minimum").and_then(Value::as_f64) {
-                if number.as_f64().is_none_or(|value| value < min) {
-                    return Err(ValidationError::new(path, "minimum constraint"));
-                }
-            }
-            if let Some(max) = object.get("maximum").and_then(Value::as_f64) {
-                if number.as_f64().is_none_or(|value| value > max) {
-                    return Err(ValidationError::new(path, "maximum constraint"));
-                }
-            }
+            validate_bounds(schema, "minimum", "maximum", number.as_f64().unwrap(), path)?
         }
         _ => {}
     }

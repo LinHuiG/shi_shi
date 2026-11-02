@@ -63,6 +63,7 @@ $ui=[IO.File]::ReadAllText((Join-Path $uiRoot 'index.html')).Replace("`r`n","`n"
  published_at=$PublishedAt
  installer_bytes=(Get-Item -LiteralPath $installer).Length
  executable_bytes=(Get-Item -LiteralPath "$PSScriptRoot/target/release/shishi.exe").Length
+ cli_bytes=(Get-Item -LiteralPath "$PSScriptRoot/target/release/ss.exe").Length
  embedded_ui_bytes=[Text.Encoding]::UTF8.GetByteCount($ui)
  loader_version=$loaderPackage.version
  loader_sha256=(Get-FileHash -LiteralPath $loaderPath -Algorithm SHA256).Hash

@@ -126,33 +126,6 @@ function handlingProcess(round) {
       .join('') || '<p class="helper">暂未收到执行过程；只展示该接入返回的可见记录。</p>'
   );
 }
-function handlingBatch(id) {
-  const run = taskRun(id),
-    requests = (run?.requests || []).filter(approvalBatchEligible);
-  if (!requests.length) {
-    toast('没有可批量批准的完整请求');
-    return;
-  }
-  setModal(
-    `<div class="approval-dialog"><header><h2>批准当前 ${requests.length} 项请求</h2></header><div class="approval-scroll"><p class="subtitle">仅批准下面列出的当前请求，不批准以后新增的请求。权限申请仅在本轮有效；问题、外部服务授权及信息不完整的请求仍需单独处理。</p>${requests
-      .map((q) => {
-        const p = q.params || {};
-        return `<section class="approval-context">${approvalField('类型', q.method === 'item/permissions/requestApproval' ? '本轮权限' : q.method === 'item/fileChange/requestApproval' ? '本次文件修改' : '本次命令')}${approvalField('原因', p.reason)}${approvalField('命令', p.command, true)}${approvalField('目录', p.cwd || run.cwd)}${approvalField('文件变更', p.changes || p.fileChanges, true)}${
-          q.method === 'item/permissions/requestApproval'
-            ? approvalPermissions(p.permissions)
-                .rows.map(([k, v]) => approvalField(k, v, true))
-                .join('')
-            : ''
-        }</section>`;
-      })
-      .join(
-        '',
-      )}<div id="modal-error" class="error-box"></div></div><div class="dialog-foot approval-footer"><button data-action="close">取消</button><button class="primary" id="handling-batch-confirm" data-handle="batch-confirm" data-task-id="${esc(id)}" data-run-id="${esc(run.id)}" data-thread-id="${esc(run.thread_id)}">全部批准这 ${requests.length} 项</button></div></div>`,
-  );
-  $('#dialog').classList.add('approval-shell');
-  $('#handling-batch-confirm')._requestIds = requests.map((q) => JSON.stringify(q.id));
-}
-
 // Durable Codex investigations. User text is always escaped before rendering.
 const handlingDesktop = (r) =>
   r?.connection?.driver === 'codex' || r?.transport === 'desktop' || r?.desktop_control;
@@ -189,8 +162,23 @@ const handlingActive = (r) =>
     'disconnected',
     'stopping',
   ].includes(r?.status);
+let handlingIndex;
+function indexHandlingRuns(rebuild = false) {
+  const rows = state?.handling;
+  if (rebuild || !handlingIndex || handlingIndex.state !== state || handlingIndex.rows !== rows || handlingIndex.size !== rows?.length) {
+    const tasks = new Map();
+    for (const run of rows || []) {
+      const taskId = run.task_id;
+      let list = tasks.get(taskId);
+      if (!list) tasks.set(taskId, list = []);
+      list.push(run);
+    }
+    handlingIndex = {state, rows, size: rows?.length, tasks};
+  }
+  return handlingIndex.tasks;
+}
 const taskRuns = (id) =>
-  (state?.handling || []).filter((r) => r.task_id === id && r.status !== 'setupCancelled');
+  (indexHandlingRuns().get(id) || []).filter((r) => r.status !== 'setupCancelled');
 const taskRun = (id) =>
   taskRuns(id)
     .filter((r) => r.current_source !== false)
@@ -427,40 +415,22 @@ function handlingRequests(id) {
     ),
   );
   $('#dialog').classList.add('approval-shell');
-  $('#handling-request [data-decision="decline"]')?.focus({ preventScroll: true });
+  $('#handling-request .approval-deny')?.focus({ preventScroll: true });
 }
 
 function syncHandlingApproval() {
   if ($('#overlay').hidden) return;
-  const host = $('#handling-request'),
-    batch = $('#handling-batch-confirm');
-  if (!host && !batch) return;
-  const run = (state?.handling || []).find((r) => r.id === (host || batch).dataset.runId);
-  const ids = host ? [host.dataset.requestId] : batch._requestIds || [];
+  const host = $('#handling-request');
+  if (!host) return;
+  const run = (state?.handling || []).find((r) => r.id === host.dataset.runId);
   if (
     !run ||
     run.stop_requested ||
     run.desktop_control ||
-    ids.some((id) => !run.requests?.some((q) => JSON.stringify(q.id) === id))
+    !run.requests?.some((q) => JSON.stringify(q.id) === host.dataset.requestId)
   )
     closeModal();
 }
-document.addEventListener('change', (event) => {
-  const input = event.target;
-  if (input.matches('[data-approval-option]')) {
-    const answer = $(`[data-handling-answer="${input.dataset.approvalOption}"]`);
-    if (answer) answer.value = input.value;
-  }
-});
-document.addEventListener('input', (event) => {
-  const input = event.target;
-  if (input.matches('[data-handling-answer]')) {
-    document
-      .querySelectorAll(`[name="approval-choice-${input.dataset.handlingAnswer}"]`)
-      .forEach((option) => (option.checked = option.value === input.value));
-  }
-});
-
 async function previewHandlingProposal(id) {
   const result = await rpc('prompt_history');
   const proposal = state.evolution?.handling?.find(p => p.id === id),
@@ -586,10 +556,6 @@ document.addEventListener('click', async (e) => {
         approvalBusy.add(requestKey);
         host.querySelectorAll('button').forEach((button) => (button.disabled = true));
         try {
-          const answers = {};
-          (q.params.questions || []).forEach(
-            (q, i) => (answers[q.id] = $(`[data-handling-answer="${i}"]`).value),
-          );
           await rpc('handling_request', {
             task_id: host.dataset.taskId,
             run_id: host.dataset.runId,
@@ -597,7 +563,6 @@ document.addEventListener('click', async (e) => {
             request_id: host.dataset.requestId,
             action: b.dataset.decision,
             option_id: b.dataset.optionId,
-            answers,
           });
           if ($('#handling-request') === host) closeModal();
           await refreshState(true);
@@ -607,22 +572,8 @@ document.addEventListener('click', async (e) => {
         }
         break;
       }
-      case 'batch':
-        handlingBatch(id);
-        break;
-      case 'batch-confirm':
-        await rpc('handling_request', {
-          task_id: id,
-          run_id: b.dataset.runId,
-          thread_id: b.dataset.threadId,
-          action: 'acceptAll',
-          request_ids: b._requestIds,
-        });
-        if ($('#handling-batch-confirm') === b) closeModal();
-        await refreshState(true);
-        toast('已批准所列请求，新增请求仍需确认');
-        break;
       case 'history': {
+        if(taskRuns(id).some(run=>run._details===false))await refreshState(true);
         const runs = taskRuns(id),
           current = taskRun(id),
           logs = await rpc('handling_audit', { task_id: id });

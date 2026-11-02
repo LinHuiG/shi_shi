@@ -119,13 +119,11 @@ function motionKey(el) {
     if (el.hasAttribute(name)) return el.tagName + ':' + name + ':' + el.getAttribute(name);
   return '';
 }
-function motionCompatible(a, b) {
-  return (
-    a.nodeType === b.nodeType &&
-    (a.nodeType !== 1 || (a.tagName === b.tagName && motionKey(a) === motionKey(b)))
-  );
-}
-function reconcileHtml(host, html) {
+function reconcileHtml(host, html, { animate = true } = {}) {
+  animate = animate && !motionReduced();
+  if (!animate)
+    for (const animation of host.getAnimations({ subtree: true }))
+      if (motionAnimations.get(animation.effect?.target) === animation) animation.cancel();
   const template = document.createElement('template');
   template.innerHTML = html;
   const active = document.activeElement,
@@ -134,7 +132,7 @@ function reconcileHtml(host, html) {
       : null;
   const rowSelector = '.task-row,.inbox-row,.event,.advice-card,.report-card';
   const positions = new Map(
-    [...host.querySelectorAll(rowSelector)].map((el) => [el, el.getBoundingClientRect()]),
+    animate ? [...host.querySelectorAll(rowSelector)].map((el) => [el, el.getBoundingClientRect()]) : [],
   );
   for (const el of positions.keys()) motionAnimations.get(el)?.cancel();
   const scrollers = [
@@ -154,7 +152,7 @@ function reconcileHtml(host, html) {
         old.nodeValue = next.nodeValue;
         const parent = old.parentElement;
         if (
-          parent?.matches(
+          animate && parent?.matches(
             '.badge,.task-status,.advice-status,.phase-copy,.side-pending,.usage-line b,.report-counts b',
           )
         )
@@ -165,6 +163,7 @@ function reconcileHtml(host, html) {
     const focused = old === active,
       open = old.tagName === 'DETAILS' ? old.open : null,
       value = old.matches('input,textarea,select') ? old.value : null,
+      nextValue = value !== null ? next.value : null,
       previous = old.getAttribute('value');
     for (const attr of [...old.attributes])
       if (
@@ -180,40 +179,37 @@ function reconcileHtml(host, html) {
     if (open !== null) old.open = open;
     if (value !== null) {
       if (focused) old.value = value;
-      else if (old.tagName === 'TEXTAREA') old.value = next.value;
-      else if (old.tagName === 'SELECT') old.value = next.value;
-      else if (previous !== next.getAttribute('value')) old.value = next.value;
+      else if (old.tagName !== 'INPUT' || previous !== next.getAttribute('value')) old.value = nextValue;
     }
   }
   function children(parent, next) {
-    const old = [...parent.childNodes],
-      used = new Set(),
-      keyed = new Map(old.map((n) => [motionKey(n), n]).filter(([k]) => k));
+    const remaining = new Set(parent.childNodes), candidates = new Map();
+    // Unkeyed nodes match in document order; a duplicate explicit key keeps
+    // the last old node, just as the previous keyed map did.
+    for (const node of [...remaining].reverse()) {
+      const key = motionKey(node), slot = key || node.nodeType + ':' + node.nodeName;
+      if (!candidates.has(slot)) candidates.set(slot, []);
+      const group = candidates.get(slot);
+      if (!key || !group.length) group.push(node);
+    }
     let cursor = parent.firstChild;
     for (const desired of [...next.childNodes]) {
-      const key = motionKey(desired);
-      let node = key ? keyed.get(key) : null;
-      if (node && (!motionCompatible(node, desired) || used.has(node))) node = null;
-      if (!node && !key)
-        node = old.find((n) => !used.has(n) && !motionKey(n) && motionCompatible(n, desired));
+      const key = motionKey(desired) || desired.nodeType + ':' + desired.nodeName;
+      let node = candidates.get(key)?.pop();
       if (node) {
-        used.add(node);
+        remaining.delete(node);
         patch(node, desired);
         if (node !== cursor) parent.insertBefore(node, cursor);
       } else {
-        node = desired.cloneNode(true);
+        node = desired;
         parent.insertBefore(node, cursor);
-        if (node.nodeType === 1 && parent.isConnected)
+        if (animate && node.nodeType === 1 && parent.isConnected)
           motionAnimate(node, [{ opacity: 0.4 }, { opacity: 1 }]);
       }
       cursor = node.nextSibling;
     }
-    const removals = old.filter((node) => !used.has(node) && node.parentNode === parent);
-    for (const node of removals) {
-      if (removals.length <= 6 && node.nodeType === 1 && node.matches(rowSelector))
-        motionExit(node);
-      else node.remove();
-    }
+    // Removed results must disappear with the update, not linger over the new list.
+    for (const node of remaining) node.remove();
   }
   children(host, template.content);
   for (const { el, node, top, scroll } of anchors)
@@ -289,7 +285,7 @@ new MutationObserver((records) => {
 new MutationObserver((records) => {
   const changed = new Set();
   for (const r of records) {
-    const el = r.target.nodeType === 3 ? r.target.parentElement : r.target;
+    const el = r.target.nodeType === 1 ? r.target : r.target.parentElement;
     if (
       !el?.isConnected ||
       el.closest(

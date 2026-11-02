@@ -5,45 +5,42 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Account for exactly the compact wire representation, including shared room metadata.
 #[derive(Default)]
-struct MessagePack {
+struct MessagePack<'a> {
     rooms: Vec<Value>,
-    keys: BTreeMap<(String, String, bool), String>,
+    keys: BTreeMap<(&'a str, &'a str, bool), String>,
     chars: usize,
 }
-impl MessagePack {
-    fn push(&mut self, m: &Message, limit: usize) -> Value {
-        let key = (m.source_id.clone(), m.chat.clone(), m.private);
-        let room = if let Some(id) = self.keys.get(&key) {
-            id.clone()
-        } else {
-            let id = format!("r{}", self.rooms.len() + 1);
-            let name = if !m.group.is_empty() {
-                &m.group
-            } else {
-                &m.chat
-            };
-            let mut row = json!({"id":id,"name":clip(name,80)});
-            if m.private {
-                row["private"] = json!(true);
-            }
-            if m.private {
-                let peer = if !m.mine {
-                    &m.sender
-                } else if !m.recipient.is_empty() {
-                    &m.recipient
+impl<'a> MessagePack<'a> {
+    fn push(&mut self, m: &'a Message, limit: usize) -> Value {
+        let room = self
+            .keys
+            .entry((&m.source_id, &m.chat, m.private))
+            .or_insert_with(|| {
+                let id = format!("r{}", self.rooms.len() + 1);
+                let name = if !m.group.is_empty() {
+                    &m.group
                 } else {
-                    &m.to
+                    &m.chat
                 };
-                if !peer.is_empty() {
-                    row["recipient"] = json!(clip(peer, 50));
+                let mut row = json!({"id":id,"name":clip(name,80)});
+                if m.private {
+                    row["private"] = json!(true);
+                    let peer = if !m.mine {
+                        &m.sender
+                    } else if !m.recipient.is_empty() {
+                        &m.recipient
+                    } else {
+                        &m.to
+                    };
+                    if !peer.is_empty() {
+                        row["recipient"] = json!(clip(peer, 50));
+                    }
                 }
-            }
-            omit_empty(&mut row);
-            self.chars += row.to_string().chars().count() + usize::from(!self.rooms.is_empty());
-            self.rooms.push(row);
-            self.keys.insert(key, id.clone());
-            id
-        };
+                omit_empty(&mut row);
+                self.chars += json_chars(&row) + usize::from(!self.rooms.is_empty());
+                self.rooms.push(row);
+                id
+            });
         let mut row = message(m, limit);
         let fields = row.as_object_mut().unwrap();
         for key in ["source_id", "chat", "private", "recipient"] {
@@ -57,75 +54,114 @@ pub fn message_batch_chars(messages: &[Message]) -> usize {
     let mut pack = MessagePack::default();
     let rows = messages
         .iter()
-        .map(|m| pack.push(m, 2000))
-        .collect::<Vec<_>>();
-    json!({"changes":rows,"rooms":pack.rooms})
-        .to_string()
-        .chars()
-        .count()
+        .map(|m| json_chars(&pack.push(m, 2000)))
+        .sum::<usize>();
+    r#"{"changes":[],"rooms":[]}"#.len() + rows + messages.len().saturating_sub(1) + pack.chars
 }
-/// No fixed message-count cap: long and short messages share the configured
-/// character budget. Each body is clipped to the first 2,000 Unicode chars
-/// before volume accounting.
-pub fn batch_messages(mut messages: Vec<Message>, limit: usize) -> Vec<Message> {
-    messages.sort_by_key(|m| (m.updated_at, m.time, m.id.clone()));
-    let mut pack = MessagePack::default();
-    let mut chars = "{\"changes\":[],\"rooms\":[]}".chars().count();
-    let mut count = 0;
-    messages
-        .into_iter()
-        .take_while(|m| {
-            let before = pack.chars;
-            let row = pack.push(m, 2000);
-            let size =
-                row.to_string().chars().count() + pack.chars - before + usize::from(count > 0);
-            if chars + size > limit {
-                return false;
-            }
-            chars += size;
-            count += 1;
-            true
-        })
-        .collect()
+/// Bound preparation by characters that cannot disappear from the final request:
+/// every preview body plus its room, truncation flag and original length.
+/// Include the first row beyond the bound so the exact fitter can report an
+/// indivisible oversized message. Original ids and field names are not counted;
+/// wire aliases and shared columns may make those much smaller.
+pub fn analysis_candidates<'a>(
+    messages: impl Iterator<Item = &'a Message>,
+    limit: usize,
+) -> Vec<Message> {
+    let mut rows = Vec::new();
+    let mut lower_bound = 0usize;
+    for message in messages {
+        lower_bound = lower_bound
+            .saturating_add(message.text.chars().take(2000).count() + r#"["r1",true,0]"#.len());
+        rows.push(message.clone());
+        if lower_bound > limit {
+            break;
+        }
+    }
+    rows
 }
+#[cfg(test)]
 pub fn pending(s: &State) -> Vec<Message> {
     pending_for(s, false)
 }
+#[cfg(test)]
 pub fn pending_for(s: &State, manual: bool) -> Vec<Message> {
-    let cutoff = now() - s.config.analysis_lookback_hours as i64 * 3_600_000;
-    pending_all(s)
-        .into_iter()
-        .filter(|m| m.time <= 0 || m.time >= cutoff)
-        .filter(|m| manual || s.analysis_retry_counts.get(&m.id).copied().unwrap_or(0) < 3)
-        .collect()
+    pending_refs(s, manual).cloned().collect()
 }
-pub fn pending_all(s: &State) -> Vec<Message> {
+pub(crate) const COMMAND_RETRY_REASON: &str =
+    "本批存在已执行或结果未知的命令，须核对命令记录后手动重试，未标为已分析";
+pub(crate) fn automatic_retry(s: &State, id: &str, scope: Option<&String>) -> bool {
+    if let Some(previous) = s.analysis_retry_scopes.get(id) {
+        return Some(previous) != scope;
+    }
+    // Retry counts order ordinary failures behind new messages, not retire them.
+    // The exact persisted command guard also covers installations predating this policy.
+    !s.analysis_retries
+        .get(id)
+        .is_some_and(|reason| reason.ends_with(COMMAND_RETRY_REASON))
+}
+pub fn pending_refs(s: &State, manual: bool) -> impl Iterator<Item = &Message> {
+    let cutoff = now() - s.config.analysis_lookback_hours as i64 * 3_600_000;
+    let retry_scope = (!manual && !s.analysis_retry_scopes.is_empty())
+        .then(|| crate::engine::analysis_block_fingerprint(s));
     let rooms = s
         .tasks
         .iter()
-        .filter(|t| !t.archived && t.merged_into.is_empty())
-        .flat_map(|t| t.evidence.all())
-        .filter_map(|id| s.messages.get(&id))
+        .filter(|t| s.config.analysis_related_only && !t.archived && t.merged_into.is_empty())
+        .flat_map(|t| t.evidence.iter())
+        .filter_map(|id| s.messages.get(id))
         .filter(|m| !m.withdrawn)
         .map(|m| (&m.source_id, &m.chat))
         .collect::<BTreeSet<_>>();
     s.messages
         .values()
-        .filter(|m| {
+        .filter(move |m| {
             !m.withdrawn
+                && (m.time <= 0 || m.time >= cutoff)
                 && (!s.config.analysis_related_only
                     || m.relevant()
                     || rooms.contains(&(&m.source_id, &m.chat)))
                 && !crate::message_progress::analyzed(s, m)
         })
-        .cloned()
-        .collect()
+        .filter(move |m| manual || automatic_retry(s, &m.id, retry_scope.as_ref()))
 }
-pub fn automatic_due(s: &State, pending: &[Message], at: i64, last_attempt: i64) -> bool {
-    if !s.config.automatic_analysis_enabled() {
-        return false;
+
+/// Compare the route and inputs this purpose actually uses. Catalog refreshes,
+/// other purposes' prompts/models and trace preferences do not revoke results.
+pub(crate) fn config_authority(config: &Config, kind: &str) -> Value {
+    let selected = config.model_choice(kind);
+    let route = crate::ai_backend::connection_by_id(config, selected.connection_id)
+        .map(|connection| json!({"identity":connection.cache_key(),"stream":connection.stream}))
+        .unwrap_or_else(|_| json!(selected.connection_id));
+    let mut value = json!({
+        "route":route,"model":selected.model,"effort":selected.reasoning_effort,
+        "policy":crate::ai::effective_policy(config, kind),
+        "workdir":config.analysis_workdir,"max_input_chars":config.max_input_chars,
+        "retrieval_budget_chars":config.retrieval_budget_chars,
+        "analysis_lookback_hours":config.analysis_lookback_hours,
+        "analysis_related_only":config.analysis_related_only,
+    });
+    if kind == "classify" {
+        let tools = config
+            .tools
+            .iter()
+            .filter(|tool| tool.enabled && tool.compatibility_issue().is_none())
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            value["tool_policy"] = json!(crate::ai::effective_policy(config, "tool_call"));
+        }
+        value["tools"] = json!(tools);
+        value["leaders"] = json!(config.leaders);
     }
-    if pending.is_empty() {
+    value
+}
+pub fn automatic_due<'a>(
+    s: &State,
+    pending: impl IntoIterator<Item = &'a Message>,
+    at: i64,
+    last_attempt: i64,
+) -> bool {
+    let mut pending = pending.into_iter().peekable();
+    if !s.config.automatic_analysis_enabled() || pending.peek().is_none() {
         return false;
     }
     // A fresh one-shot filter decision hands off immediately. Regular scheduled
@@ -133,38 +169,58 @@ pub fn automatic_due(s: &State, pending: &[Message], at: i64, last_attempt: i64)
     (s.config.message_filter_enabled && s.message_filter.early)
         || (at - last_attempt >= 60_000 && due(s, pending, at))
 }
-pub fn due(s: &State, pending: &[Message], at: i64) -> bool {
+pub fn due<'a>(s: &State, pending: impl IntoIterator<Item = &'a Message>, at: i64) -> bool {
     due_reason(s, pending, at).is_some()
 }
-pub fn due_reason(s: &State, pending: &[Message], at: i64) -> Option<&'static str> {
-    if pending.is_empty() {
-        return None;
+/// Keep the original cadence after cancellation. A boundary already reached
+/// when the user stopped the round is consumed, including an exact tie.
+pub(crate) fn next_interval_at(anchor: i64, interval: i64, interrupted_at: i64) -> i64 {
+    let interval = interval.max(1);
+    if anchor <= 0 {
+        return if interrupted_at > 0 {
+            interrupted_at.saturating_add(interval)
+        } else {
+            0
+        };
     }
-    // A threshold-triggered run resets the same timer; never immediately chain another run.
+    let steps = (interrupted_at.saturating_sub(anchor).max(0) / interval).saturating_add(1);
+    anchor.saturating_add(interval.saturating_mul(steps))
+}
+pub fn due_reason<'a>(
+    s: &State,
+    pending: impl IntoIterator<Item = &'a Message>,
+    at: i64,
+) -> Option<&'static str> {
+    let mut pending = pending.into_iter().peekable();
+    pending.peek()?;
+    // New rounds share this timer. Batches within an active round continue
+    // directly and do not re-enter these startup conditions.
     if s.last_analysis_at > 0 && at - s.last_analysis_at < 60_000 {
         return None;
-    }
-    if s.analysis_interrupted_at > 0
-        && at - s.analysis_interrupted_at < s.config.analysis_interval_minutes as i64 * 60_000
-    {
-        return None;
-    }
-    let budget = crate::ai::message_budget(&s.config, "classify");
-    let mut pack = MessagePack::default();
-    let mut volume = "{\"changes\":[],\"rooms\":[]}".chars().count();
-    for m in pending {
-        volume += pack.push(m, 2000).to_string().chars().count() + 1;
-        if volume + pack.chars >= budget * 4 / 5 {
-            return Some("message_volume");
-        }
     }
     let anchor = if s.last_analysis_at > 0 {
         s.last_analysis_at
     } else {
         s.analysis_pending_since
     };
-    (anchor > 0 && at - anchor >= s.config.analysis_interval_minutes as i64 * 60_000)
-        .then_some("analysis_interval")
+    let scheduled_at = next_interval_at(
+        anchor,
+        s.config.analysis_interval_minutes as i64 * 60_000,
+        s.analysis_interrupted_at,
+    );
+    if s.analysis_interrupted_at > 0 && at < scheduled_at {
+        return None;
+    }
+    let budget = crate::ai::message_budget(&s.config, "classify");
+    let mut pack = MessagePack::default();
+    let mut volume = "{\"changes\":[],\"rooms\":[]}".chars().count();
+    for m in pending {
+        volume += json_chars(&pack.push(m, 2000)) + 1;
+        if volume + pack.chars >= budget * 4 / 5 {
+            return Some("message_volume");
+        }
+    }
+    (anchor > 0 && at >= scheduled_at).then_some("analysis_interval")
 }
 pub fn mark_pending(s: &mut State, pending: bool, at: i64) {
     s.pending_analysis = pending;
@@ -174,48 +230,36 @@ pub fn mark_pending(s: &mut State, pending: bool, at: i64) {
         s.analysis_pending_since = at;
     }
 }
-pub fn materialize(action: &Value, tasks: &[Task]) -> Result<Task, String> {
-    let old = if action["action"] == "update" {
-        tasks
-            .iter()
-            .find(|t| Some(t.id.as_str()) == action["task_id"].as_str())
-    } else {
-        None
-    };
-    let mut v = old
-        .map(|t| json!(t))
-        .unwrap_or_else(|| json!(Task::default()));
+pub fn materialize(action: &Value, old: Option<&Task>) -> Result<Task, String> {
+    let mut task = old.cloned().unwrap_or_default();
     let fields = action["fields"].as_array().ok_or("AI 动作缺少字段差异")?;
     let mut seen = BTreeSet::new();
     for change in fields {
         let key = change["field"].as_str().ok_or("AI 字段无效")?;
-        if ![
-            "title",
-            "description",
-            "status",
-            "blocker",
-            "waiting_for",
-            "due",
-            "summary",
-        ]
-        .contains(&key)
-            || !seen.insert(key)
-            || !change["value"].is_string()
-        {
+        let value = change["value"].as_str().ok_or("AI 字段重复或无效")?;
+        if !seen.insert(key) {
             return Err("AI 字段重复或无效".into());
         }
-        v[key] = change["value"].clone();
+        if key == "deferred_until" {
+            task.deferred_until = if value == "0" {
+                0
+            } else {
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map_err(|_| "延后时间无效")?
+                    .timestamp_millis()
+            };
+        } else {
+            *task.text_field_mut(key).ok_or("AI 字段重复或无效")? = value.into();
+        }
     }
-    v["reason"] = action["reason"].clone();
-    let mut t: Task = serde_json::from_value(v).map_err(|e| e.to_string())?;
-    if let Some(tags) = action.get("tags").filter(|v| v.is_array()) {
-        t.tags = serde_json::from_value(tags.clone()).map_err(|_| "事项标签格式无效")?;
-    }
-    Ok(t)
+    task.reason = action["reason"].as_str().ok_or("AI 动作缺少理由")?.into();
+    Ok(task)
 }
+
 pub fn clip(s: &str, n: usize) -> String {
-    let mut out: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(n).collect();
+    if chars.next().is_some() {
         out.push('…');
     }
     out
@@ -231,35 +275,46 @@ fn omit_empty(v: &mut Value) {
         });
     }
 }
-fn project(v: &Value, fields: &[&str], n: usize) -> Value {
+pub(crate) fn text_fields<'a>(
+    fields: impl IntoIterator<Item = (&'a str, &'a str)>,
+    n: usize,
+) -> Value {
     let mut out = serde_json::Map::new();
     let mut truncated = vec![];
-    for key in fields {
-        if let Some(x) = v.get(key) {
-            if let Some(s) = x.as_str() {
-                if s.is_empty() {
-                    continue;
-                }
-                if s.chars().count() > n {
-                    truncated.push(*key);
-                }
-                out.insert(
-                    (*key).into(),
-                    json!(if *key == "id" || *key == "task_id" {
-                        s.to_string()
-                    } else {
-                        clip(s, n)
-                    }),
-                );
-            } else if !x.is_null() {
-                out.insert((*key).into(), x.clone());
-            }
+    for (key, text) in fields {
+        if text.is_empty() {
+            continue;
         }
+        if text.chars().nth(n).is_some() {
+            truncated.push(key);
+        }
+        out.insert(
+            key.into(),
+            json!(if key == "id" || key == "task_id" {
+                text.to_owned()
+            } else {
+                clip(text, n)
+            }),
+        );
     }
     if !truncated.is_empty() {
         out.insert("truncated_fields".into(), json!(truncated));
     }
     Value::Object(out)
+}
+fn project(v: &Value, fields: &[&str], n: usize) -> Value {
+    let mut out = text_fields(
+        fields
+            .iter()
+            .filter_map(|&key| v[key].as_str().map(|s| (key, s))),
+        n,
+    );
+    for key in fields {
+        if let Some(value) = v.get(key).filter(|v| !v.is_null() && !v.is_string()) {
+            out[*key] = value.clone();
+        }
+    }
+    out
 }
 pub fn task(t: &Task) -> Value {
     task_value(&json!(t))
@@ -301,11 +356,11 @@ pub fn task_value(t: &Value) -> Value {
             v["summary"] = json!("（未命名事项）");
         }
     }
+    v["deferred_until"] = t["deferred_until"].clone();
     v["tags"] = json!(t["tags"]
         .as_array()
         .into_iter()
         .flatten()
-        .take(8)
         .map(|x| project(x, &["kind", "value"], 40))
         .collect::<Vec<_>>());
     if v["manual"] == false {
@@ -317,16 +372,9 @@ pub fn task_value(t: &Value) -> Value {
 pub fn task_detail(t: &Task) -> Value {
     let mut value = json!(t);
     value.as_object_mut().unwrap().remove("steps");
-    value["summary"] = json!(if t.summary.trim().is_empty() {
-        crate::model::summary_content(t)
-    } else {
-        t.summary.clone()
-    });
-    value["evidence"] = json!({
-        "direct":t.evidence.direct,
-        "background":t.evidence.background,
-        "completion":t.evidence.completion
-    });
+    if t.summary.trim().is_empty() {
+        value["summary"] = json!(crate::model::summary_content(t));
+    }
     value
 }
 pub fn message(m: &Message, limit: usize) -> Value {
@@ -367,21 +415,27 @@ pub fn message(m: &Message, limit: usize) -> Value {
     v
 }
 pub fn audit(a: &Audit) -> Value {
-    audit_value(&json!(a))
+    audit_changes(
+        json!({"task_id":a.task_id,"time":a.time,"kind":a.kind,"detail":clip(&a.detail,160)}),
+        &a.before,
+        &a.after,
+    )
 }
 pub fn audit_value(a: &Value) -> Value {
-    let select = |v: &Value| {
-        if let Some(rows) = v.as_array() {
+    audit_changes(
+        json!({"task_id":a["task_id"],"time":a["time"],"kind":a["kind"],"detail":clip(a["detail"].as_str().unwrap_or(""),160)}),
+        &a["before"],
+        &a["after"],
+    )
+}
+fn audit_changes(mut result: Value, before: &Value, after: &Value) -> Value {
+    let [before, after] = [before, after].map(|value| {
+        value.as_array().map_or(value, |rows| {
             rows.iter()
-                .find(|r| r["id"] == a["task_id"])
-                .cloned()
-                .unwrap_or(Value::Null)
-        } else {
-            v.clone()
-        }
-    };
-    let before = select(&a["before"]);
-    let after = select(&a["after"]);
+                .find(|row| row["id"] == result["task_id"])
+                .unwrap_or(&Value::Null)
+        })
+    });
     let mut changes = serde_json::Map::new();
     for key in [
         "title",
@@ -409,56 +463,81 @@ pub fn audit_value(a: &Value) -> Value {
             );
         }
     }
-    let mut result = json!({"task_id":a["task_id"],"time":a["time"],"kind":a["kind"],"detail":clip(a["detail"].as_str().unwrap_or(""),160),"changes":changes,"note":"字段为摘录；省略字段不代表清空"});
+    result["changes"] = Value::Object(changes);
+    result["note"] = json!("字段为摘录；省略字段不代表清空");
     if before["decision_context"].is_object() {
         result["prior_decision"] = before["decision_context"].clone();
     }
     result
 }
+/// Find the largest nonempty prefix that fits a monotone request budget.
+/// Preparation errors stop the search; None means only that this prefix is too large.
+pub(crate) fn fit_prefix<T>(
+    count: usize,
+    mut prepare: impl FnMut(usize) -> Result<Option<T>, String>,
+) -> Result<Option<(usize, T)>, String> {
+    let (mut low, mut high) = (1, count);
+    let mut accepted = None;
+    while low <= high {
+        let middle = low + (high - low) / 2;
+        if let Some(candidate) = prepare(middle)? {
+            accepted = Some((middle, candidate));
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    Ok(accepted)
+}
+
 /// Select whole rows under a section budget and disclose omissions; never silently truncate JSON.
-pub fn rows(items: impl IntoIterator<Item = Value>, max_rows: usize, chars: usize) -> Value {
+pub fn rows(items: impl IntoIterator<Item = Value>, chars: usize) -> Value {
+    let mut items = items.into_iter();
     let mut result = vec![];
     let mut used = 2;
     let mut omitted = 0;
-    for row in items {
-        let n = row.to_string().chars().count() + 1;
-        if result.len() < max_rows && n <= chars.saturating_sub(used) {
+    while used < chars {
+        let Some(row) = items.next() else { break };
+        let n = json_chars(&row) + usize::from(!result.is_empty());
+        if n <= chars.saturating_sub(used) {
             used += n;
             result.push(row);
         } else {
             omitted += 1;
         }
     }
-    json!({"items":result,"omitted":omitted})
+    json!({"items":result,"omitted":omitted + items.count()})
 }
 pub fn suggestions(s: &State, context: &str) -> Value {
-    let terms = terms(context);
+    let terms = terms([context]);
     let mut entries = s.suggestions.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|r| {
+    entries.sort_by_cached_key(|r| {
         (
             std::cmp::Reverse(
                 terms
-                    .intersection(&self::terms(&format!("{} {}", r.title, r.rule)))
+                    .intersection(&self::terms([r.title.as_str(), r.rule.as_str()]))
                     .count(),
             ),
             std::cmp::Reverse(r.updated),
         )
     });
-    rows(entries.into_iter().map(|r|json!({"id":r.id,"title":clip(&r.title,80),"rule":clip(&r.rule,240),"decision":crate::evolution::decision(r),"evidence":r.evidence.iter().rev().take(3).collect::<Vec<_>>()})),8,2400)
+    rows(entries.into_iter().map(|r|json!({"id":r.id,"title":clip(&r.title,80),"rule":clip(&r.rule,240),"decision":crate::evolution::decision(r),"evidence":r.evidence.iter().rev().take(3).collect::<Vec<_>>()})),2400)
 }
-fn terms(s: &str) -> BTreeSet<String> {
+fn terms<'a>(parts: impl IntoIterator<Item = &'a str>) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for word in s
-        .to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-    {
-        if word.is_ascii() && word.len() >= 3 {
-            out.insert(word.to_string());
-        }
-        if !word.is_ascii() {
-            let c: Vec<_> = word.chars().collect();
-            for a in c.windows(4) {
-                out.insert(a.iter().collect());
+    for part in parts {
+        for word in part
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+        {
+            if word.is_ascii() && word.len() >= 3 {
+                out.insert(word.to_string());
+            }
+            if !word.is_ascii() {
+                for ((start, _), (end, ch)) in word.char_indices().zip(word.char_indices().skip(3))
+                {
+                    out.insert(word[start..end + ch.len_utf8()].to_owned());
+                }
             }
         }
     }
@@ -470,20 +549,14 @@ pub struct Batch {
     pub allowed: BTreeMap<String, Message>,
     pub versions: BTreeMap<String, i64>,
 }
-#[cfg(test)]
-pub fn classify(s: &State, changes: &[Message]) -> Result<Batch, String> {
-    classify_with_task_limit(s, changes, usize::MAX)
-}
-/// Build one fresh-session batch. Neighbouring messages are deliberately not
-/// injected: the model must request additional history through the bounded
-/// snapshot tool, so an old conversation cannot silently pollute a new batch.
-pub fn classify_with_task_limit(
-    s: &State,
-    changes: &[Message],
-    task_limit: usize,
-) -> Result<Batch, String> {
+const REPLY_CONTEXT_CHARS: usize = 8000;
+
+/// Build one fresh-session batch. Only explicit reply ancestors may accompany
+/// the delta, within the serialized character budget. Other history remains in
+/// the bounded snapshot tool; proximity alone never includes a message body.
+pub fn classify(s: &State, changes: &[Message]) -> Batch {
     // Keys include source/account identity. A room name alone is never an identity.
-    let mut owners: BTreeMap<String, Vec<&Task>> = BTreeMap::new();
+    let mut owners: BTreeMap<&str, Vec<&Task>> = BTreeMap::new();
     for t in s
         .tasks
         .iter()
@@ -494,16 +567,23 @@ pub fn classify_with_task_limit(
         }
     }
     let mut scores: BTreeMap<&str, (usize, &Task)> = BTreeMap::new();
-    // A fresh batch contains only the newly selected messages. Explicit reply
-    // links may associate a task, but never inject the older parent body.
-    let context: Vec<&Message> = vec![];
-    for m in changes {
+    let changed_ids = changes
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let max_room_id = format!("r{}", changes.len() + s.messages.len());
+    let mut context = Vec::new();
+    let mut reply_messages = Vec::new();
+    let mut walked = BTreeMap::new();
+    let mut context_chars = 2; // JSON array brackets; count each row and separator below.
+    let mut reply_context_incomplete = false;
+    for (chain_id, m) in changes.iter().enumerate() {
         let mut cursor = m;
-        let mut chain = BTreeSet::new();
         // Explicit reply identity is structural context, not an arbitrary
         // neighbouring-message window.
-        for _ in 0..8 {
-            if !chain.insert(cursor.id.as_str()) {
+        loop {
+            if let Some(previous_chain) = walked.insert(cursor.id.as_str(), chain_id) {
+                reply_context_incomplete |= previous_chain == chain_id;
                 break;
             }
             if let Some(ts) = owners.get(cursor.id.as_str()) {
@@ -521,100 +601,102 @@ pub fn classify_with_task_limit(
                     scores.insert(&t.id, (1000, *t));
                 }
             }
+            if cursor.reply.is_empty() {
+                break;
+            }
             let Some(parent) = s
                 .messages
                 .get(&cursor.reply)
                 .filter(|p| !p.withdrawn && p.source_id == m.source_id && p.chat == m.chat)
             else {
+                reply_context_incomplete = true;
                 break;
             };
-            // Reply identity is used only to associate the task. The parent
-            // body is not injected into a fresh batch; the model can request it
-            // by id through the bounded snapshot tool.
+            if !changed_ids.contains(parent.id.as_str()) && !walked.contains_key(parent.id.as_str())
+            {
+                reply_messages.push(parent);
+                // Measure the uncompressed row conservatively. Room compression
+                // only reduces repeated metadata; the final request still goes
+                // through the engine's exact global input-budget check.
+                let mut row = message(parent, 2000);
+                row["room"] = json!(max_room_id);
+                let chars = json_chars(&row) + usize::from(!context.is_empty());
+                if context_chars + chars <= REPLY_CONTEXT_CHARS {
+                    context_chars += chars;
+                    context.push(parent);
+                    reply_context_incomplete |= row["truncated"] == true;
+                } else {
+                    reply_context_incomplete = true;
+                }
+            }
             cursor = parent;
         }
     }
-    for m in &context {
-        if let Some(ts) = owners.get(m.id.as_str()) {
-            for t in ts {
-                scores.entry(&t.id).or_insert((700, *t));
-            }
-        }
-    }
-    let query = terms(
-        &changes
-            .iter()
-            .map(|m| m.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
+    let query = terms(changes.iter().map(|m| m.text.as_str()));
+    let rooms = changes
+        .iter()
+        .map(|m| (&m.source_id, &m.chat))
+        .collect::<BTreeSet<_>>();
     for t in s.tasks.iter().filter(|t| {
         !t.archived
             && t.merged_into.is_empty()
             && t.generation.is_empty()
-            && (t.status == "待处理" || t.updated > now() - 86_400_000)
+            && (["待处理", "处理中"].contains(&t.status.as_str()) || t.updated > now() - 86_400_000)
     }) {
-        let shared = query
-            .intersection(&terms(&format!("{} {}", t.title, t.description)))
-            .cloned()
-            .collect::<Vec<_>>();
+        let words = terms([t.title.as_str(), t.description.as_str()]);
+        let (shared, precise) =
+            query
+                .intersection(&words)
+                .fold((0, false), |(count, precise), word| {
+                    (
+                        count + 1,
+                        precise
+                            || (word.is_ascii()
+                                && word.len() >= 6
+                                && word.chars().any(|c| c.is_ascii_digit())),
+                    )
+                });
         let same_room = t
             .evidence
-            .all()
             .iter()
             .filter_map(|id| s.messages.get(id))
-            .any(|p| {
-                changes
-                    .iter()
-                    .any(|m| m.source_id == p.source_id && m.chat == p.chat)
-            });
-        let precise = shared
-            .iter()
-            .any(|w| w.is_ascii() && w.len() >= 6 && w.chars().any(|c| c.is_ascii_digit()));
+            .any(|p| rooms.contains(&(&p.source_id, &p.chat)));
         if precise
             || (same_room
-                && (shared.len() >= 2
+                && (shared >= 2
                     || changes
                         .iter()
                         .any(|m| (m.time - t.updated).abs() < 86_400_000)))
         {
-            scores.entry(&t.id).or_insert((
-                if precise {
-                    500
-                } else {
-                    100 + shared.len().min(99)
-                },
-                t,
-            ));
+            scores
+                .entry(&t.id)
+                .or_insert((if precise { 500 } else { 100 + shared.min(99) }, t));
         }
     }
-    let mut candidates = scores.values().copied().collect::<Vec<_>>();
-    candidates.sort_by_key(|(score, t)| {
+    // Freeze the complete relevance order once. Budget fitting only takes a
+    // prefix of these summaries; it never reranks tasks for each candidate.
+    let mut ordered = scores
+        .values()
+        .copied()
+        .chain(
+            s.tasks
+                .iter()
+                .filter(|task| {
+                    !task.archived
+                        && task.merged_into.is_empty()
+                        && task.generation.is_empty()
+                        && !scores.contains_key(task.id.as_str())
+                })
+                .map(|task| (0, task)),
+        )
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(score, t)| {
         (
             std::cmp::Reverse(*score),
             std::cmp::Reverse(t.updated),
             &t.id,
         )
     });
-    // All unarchived summaries are supplied by default. The engine only lowers
-    // this to <=10 after the exact final prompt exceeds the configured limit.
-    let candidate_ids = candidates
-        .iter()
-        .map(|(_, task)| task.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut ordered = candidates.clone();
-    let mut others = s
-        .tasks
-        .iter()
-        .filter(|task| {
-            !task.archived
-                && task.merged_into.is_empty()
-                && task.generation.is_empty()
-                && !candidate_ids.contains(task.id.as_str())
-        })
-        .collect::<Vec<_>>();
-    others.sort_by_key(|task| (std::cmp::Reverse(task.updated), &task.id));
-    ordered.extend(others.into_iter().map(|task| (0, task)));
     let allowed = changes
         .iter()
         .chain(context.iter().copied())
@@ -624,46 +706,36 @@ pub fn classify_with_task_limit(
         .iter()
         .map(|(_, t)| (t.id.clone(), t.updated))
         .collect::<BTreeMap<_, _>>();
-    let task_limit = task_limit.min(ordered.len());
-    let initial_tasks = rows(
-        ordered.iter().take(task_limit).map(|(score, t)| {
+    let initial_tasks = ordered
+        .iter()
+        .map(|(score, t)| {
             let mut v = task(t);
             if *score > 0 {
                 v["match_rank"] = json!(score);
             }
             v
-        }),
-        task_limit.max(1),
-        usize::MAX,
-    );
-    let initial_ids = initial_tasks["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|t| t["id"].as_str())
-        .collect::<BTreeSet<_>>();
+        })
+        .collect::<Vec<_>>();
     let history = rows(
         s.audit
             .iter()
             .rev()
             .filter(|a| {
-                initial_ids.contains(a.task_id.as_str())
+                !a.task_id.is_empty()
+                    && versions.contains_key(&a.task_id)
                     && (a.kind.starts_with("manual") || a.kind == "merge" || a.kind == "undo")
             })
-            .take(6)
             .map(audit),
-        6,
         2800,
     );
     let mut records = changes
         .iter()
-        .chain(context.iter().copied())
+        .chain(reply_messages.iter().copied())
         .map(|m| {
             // Full text and secondary metadata remain local until explicitly requested.
             let mut data = json!(m);
             let o = data.as_object_mut().unwrap();
             o.retain(|_, v| v != &json!(false));
-            data["time"] = json!(stamp(m.time));
             omit_empty(&mut data);
             json!({"id":m.id,"kind":"message","source":m.source_id,"chat":m.chat,"time":m.time,"data":data})
         })
@@ -685,11 +757,6 @@ pub fn classify_with_task_limit(
         .filter(|r| r.active && !current.contains(r.rule.trim()))
         .map(|r| r.rule.clone())
         .collect::<BTreeSet<_>>();
-    let index = ordered
-        .iter()
-        .filter(|(_, t)| !initial_ids.contains(t.id.as_str()))
-        .map(|(_, t)| json!({"id":t.id,"title":clip(&t.title,80)}))
-        .collect::<Vec<_>>();
     let mut pack = MessagePack::default();
     let changes_wire = changes
         .iter()
@@ -699,7 +766,15 @@ pub fn classify_with_task_limit(
         .iter()
         .map(|m| pack.push(m, 2000))
         .collect::<Vec<_>>();
-    let mut payload = json!({"changes":changes_wire,"rooms":pack.rooms,"context":context_wire,"tasks":initial_tasks["items"],"task_index":index,"manual_history":history,"leaders":s.config.leaders,"rules":rules,"retrieval":{"open_tasks":ordered.len(),"local_candidates":candidates.len(),"omitted_tasks":index.len()},"_local_context":{"records":records,"expires":now()+300_000}});
+    let room_aliases = pack
+        .keys
+        .iter()
+        .map(|((source, chat, _), id)| (id.clone(), json!({"source":source,"chat":chat})))
+        .collect::<BTreeMap<_, _>>();
+    let mut payload = json!({"changes":changes_wire,"rooms":pack.rooms,"context":context_wire,"tasks":initial_tasks,"manual_history":history,"leaders":s.config.leaders,"rules":rules,"retrieval":{"open_tasks":ordered.len(),"local_candidates":scores.len(),"omitted_tasks":0},"_local_context":{"records":records,"room_aliases":room_aliases,"expires":now()+300_000}});
+    if reply_context_incomplete {
+        payload["reply_context_incomplete"] = json!(true);
+    }
     if payload["manual_history"]["items"]
         .as_array()
         .is_some_and(|a| a.is_empty())
@@ -707,7 +782,7 @@ pub fn classify_with_task_limit(
         payload.as_object_mut().unwrap().remove("manual_history");
     }
     omit_empty(&mut payload);
-    Ok(Batch {
+    Batch {
         payload,
         fingerprints: changes
             .iter()
@@ -715,7 +790,7 @@ pub fn classify_with_task_limit(
             .collect(),
         allowed,
         versions,
-    })
+    }
 }
 
 /// Project a payload into the bounded per-purpose request shape. This is the
@@ -723,9 +798,8 @@ pub fn classify_with_task_limit(
 pub fn prepare(kind: &str, p: &Value) -> Value {
     let mut p = p.clone();
     if kind == "advice_revision" {
-        let values = p["evidence"].as_array().cloned().unwrap_or_default();
         let selected = rows(
-            values.iter().map(|e| {
+            p["evidence"].as_array().into_iter().flatten().map(|e| {
                 if e.get("before").is_some() {
                     return audit_value(e);
                 }
@@ -738,25 +812,19 @@ pub fn prepare(kind: &str, p: &Value) -> Value {
                         "instructions",
                         "title",
                         "text",
+                        "rounds",
+                        "omitted_rounds",
                     ],
                     400,
                 );
                 if let Some(task) = e.get("task") {
                     row["task"] = task_value(task);
                 }
-                if let Some(rounds) = e["rounds"].as_array() {
-                    row["rounds"] = json!(rounds
-                        .iter()
-                        .take(2)
-                        .map(|r| project(r, &["question", "conclusion"], 600))
-                        .collect::<Vec<_>>());
-                }
                 if e.is_string() {
                     return json!(clip(e.as_str().unwrap(), 600));
                 }
                 row
             }),
-            6,
             6500,
         );
         if p["evidence"].is_array() {
@@ -779,15 +847,18 @@ pub fn prepare(kind: &str, p: &Value) -> Value {
             let k=r["event"]["kind"].as_str().unwrap_or("");
             k.starts_with("manual")||k=="undo"||k=="merge"
         }).map(|r|json!({"evidence_id":r["evidence_id"],"event":if r["event"]["changes"].is_object(){r["event"].clone()}else{audit_value(&r["event"])}}));
-        let selected = rows(audits, 6, 7000);
+        let selected = rows(audits, 7000);
         p["daily_evidence"] = json!({"audit":selected["items"],"omitted":selected["omitted"],"logs":[],"notice":"仅人工修正的字段差异；技术运行日志不用于推导业务规则，摘录之外不推断"});
     }
     if kind == "report" {
-        let mut tasks = p["report_tasks"].as_array().cloned().unwrap_or_default();
-        tasks.sort_by_key(|t| {
+        let mut tasks = p["report_tasks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        tasks.sort_by_cached_key(|t| {
             (
-                t["status"] != "待处理",
-                t["due"].as_str().is_none_or(str::is_empty),
+                t["status"] != "待处理" && t["status"] != "处理中",
                 t["due"].as_str().unwrap_or("").is_empty(),
                 t["id"].to_string(),
             )
@@ -798,7 +869,7 @@ pub fn prepare(kind: &str, p: &Value) -> Value {
                 .entry(t["status"].as_str().unwrap_or("未知").into())
                 .or_default() += 1;
         }
-        let selected = rows(tasks.iter().map(task_value), 12, 7000);
+        let selected = rows(tasks.into_iter().map(task_value), 7000);
         p["report_tasks"] = selected["items"].clone();
         p["coverage"] = json!({"status_counts":counts,"omitted_tasks":selected["omitted"],"notice":"代表事项摘录，不能声称逐项检查了所有事项"});
         let delta = rows(
@@ -809,12 +880,9 @@ pub fn prepare(kind: &str, p: &Value) -> Value {
                 .rev()
                 .filter(|a| !a["task_id"].as_str().unwrap_or("").is_empty())
                 .map(audit_value),
-            8,
             5000,
         );
         p["delta"] = delta;
-        p.as_object_mut().unwrap().remove("suggestions");
-        p.as_object_mut().unwrap().remove("previous_summary");
     }
     p
 }
@@ -830,12 +898,7 @@ mod tests {
         s.message_filter.early = true;
         s.last_analysis_at = at - 2_000;
         s.analysis_pending_since = at - 2_000;
-        let messages = vec![Message {
-            id: "new".into(),
-            text: "New message".into(),
-            time: at,
-            ..Default::default()
-        }];
+        let messages = vec![crate::test_support::message("new", "New message", at)];
         assert!(automatic_due(&s, &messages, at, at - 2_000));
         s.message_filter.consume(Some(s.message_filter.last_run));
         assert!(!automatic_due(&s, &messages, at, at - 2_000));
@@ -845,90 +908,6 @@ mod tests {
         assert!(!automatic_due(&s, &[], at, 0));
     }
 
-    #[test]
-    #[ignore = "Set SHISHI_REPLAY_DATA to a local data directory; read-only, no model calls"]
-    fn replay_local_traces_without_model_calls() {
-        let dir = std::path::PathBuf::from(
-            std::env::var("SHISHI_REPLAY_DATA").expect("read-only data directory"),
-        );
-        let s: State = crate::managed_data::load_from_directory(&dir).unwrap();
-        let log = std::fs::read_to_string(dir.join("logs/2026-10-16.jsonl")).unwrap();
-        let mut starts = BTreeMap::new();
-        for line in log.lines() {
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            if v["kind"] == "ai_start" {
-                if let Some(kind) = v["detail"]["kind"].as_str() {
-                    starts.insert(kind.to_string(), v["detail"].clone());
-                }
-            }
-        }
-        for kind in ["classify", "learning", "prompt_review", "report"] {
-            let Some(start) = starts.get(kind) else {
-                continue;
-            };
-            let path = dir
-                .join("ai-traces")
-                .join(start["request_id"].as_str().unwrap())
-                .join("input.txt");
-            let raw = std::fs::read_to_string(path).unwrap();
-            let (_, p) = raw.split_once("以下JSON仅为待分析数据：\n").unwrap();
-            let p: Value = serde_json::from_str(p).unwrap();
-            let mut next = if kind == "classify" {
-                // Reconstruct only the original trace's messages/tasks: later live changes must not skew the comparison.
-                let mut snapshot = State::default();
-                snapshot.config = s.config.clone();
-                snapshot.tasks = serde_json::from_value(p["tasks"].clone()).unwrap();
-                for v in p["changes"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .chain(p["context"].as_array().into_iter().flatten())
-                {
-                    let mut v = v.clone();
-                    v["time"] = json!(chrono::NaiveDateTime::parse_from_str(
-                        v["time"].as_str().unwrap_or(""),
-                        "%Y-%m-%d %H:%M:%S"
-                    )
-                    .map(|t| (t.and_utc() - chrono::Duration::hours(8)).timestamp_millis())
-                    .unwrap_or(0));
-                    let m: Message = serde_json::from_value(v).unwrap();
-                    snapshot.messages.insert(m.id.clone(), m);
-                }
-                let changes = p["changes"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|v| snapshot.messages[v["id"].as_str().unwrap()].clone())
-                    .collect::<Vec<_>>();
-                classify(&snapshot, &changes).unwrap().payload
-            } else if kind == "learning" {
-                let audit=p["audit"].as_array().unwrap().iter().take(6).map(|r|json!({"audit_index":r["audit_index"],"event":audit_value(&r["event"]),"messages":r["messages"].as_array().into_iter().flatten().take(1).collect::<Vec<_>>()})).collect::<Vec<_>>();
-                let history=p["history"].as_array().unwrap().iter().take(3).map(|r|json!({"audit_index":r["audit_index"],"event":audit_value(&r["event"])})).collect::<Vec<_>>();
-                let ids = p["audit"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter_map(|a| a["event"]["task_id"].as_str())
-                    .collect::<BTreeSet<_>>();
-                json!({"audit":audit,"history":history,"current_prompt":p["current_prompt"],"current_tasks":rows(p["current_tasks"].as_array().into_iter().flatten().filter(|t|ids.contains(t["id"].as_str().unwrap_or(""))).map(task_value),6,3000),"existing_suggestions":suggestions(&s,&json!(audit).to_string())})
-            } else {
-                prepare(kind, &p)
-            };
-            if ["classify", "learning"].contains(&kind) {
-                next["tag_catalog"] = p["tag_catalog"].clone();
-            }
-            let new = crate::ai::build_prompt(&s.config.for_kind(kind), kind, &next)
-                .chars()
-                .count();
-            println!(
-                "OFFLINE_REPLAY {}",
-                json!({"kind":kind,"old_prompt_chars":raw.chars().count(),"new_prompt_chars":new,"new_sizes":crate::ai::input_sizes(&s.config,kind,&next)})
-            );
-            assert!(new < raw.chars().count());
-        }
-    }
     #[test]
     fn optional_relevance_gate_keeps_all_incremental_messages_by_default() {
         let mut s = State::default();
@@ -1006,36 +985,6 @@ mod tests {
         s.config.analysis_related_only = false;
         assert_eq!(ids(&s), all);
         assert_eq!(s.analyzed, progress);
-        let selected = batch_messages(pending(&s), 60_000);
-        assert_eq!(selected.len(), 7, "all eligible messages fit in one batch");
-    }
-    #[test]
-    fn batching_is_volume_based_and_never_consumes_the_backlog() {
-        let messages = (0..200)
-            .map(|i| Message {
-                id: format!("m{i:03}"),
-                text: "一句短消息".into(),
-                time: now() - 1000 + i,
-                private: true,
-                ..Default::default()
-            })
-            .collect::<Vec<_>>();
-        let small = batch_messages(messages.clone(), 2000);
-        let large = batch_messages(messages.clone(), 12000);
-        assert!(large.len() > 64);
-        assert!(large.len() > small.len());
-        assert!(large.len() < messages.len());
-        assert!(message_batch_chars(&large) <= 12000);
-        let mut next = large.clone();
-        next.push(messages[large.len()].clone());
-        assert!(message_batch_chars(&next) > 12000);
-        assert_eq!(large[0].id, "m000");
-        let mut s = State::default();
-        s.messages = messages.into_iter().map(|m| (m.id.clone(), m)).collect();
-        for m in &large {
-            s.analyzed.insert(m.id.clone(), fingerprint(m));
-        }
-        assert_eq!(pending(&s).len(), 200 - large.len());
     }
     #[test]
     fn compact_messages_preserve_reply_identity_and_omit_empty_fields() {
@@ -1075,7 +1024,7 @@ mod tests {
         }
         let mut s = State::default();
         s.messages.insert(a.id.clone(), a.clone());
-        let batch = classify(&s, &[a]).unwrap();
+        let batch = classify(&s, &[a]);
         assert_eq!(batch.payload["changes"][0]["text"], "请验证");
         assert!(batch.payload.get("task_index").is_none());
         assert_eq!(
@@ -1085,87 +1034,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "Read-only real-message replay; no model call. Set SHISHI_REPLAY_DATA"]
-    fn replay_compact_batches_without_model_calls() {
-        let dir = std::path::PathBuf::from(std::env::var("SHISHI_REPLAY_DATA").unwrap());
-        let s: State = crate::managed_data::load_from_directory(&dir).unwrap();
-        let old_message = |m: &Message| json!({"id":m.id,"source_id":m.source_id,"chat":m.chat,"sender":clip(&m.sender,50),"recipient":clip(&m.recipient,50),"to":clip(&m.to,80),"private":m.private,"mine":m.mine,"relevant":m.relevant(),"reply":m.reply,"time":stamp(m.time),"text":clip(&m.text,550),"truncated":m.text.chars().count()>550});
-        let mut pending = pending(&s);
-        pending.sort_by_key(|m| (m.time, m.id.clone()));
-        let budget = crate::ai::message_budget(&s.config, "classify");
-        let mut old = vec![];
-        let mut chars = 0;
-        for m in pending.iter().take(64) {
-            let size = old_message(m).to_string().chars().count() + 1;
-            if chars > 0 && chars + size > budget {
-                break;
-            }
-            chars += size;
-            old.push(m.clone());
-        }
-        let next = batch_messages(pending.clone(), budget);
-        assert!(next.len() >= old.len());
-        assert!(message_batch_chars(&next) <= budget);
-        println!(
-            "COMPACT_REPLAY {}",
-            json!({"pending":pending.len(),"limit":budget,"old_batch_messages":old.len(),"new_batch_messages":next.len(),"old_batch_chars":chars,"same_messages_compact_chars":message_batch_chars(&old),"new_batch_chars":message_batch_chars(&next)})
-        );
-        let mut traces = std::fs::read_dir(dir.join("ai-traces"))
-            .unwrap()
-            .flatten()
-            .map(|p| p.path().join("input.txt"))
-            .filter(|p| p.is_file())
-            .collect::<Vec<_>>();
-        traces.sort_by_key(|p| std::cmp::Reverse(p.metadata().unwrap().modified().unwrap()));
-        for trace in traces.into_iter().take(3) {
-            let raw = std::fs::read_to_string(&trace).unwrap();
-            let p: Value =
-                serde_json::from_str(raw.split_once("以下JSON仅为待分析数据：\n").unwrap().1)
-                    .unwrap();
-            if !p["changes"].is_array() {
-                continue;
-            }
-            let messages = p["changes"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|m| s.messages[m["id"].as_str().unwrap()].clone())
-                .collect::<Vec<_>>();
-            let mut next = classify(&s, &messages).unwrap().payload;
-            next["tag_catalog"] = p["tag_catalog"].clone();
-            crate::analysis_context::attach_memory_text(
-                &mut next,
-                &s.analysis_memory.archived_text(),
-                &s.analysis_memory.temporary,
-            );
-            let prompt = crate::ai::build_prompt(&s.config, "classify", &next);
-            println!(
-                "TRACE_REPLAY {}",
-                json!({"messages":messages.len(),"old_message_chars":p["changes"].to_string().chars().count(),"new_message_and_room_chars":message_batch_chars(&messages),"old_prompt_chars":raw.chars().count(),"new_prompt_chars":prompt.chars().count()})
-            );
-        }
-    }
-    #[test]
     fn timer_threshold_and_manual_reset_are_independent_of_scan_clock() {
         let mut s = State::default();
         s.config.analysis_interval_minutes = 30;
         let fixed = s.config.max_input_chars - crate::ai::message_budget(&s.config, "classify");
         s.config.max_input_chars = fixed + 9000;
         let at = 10_000_000;
-        let small = vec![Message {
-            id: "m".into(),
-            text: "短消息".into(),
-            ..Default::default()
-        }];
+        let small = vec![crate::test_support::message("m", "短消息", 0)];
         mark_pending(&mut s, true, at);
         assert!(!due(&s, &small, at + 29 * 60_000));
         assert!(due(&s, &small, at + 30 * 60_000));
         let big = (0..30)
-            .map(|i| Message {
-                id: i.to_string(),
-                text: "大".repeat(550),
-                ..Default::default()
-            })
+            .map(|i| crate::test_support::message(i.to_string(), "大".repeat(550), 0))
             .collect::<Vec<_>>();
         assert!(due(&s, &big, at + 60_000));
         // Manual, interval and volume triggers all write this same completion timestamp.
@@ -1191,20 +1071,28 @@ mod tests {
             description: "完整原始描述".repeat(200),
             priority: "高".into(),
             waiting_for: "同事".into(),
+            tags: (0..12)
+                .map(|i| crate::tags::Tag {
+                    kind: "合成类型".into(),
+                    value: format!("核对{i}"),
+                })
+                .collect(),
             manual: true,
             ..Default::default()
         };
-        let a = json!({"action":"update","task_id":"t","reason":"已经收到答复","fields":[{"field":"waiting_for","value":""}],"tags":[]});
-        let updated = materialize(&a, &[t.clone()]).unwrap();
+        let a = json!({"action":"update","task_id":"t","reason":"已经收到答复","fields":[{"field":"waiting_for","value":""}],"tag_changes":[]});
+        let updated = materialize(&a, Some(&t)).unwrap();
         assert_eq!(updated.description, t.description);
         assert_eq!(updated.priority, "高");
         assert_eq!(updated.title, t.title);
+        assert_eq!(updated.tags, t.tags);
+        assert_eq!(task(&t)["tags"], json!(t.tags));
         assert!(updated.waiting_for.is_empty());
         let mut a = a;
         a["fields"] = json!([{"field":"sources","value":"fake"}]);
-        assert!(materialize(&a, &[t.clone()]).is_err());
+        assert!(materialize(&a, Some(&t)).is_err());
         a["fields"] = json!([{"field":"title","value":"a"},{"field":"title","value":"b"}]);
-        assert!(materialize(&a, &[t]).is_err());
+        assert!(materialize(&a, Some(&t)).is_err());
     }
     #[test]
     fn local_file_is_excluded_from_prompt_but_query_budget_is_reserved() {
@@ -1225,7 +1113,8 @@ mod tests {
             max_input_chars: sizes["total_input_chars"].as_u64().unwrap() as usize - 1,
             ..Default::default()
         };
-        assert!(crate::ai::validate_input(&c, "classify", &payload).is_err());
+        let prepared = crate::ai::prepare(&c, "classify", &payload);
+        assert!(crate::ai::validate_prepared(&c, &payload, &prepared).is_err());
     }
     #[test]
     fn old_reply_links_win_and_unrelated_history_does_not_grow_input() {
@@ -1260,11 +1149,10 @@ mod tests {
             ..Default::default()
         };
         s.messages.insert(m.id.clone(), m.clone());
-        let a = classify(&s, &[m.clone()]).unwrap();
-        assert!(a
-            .payload
-            .get("context")
-            .is_none_or(|rows| rows.as_array().is_some_and(|rows| rows.is_empty())));
+        let a = classify(&s, &[m.clone()]);
+        assert_eq!(a.payload["context"][0]["id"], "old");
+        assert_eq!(a.payload["context"][0]["text"], "旧故障");
+        assert_eq!(a.payload["context"].as_array().unwrap().len(), 1);
         for i in 0..10000 {
             let id = format!("unrelated{i}");
             s.messages.insert(
@@ -1290,7 +1178,7 @@ mod tests {
                 ..Default::default()
             });
         }
-        let b = classify(&s, &[m]).unwrap();
+        let b = classify(&s, &[m]);
         // All unarchived summaries are supplied by default; adding unrelated
         // messages must not inject their bodies into the delta or context.
         assert_eq!(b.payload["tasks"][0]["id"], "owner");
@@ -1301,54 +1189,9 @@ mod tests {
         assert_eq!(b.versions.len(), 10_001);
     }
     #[test]
-    fn all_unarchived_summaries_are_sent_and_the_omitted_index_covers_every_omitted_task() {
-        let mut s = State::default();
-        let m = Message {
-            id: "m".into(),
-            text: "新材料".into(),
-            time: now(),
-            private: true,
-            ..Default::default()
-        };
-        s.messages.insert(m.id.clone(), m.clone());
-        for i in 0..15 {
-            s.tasks.push(Task {
-                id: format!("t{i}"),
-                title: format!("事项{i}"),
-                description: "摘要内容".into(),
-                status: "待处理".into(),
-                updated: 100 + i,
-                ..Default::default()
-            });
-        }
-        let all = classify(&s, &[m.clone()]).unwrap();
-        assert_eq!(all.payload["tasks"].as_array().unwrap().len(), 15);
-        assert!(all.payload.get("task_index").is_none());
-        assert_eq!(all.versions.len(), 15);
-
-        let reduced = classify_with_task_limit(&s, &[m], 10).unwrap();
-        assert_eq!(reduced.payload["tasks"].as_array().unwrap().len(), 10);
-        let index = reduced.payload["task_index"].as_array().unwrap();
-        assert_eq!(index.len(), 5);
-        let listed = reduced.payload["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .chain(index.iter())
-            .filter_map(|task| task["id"].as_str())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(listed.len(), 15);
-        assert_eq!(reduced.versions.len(), 15);
-    }
-
-    #[test]
     fn message_bodies_truncate_by_unicode_chars_and_always_carry_metadata() {
         for (chars, truncated) in [(1999usize, false), (2000, false), (2001, true)] {
-            let m = Message {
-                id: format!("m{chars}"),
-                text: "甲".repeat(chars),
-                ..Default::default()
-            };
+            let m = crate::test_support::message(format!("m{chars}"), "甲".repeat(chars), 0);
             let row = message(&m, 2000);
             assert_eq!(row["id"], format!("m{chars}"));
             assert_eq!(row["truncated"], truncated);
@@ -1358,11 +1201,7 @@ mod tests {
                 chars.min(2000)
             );
         }
-        let emoji = Message {
-            id: "emoji".into(),
-            text: "🙂".repeat(2001),
-            ..Default::default()
-        };
+        let emoji = crate::test_support::message("emoji", "🙂".repeat(2001), 0);
         let row = message(&emoji, 2000);
         assert_eq!(row["truncated"], true);
         assert_eq!(row["original_chars"], 2001);
@@ -1375,11 +1214,45 @@ mod tests {
 
     #[test]
     fn report_and_legacy_review_are_bounded_and_do_not_contain_snapshots() {
-        let event = json!({"kind":"manual_edit","task_id":"x","before":{"description":"a".repeat(10000)},"after":{"description":"b".repeat(10000)}});
+        for (budget, selected, omitted) in [
+            (9, json!(["x", ""]), 2),
+            (8, json!(["x", ""]), 2),
+            (7, json!(["x", 0]), 2),
+            (2, json!([]), 4),
+        ] {
+            let input = [json!("long".repeat(30)), json!("x"), json!(""), json!(0)];
+            assert_eq!(
+                rows(input, budget),
+                json!({"items":selected,"omitted":omitted})
+            );
+        }
+        let short = vec![json!("甲"); 30];
+        let budget = json_chars(&json!(short));
+        assert_eq!(
+            rows(short.clone(), budget),
+            json!({"items":short,"omitted":0})
+        );
+        let mut event = json!({"kind":"manual_edit","task_id":"x","time":1,"detail":"Synthetic correction","before":{"id":"x","title":"Before","description":"a".repeat(10000)},"after":{"id":"x","title":"After","description":"b".repeat(10000)}});
+        for array in [false, true] {
+            if array {
+                event["before"] = json!([{"id":"other","title":"Unrelated"},event["before"]]);
+                event["after"] = json!([event["after"]]);
+            }
+            let row = audit(&serde_json::from_value(event.clone()).unwrap());
+            assert_eq!(row, audit_value(&event));
+            assert_eq!(
+                row["changes"]["title"],
+                json!({"before":"Before","after":"After"})
+            );
+        }
         let p = json!({"daily_evidence":{"audit":(0..200).map(|i|json!({"evidence_id":format!("audit:{i}"),"event":event})).collect::<Vec<_>>(),"logs":[{"raw":"x".repeat(100000)}]}});
         let p = prepare("prompt_review", &p);
         assert!(p.to_string().len() < 12000);
         assert!(p["daily_evidence"]["audit"][0]["event"]["before"].is_null());
+        let short = json!({"report_tasks":(0..30).map(|i|json!({"id":i.to_string(),"title":"task","status":"待处理"})).collect::<Vec<_>>()});
+        let p = prepare("report", &short);
+        assert_eq!(p["report_tasks"].as_array().unwrap().len(), 30);
+        assert_eq!(p["coverage"]["omitted_tasks"], 0);
         let p = prepare(
             "report",
             &json!({"report_tasks":(0..10000).map(|i|json!({"id":i.to_string(),"title":"task","description":"x".repeat(500),"status":"待处理"})).collect::<Vec<_>>(),"delta":[event]}),

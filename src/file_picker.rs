@@ -31,8 +31,7 @@ struct Options {
 }
 impl Options {
     fn parse(value: &Value) -> Result<Self, String> {
-        let options: Self =
-            serde_json::from_value(value.clone()).map_err(|_| "文件选择参数无效")?;
+        let options: Self = crate::model::from_json(value).map_err(|_| "文件选择参数无效")?;
         if options.title.chars().count() > 100
             || options.title.contains('\0')
             || options.default_path.len() > 32_768

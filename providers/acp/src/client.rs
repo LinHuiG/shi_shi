@@ -7,18 +7,17 @@
 //! The client never parses assistant text as a business result.
 
 use crate::jsonrpc::{
-    decode_line, encode_error, encode_notification, encode_request, encode_response, Incoming,
-    RequestId, RpcError,
+    encode_error, encode_notification, encode_request, encode_response, Incoming, RequestId,
+    RpcError,
 };
 use crate::transport::{StderrSnapshot, Transport, TransportConfig, TransportError};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_PENDING_PERMISSIONS: usize = 16;
@@ -230,23 +229,10 @@ fn mcp_servers_json(servers: &[McpServer]) -> Result<Value, ClientError> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct AgentCapabilities {
-    pub resume: bool,
-    pub close: bool,
-    pub list: bool,
-    pub mcp_http: bool,
-    pub prompt_image: bool,
-    pub prompt_audio: bool,
-    pub prompt_embedded_context: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct ServerCapabilities {
-    pub protocol_version: i64,
-    pub agent_name: String,
-    pub agent_version: String,
-    pub capabilities: AgentCapabilities,
-    pub raw: Value,
+struct AgentCapabilities {
+    resume: bool,
+    close: bool,
+    prompt_image: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -254,15 +240,11 @@ pub struct ConfigChoice {
     pub value: String,
     pub name: String,
     pub group: Option<String>,
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ConfigOption {
     pub id: String,
-    pub name: String,
-    pub category: Option<String>,
-    pub kind: String,
     pub current_value: String,
     pub choices: Vec<ConfigChoice>,
 }
@@ -271,13 +253,18 @@ pub struct ConfigOption {
 pub struct SessionInfo {
     pub session_id: String,
     pub cwd: String,
-    pub capabilities: AgentCapabilities,
     pub config_options: Vec<ConfigOption>,
     pub model_value: Option<String>,
-    pub effort_value: Option<String>,
 }
 
 impl SessionInfo {
+    fn replace_options(&mut self, options: Vec<ConfigOption>) {
+        self.config_options = options;
+        self.model_value = self
+            .model_option()
+            .map(|option| option.current_value.clone());
+    }
+
     pub fn model_option(&self) -> Option<&ConfigOption> {
         self.config_options
             .iter()
@@ -294,9 +281,8 @@ impl SessionInfo {
     /// `JSON.stringify([provider, model])`; match that exact encoding only.
     pub fn find_model_value(&self, provider: &str, model: &str) -> Option<String> {
         self.model_option()?.choices.iter().find_map(|choice| {
-            let route: Vec<String> = serde_json::from_str(&choice.value).ok()?;
-            (route.len() == 2 && route[0] == provider && route[1] == model)
-                .then(|| choice.value.clone())
+            let route: [String; 2] = serde_json::from_str(&choice.value).ok()?;
+            (route[0] == provider && route[1] == model).then(|| choice.value.clone())
         })
     }
 
@@ -309,13 +295,7 @@ impl SessionInfo {
     }
 
     pub fn current_model_route(&self) -> Option<(String, String)> {
-        let value = self.model_value.as_deref()?;
-        let route: Vec<String> = serde_json::from_str(value).ok()?;
-        if route.len() == 2 {
-            Some((route[0].clone(), route[1].clone()))
-        } else {
-            None
-        }
+        serde_json::from_str(self.model_value.as_deref()?).ok()
     }
 }
 
@@ -324,9 +304,7 @@ pub struct TokenUsage {
     pub total_tokens: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub thought_tokens: Option<u64>,
     pub cached_read_tokens: Option<u64>,
-    pub cached_write_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -335,31 +313,18 @@ impl TokenUsage {
     /// treated as unknown rather than fabricating zeros.
     pub fn from_value(value: &Value) -> Option<Self> {
         let object = value.as_object()?;
+        let input_tokens = object.get("inputTokens")?.as_u64()?;
+        let output_tokens = object.get("outputTokens")?.as_u64()?;
         Some(Self {
             total_tokens: object
                 .get("totalTokens")
                 .and_then(Value::as_u64)
-                .or_else(|| {
-                    Some(
-                        object
-                            .get("inputTokens")?
-                            .as_u64()?
-                            .checked_add(object.get("outputTokens")?.as_u64()?)?,
-                    )
-                })?,
-            input_tokens: object.get("inputTokens")?.as_u64()?,
-            output_tokens: object.get("outputTokens")?.as_u64()?,
-            thought_tokens: object.get("thoughtTokens").and_then(Value::as_u64),
+                .or_else(|| input_tokens.checked_add(output_tokens))?,
+            input_tokens,
+            output_tokens,
             cached_read_tokens: object.get("cachedReadTokens").and_then(Value::as_u64),
-            cached_write_tokens: object.get("cachedWriteTokens").and_then(Value::as_u64),
         })
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ContextUsage {
-    pub used: u64,
-    pub size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -382,26 +347,13 @@ pub enum SessionUpdate {
         status: Option<String>,
         text: String,
     },
-    Usage(ContextUsage),
-    ConfigOptionUpdate {
-        config_options: Vec<ConfigOption>,
-    },
-    Other {
-        kind: String,
-        raw: Value,
-    },
+    Other,
 }
 
 #[derive(Debug, Clone)]
-pub enum AcpEvent {
-    SessionUpdate {
-        session_id: String,
-        update: SessionUpdate,
-    },
-    Notification {
-        method: String,
-        params: Value,
-    },
+pub struct AcpEvent {
+    pub session_id: String,
+    pub update: SessionUpdate,
 }
 
 #[derive(Debug, Clone)]
@@ -415,78 +367,47 @@ pub struct PermissionOption {
 pub struct PendingPermission {
     pub request_id: RequestId,
     pub session_id: String,
-    pub tool_call_id: Option<String>,
     pub options: Vec<PermissionOption>,
     pub raw: Value,
 }
 
 #[derive(Debug, Clone)]
 pub struct PromptResult {
-    pub session_id: String,
-    pub cwd: String,
-    pub model_value: Option<String>,
-    pub effort_value: Option<String>,
     pub stop_reason: String,
     pub usage: Option<TokenUsage>,
-    pub context_usage: Option<ContextUsage>,
 }
 
-#[derive(Debug, Clone)]
-pub struct SessionListEntry {
-    pub session_id: String,
-    pub cwd: String,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ClientError {
+    #[error("{0}")]
     Transport(TransportError),
+    #[error("ACP error {code}: {message}")]
     Rpc { code: i64, message: String },
+    #[error("ACP protocol failure: {0}")]
     Protocol(String),
+    #[error("ACP capability failure: {0}")]
     Unsupported(String),
+    #[error("unknown ACP session: {0}")]
     UnknownSession(String),
+    #[error(
+        "model {provider}/{model} is not advertised by the ACP session; refusing to use a default"
+    )]
     ModelNotAdvertised { provider: String, model: String },
+    #[error("reasoning effort {0:?} is not advertised by the ACP session")]
     EffortNotAdvertised(String),
+    #[error("{method} timed out (ambiguous={ambiguous})")]
     Timeout { method: String, ambiguous: bool },
+    #[error("{method} lost the ACP process (ambiguous={ambiguous})")]
     Disconnected { method: String, ambiguous: bool },
+    #[error("no pending permission with that id")]
     PermissionNotFound,
+    #[error("permission option was not offered by the agent")]
     PermissionOptionNotOffered,
+    #[error("prompt must not be empty")]
     PromptEmpty,
+    #[error("prompt exceeds the ACP frame limit")]
     PromptTooLarge,
 }
-
-impl std::fmt::Display for ClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transport(error) => write!(f, "{error}"),
-            Self::Rpc { code, message } => write!(f, "ACP error {code}: {message}"),
-            Self::Protocol(message) => write!(f, "ACP protocol failure: {message}"),
-            Self::Unsupported(message) => write!(f, "ACP capability failure: {message}"),
-            Self::UnknownSession(id) => write!(f, "unknown ACP session: {id}"),
-            Self::ModelNotAdvertised { provider, model } => write!(
-                f,
-                "model {provider}/{model} is not advertised by the ACP session; refusing to use a default"
-            ),
-            Self::EffortNotAdvertised(effort) => write!(
-                f,
-                "reasoning effort {effort:?} is not advertised by the ACP session"
-            ),
-            Self::Timeout { method, ambiguous } => {
-                write!(f, "{method} timed out (ambiguous={ambiguous})")
-            }
-            Self::Disconnected { method, ambiguous } => {
-                write!(f, "{method} lost the ACP process (ambiguous={ambiguous})")
-            }
-            Self::PermissionNotFound => f.write_str("no pending permission with that id"),
-            Self::PermissionOptionNotOffered => {
-                f.write_str("permission option was not offered by the agent")
-            }
-            Self::PromptEmpty => f.write_str("prompt must not be empty"),
-            Self::PromptTooLarge => f.write_str("prompt exceeds the ACP frame limit"),
-        }
-    }
-}
-
-impl std::error::Error for ClientError {}
 
 impl From<TransportError> for ClientError {
     fn from(error: TransportError) -> Self {
@@ -512,7 +433,6 @@ pub struct AcpClient {
     session_policies: Mutex<HashMap<String, PermissionPolicy>>,
     capabilities: Mutex<Option<AgentCapabilities>>,
     sessions: Mutex<HashMap<String, SessionInfo>>,
-    pending_permissions: Mutex<VecDeque<PendingPermission>>,
     permission_by_id: Mutex<HashMap<RequestId, PendingPermission>>,
     initialized: AtomicBool,
 }
@@ -529,7 +449,6 @@ impl AcpClient {
             session_policies: Mutex::new(HashMap::new()),
             capabilities: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
-            pending_permissions: Mutex::new(VecDeque::new()),
             permission_by_id: Mutex::new(HashMap::new()),
             initialized: AtomicBool::new(false),
         })
@@ -543,7 +462,7 @@ impl AcpClient {
         !self.transport.is_closed()
     }
 
-    pub fn initialize(&self, timeout: Duration) -> Result<ServerCapabilities, ClientError> {
+    pub fn initialize(&self, timeout: Duration) -> Result<(), ClientError> {
         let response = self.request(
             "initialize",
             json!({
@@ -558,10 +477,6 @@ impl AcpClient {
             timeout,
             &mut |_| {},
         )?;
-        self.parse_initialize(&response)
-    }
-
-    fn parse_initialize(&self, response: &Value) -> Result<ServerCapabilities, ClientError> {
         let protocol_version = response
             .get("protocolVersion")
             .and_then(Value::as_i64)
@@ -573,57 +488,20 @@ impl AcpClient {
                 "ACP protocol version {protocol_version} is not supported (need 1)"
             )));
         }
-        let agent = response.get("agentInfo").cloned().unwrap_or(Value::Null);
-        let caps = response
-            .get("agentCapabilities")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        let caps = &response["agentCapabilities"];
         let session_caps = caps.get("sessionCapabilities").and_then(Value::as_object);
         let prompt_caps = caps.get("promptCapabilities").and_then(Value::as_object);
-        let mcp_caps = caps.get("mcpCapabilities").and_then(Value::as_object);
         let capabilities = AgentCapabilities {
             resume: session_caps.is_some_and(|object| object.contains_key("resume")),
             close: session_caps.is_some_and(|object| object.contains_key("close")),
-            list: session_caps.is_some_and(|object| object.contains_key("list")),
-            mcp_http: mcp_caps
-                .and_then(|object| object.get("http"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
             prompt_image: prompt_caps
                 .and_then(|object| object.get("image"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            prompt_audio: prompt_caps
-                .and_then(|object| object.get("audio"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            prompt_embedded_context: prompt_caps
-                .and_then(|object| object.get("embeddedContext"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
         };
-        if !capabilities.close {
-            // The installed acp profile advertises close; a server that does
-            // not is still usable but sessions must be torn down by process
-            // exit. Callers can check this flag.
-        }
-        *self.capabilities.lock().unwrap() = Some(capabilities.clone());
+        *self.capabilities.lock().unwrap() = Some(capabilities);
         self.initialized.store(true, Ordering::SeqCst);
-        Ok(ServerCapabilities {
-            protocol_version,
-            agent_name: agent
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            agent_version: agent
-                .get("version")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown")
-                .to_string(),
-            capabilities,
-            raw: response.clone(),
-        })
+        Ok(())
     }
 
     pub fn new_session(
@@ -664,31 +542,7 @@ impl AcpClient {
             .and_then(Value::as_str)
             .ok_or_else(|| ClientError::Protocol("session/new has no sessionId".into()))?
             .to_string();
-        let config_options = parse_config_options(response.get("configOptions"))?;
-        let capabilities = self
-            .capabilities
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
-        let session = SessionInfo {
-            session_id: session_id.clone(),
-            cwd: cwd.to_string_lossy().to_string(),
-            capabilities,
-            model_value: config_options
-                .iter()
-                .find(|option| option.id == "model")
-                .map(|option| option.current_value.clone()),
-            effort_value: config_options
-                .iter()
-                .find(|option| option.id == "reasoning_effort")
-                .map(|option| option.current_value.clone()),
-            config_options,
-        };
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), session.clone());
+        let session = self.remember_session(&session_id, cwd, &response)?;
         self.session_policies
             .lock()
             .unwrap()
@@ -732,77 +586,28 @@ impl AcpClient {
             timeout,
             &mut |_| {},
         )?;
+        self.remember_session(session_id, cwd, &response)
+    }
+
+    fn remember_session(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        response: &Value,
+    ) -> Result<SessionInfo, ClientError> {
         let config_options = parse_config_options(response.get("configOptions"))?;
-        let capabilities = self
-            .capabilities
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
-        let session = SessionInfo {
+        let mut session = SessionInfo {
             session_id: session_id.to_string(),
             cwd: cwd.to_string_lossy().to_string(),
-            capabilities,
-            model_value: config_options
-                .iter()
-                .find(|option| option.id == "model")
-                .map(|option| option.current_value.clone()),
-            effort_value: config_options
-                .iter()
-                .find(|option| option.id == "reasoning_effort")
-                .map(|option| option.current_value.clone()),
-            config_options,
+            model_value: None,
+            config_options: Vec::new(),
         };
+        session.replace_options(config_options);
         self.sessions
             .lock()
             .unwrap()
             .insert(session_id.to_string(), session.clone());
         Ok(session)
-    }
-
-    pub fn list_sessions(
-        &self,
-        cwd: Option<&Path>,
-        cursor: Option<&str>,
-        timeout: Duration,
-    ) -> Result<(Vec<SessionListEntry>, Option<String>), ClientError> {
-        let capabilities = self
-            .capabilities
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_default();
-        if !capabilities.list {
-            return Err(ClientError::Unsupported(
-                "the ACP server did not advertise sessionCapabilities.list".into(),
-            ));
-        }
-        let response = self.request(
-            "session/list",
-            json!({"cwd": cwd.map(|path| path.to_string_lossy().to_string()), "cursor": cursor}),
-            timeout,
-            &mut |_| {},
-        )?;
-        let entries = response
-            .get("sessions")
-            .and_then(Value::as_array)
-            .map(|sessions| {
-                sessions
-                    .iter()
-                    .filter_map(|session| {
-                        Some(SessionListEntry {
-                            session_id: session.get("sessionId")?.as_str()?.to_string(),
-                            cwd: session.get("cwd")?.as_str()?.to_string(),
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let next_cursor = response
-            .get("nextCursor")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
-        Ok((entries, next_cursor))
     }
 
     pub fn close_session(&self, session_id: &str, timeout: Duration) -> Result<(), ClientError> {
@@ -824,7 +629,7 @@ impl AcpClient {
             &mut |_| {},
         )?;
         self.sessions.lock().unwrap().remove(session_id);
-        self.cancel_pending_for_session(session_id);
+        self.cancel_pending(Some(session_id));
         Ok(())
     }
 
@@ -838,7 +643,7 @@ impl AcpClient {
         config_id: &str,
         value: &str,
         timeout: Duration,
-    ) -> Result<Vec<ConfigOption>, ClientError> {
+    ) -> Result<(), ClientError> {
         let response = self.request(
             "session/set_config_option",
             json!({"sessionId": session_id, "configId": config_id, "value": value}),
@@ -850,13 +655,11 @@ impl AcpClient {
         let session = sessions
             .get_mut(session_id)
             .ok_or_else(|| ClientError::UnknownSession(session_id.to_string()))?;
-        session.config_options = config_options.clone();
+        session.config_options = config_options;
         if config_id == "model" {
             session.model_value = Some(value.to_string());
-        } else if config_id == "reasoning_effort" {
-            session.effort_value = Some(value.to_string());
         }
-        Ok(config_options)
+        Ok(())
     }
 
     pub fn select_model(
@@ -865,16 +668,18 @@ impl AcpClient {
         provider: &str,
         model: &str,
         timeout: Duration,
-    ) -> Result<Vec<ConfigOption>, ClientError> {
-        let session = self
-            .session(session_id)
-            .ok_or_else(|| ClientError::UnknownSession(session_id.to_string()))?;
-        let value = session.find_model_value(provider, model).ok_or_else(|| {
-            ClientError::ModelNotAdvertised {
+    ) -> Result<(), ClientError> {
+        let value = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .ok_or_else(|| ClientError::UnknownSession(session_id.to_string()))?
+            .find_model_value(provider, model)
+            .ok_or_else(|| ClientError::ModelNotAdvertised {
                 provider: provider.to_string(),
                 model: model.to_string(),
-            }
-        })?;
+            })?;
         self.set_config_option(session_id, "model", &value, timeout)
     }
 
@@ -883,11 +688,13 @@ impl AcpClient {
         session_id: &str,
         effort: &str,
         timeout: Duration,
-    ) -> Result<Vec<ConfigOption>, ClientError> {
-        let session = self
-            .session(session_id)
-            .ok_or_else(|| ClientError::UnknownSession(session_id.to_string()))?;
-        let value = session
+    ) -> Result<(), ClientError> {
+        let value = self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .ok_or_else(|| ClientError::UnknownSession(session_id.to_string()))?
             .find_effort_value(effort)
             .ok_or_else(|| ClientError::EffortNotAdvertised(effort.to_string()))?;
         self.set_config_option(session_id, "reasoning_effort", &value, timeout)
@@ -917,22 +724,9 @@ impl AcpClient {
         if exact_prompt.len() > MAX_PROMPT_BYTES {
             return Err(ClientError::PromptTooLarge);
         }
-        let session = self
-            .session(session_id)
-            .ok_or_else(|| ClientError::UnknownSession(session_id.to_string()))?;
-        let mut context_usage = None;
-        let mut handler = |event: AcpEvent| {
-            if let AcpEvent::SessionUpdate {
-                session_id: event_session,
-                update: SessionUpdate::Usage(usage),
-            } = &event
-            {
-                if event_session == session_id {
-                    context_usage = Some(*usage);
-                }
-            }
-            on_event(event);
-        };
+        if !self.sessions.lock().unwrap().contains_key(session_id) {
+            return Err(ClientError::UnknownSession(session_id.to_string()));
+        }
         let mut content = vec![json!({"type":"text","text":exact_prompt})];
         if !images.is_empty()
             && !self
@@ -967,7 +761,7 @@ impl AcpClient {
                 "prompt": content
             }),
             timeout,
-            &mut handler,
+            on_event,
         )?;
         let stop_reason = response
             .get("stopReason")
@@ -975,15 +769,7 @@ impl AcpClient {
             .ok_or_else(|| ClientError::Protocol("session/prompt has no stopReason".into()))?
             .to_string();
         let usage = response.get("usage").and_then(TokenUsage::from_value);
-        Ok(PromptResult {
-            session_id: session.session_id,
-            cwd: session.cwd,
-            model_value: session.model_value,
-            effort_value: session.effort_value,
-            stop_reason,
-            usage,
-            context_usage,
-        })
+        Ok(PromptResult { stop_reason, usage })
     }
 
     /// Cancel a session without consuming the response stream. This is safe to
@@ -995,20 +781,7 @@ impl AcpClient {
             "session/cancel",
             &json!({"sessionId": session_id}),
         ));
-        self.cancel_pending_for_session(session_id);
-    }
-
-    pub fn next_permission(&self, timeout: Duration) -> Option<PendingPermission> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(permission) = self.pending_permissions.lock().unwrap().pop_front() {
-                return Some(permission);
-            }
-            if Instant::now() >= deadline {
-                return None;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        self.cancel_pending(Some(session_id));
     }
 
     /// Authoritative live permissions; callers must not keep a second cache
@@ -1029,7 +802,7 @@ impl AcpClient {
         option_id: &str,
     ) -> Result<(), ClientError> {
         {
-            let permissions = self.permission_by_id.lock().unwrap();
+            let mut permissions = self.permission_by_id.lock().unwrap();
             let permission = permissions
                 .get(request_id)
                 .ok_or(ClientError::PermissionNotFound)?;
@@ -1040,12 +813,10 @@ impl AcpClient {
             {
                 return Err(ClientError::PermissionOptionNotOffered);
             }
+            // Claim the request while the offered option is still valid.
+            // Completion, cancellation and concurrent replies use this same map.
+            permissions.remove(request_id);
         }
-        self.permission_by_id.lock().unwrap().remove(request_id);
-        self.pending_permissions
-            .lock()
-            .unwrap()
-            .retain(|permission| permission.request_id != *request_id);
         self.transport.send_line(encode_response(
             request_id,
             &json!({"outcome": {"outcome": "selected", "optionId": option_id}}),
@@ -1053,28 +824,14 @@ impl AcpClient {
         Ok(())
     }
 
-    pub fn respond_permission_cancelled(&self, request_id: &RequestId) -> Result<(), ClientError> {
-        let permission = self
-            .permission_by_id
-            .lock()
-            .unwrap()
-            .remove(request_id)
-            .ok_or(ClientError::PermissionNotFound)?;
-        let _ = permission;
-        self.pending_permissions
-            .lock()
-            .unwrap()
-            .retain(|permission| permission.request_id != *request_id);
-        self.transport.send_line(encode_response(
-            request_id,
-            &json!({"outcome": {"outcome": "cancelled"}}),
-        ))?;
-        Ok(())
+    pub fn shutdown(&self) {
+        self.cancel_pending(None);
+        self.transport.shutdown();
     }
 
-    pub fn shutdown(&self) {
-        self.cancel_all_pending();
-        self.transport.shutdown();
+    pub fn abort(&self) {
+        self.transport.abort();
+        self.cancel_pending(None);
     }
 
     fn require_initialized(&self) -> Result<(), ClientError> {
@@ -1120,7 +877,7 @@ impl AcpClient {
                     }
                     if method == "session/prompt" {
                         if let Some(session_id) = params["sessionId"].as_str() {
-                            self.cancel_pending_for_session(session_id);
+                            self.cancel_pending(Some(session_id));
                         }
                     }
                     return result.map_err(|error: RpcError| ClientError::Rpc {
@@ -1149,14 +906,14 @@ impl AcpClient {
                     });
                 }
                 Err(TransportError::Closed) => {
-                    self.cancel_all_pending();
+                    self.cancel_pending(None);
                     return Err(ClientError::Disconnected {
                         method: method.to_string(),
                         ambiguous: true,
                     });
                 }
                 Err(error) => {
-                    self.cancel_all_pending();
+                    self.cancel_pending(None);
                     return Err(ClientError::from(error));
                 }
             }
@@ -1181,34 +938,25 @@ impl AcpClient {
         params: Value,
         on_event: &mut dyn FnMut(AcpEvent),
     ) {
-        if method == "session/update" {
-            let session_id = params
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let update = params.get("update").cloned().unwrap_or(Value::Null);
-            let update = parse_session_update(&update);
-            if let SessionUpdate::ConfigOptionUpdate { config_options } = &update {
-                if let Some(session) = self.sessions.lock().unwrap().get_mut(&session_id) {
-                    session.config_options = config_options.clone();
-                    session.model_value = config_options
-                        .iter()
-                        .find(|option| option.id == "model")
-                        .map(|option| option.current_value.clone());
-                    session.effort_value = config_options
-                        .iter()
-                        .find(|option| option.id == "reasoning_effort")
-                        .map(|option| option.current_value.clone());
-                }
-            }
-            on_event(AcpEvent::SessionUpdate { session_id, update });
-        } else {
-            on_event(AcpEvent::Notification {
-                method: method.to_string(),
-                params,
-            });
+        if method != "session/update" {
+            return;
         }
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let update = &params["update"];
+        if update["sessionUpdate"] == "config_option_update" {
+            let options = parse_config_options(update.get("configOptions")).unwrap_or_default();
+            if let Some(session) = self.sessions.lock().unwrap().get_mut(&session_id) {
+                session.replace_options(options);
+            }
+        }
+        on_event(AcpEvent {
+            session_id,
+            update: parse_session_update(update),
+        });
     }
 
     fn handle_server_request(&self, id: RequestId, method: &str, params: Value) {
@@ -1234,11 +982,6 @@ impl AcpClient {
             ));
             return;
         };
-        let tool_call_id = params
-            .get("toolCall")
-            .and_then(|tool| tool.get("toolCallId"))
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
         let options = params
             .get("options")
             .and_then(Value::as_array)
@@ -1265,7 +1008,6 @@ impl AcpClient {
         let pending = PendingPermission {
             request_id: id.clone(),
             session_id: session_id.clone(),
-            tool_call_id,
             options,
             raw: params,
         };
@@ -1293,60 +1035,36 @@ impl AcpClient {
             }
             PermissionPolicy::Surface => {
                 let mut by_id = self.permission_by_id.lock().unwrap();
-                let mut queue = self.pending_permissions.lock().unwrap();
                 if by_id.len() >= MAX_PENDING_PERMISSIONS {
-                    drop(queue);
                     let _ = self.transport.send_line(encode_response(
                         &id,
                         &json!({"outcome": {"outcome": "cancelled"}}),
                     ));
                     return;
                 }
-                by_id.insert(id, pending.clone());
-                queue.push_back(pending.clone());
+                by_id.insert(id, pending);
             }
         }
     }
 
-    fn cancel_pending_for_session(&self, session_id: &str) {
-        let mut removed = Vec::new();
-        {
-            let mut by_id = self.permission_by_id.lock().unwrap();
-            let ids = by_id
-                .iter()
-                .filter(|(_, permission)| permission.session_id == session_id)
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            for id in ids {
-                if let Some(permission) = by_id.remove(&id) {
-                    removed.push(permission);
-                }
-            }
-        }
-        {
-            let mut queue = self.pending_permissions.lock().unwrap();
-            queue.retain(|permission| permission.session_id != session_id);
-        }
-        for permission in removed {
-            let _ = self.transport.send_line(encode_response(
-                &permission.request_id,
-                &json!({"outcome": {"outcome": "cancelled"}}),
-            ));
-        }
-    }
-
-    fn cancel_all_pending(&self) {
-        let pending = {
-            let mut by_id = self.permission_by_id.lock().unwrap();
-            by_id
-                .drain()
-                .map(|(_, permission)| permission)
-                .collect::<Vec<_>>()
+    fn cancel_pending(&self, session_id: Option<&str>) {
+        let ids = {
+            let mut ids = Vec::new();
+            self.permission_by_id
+                .lock()
+                .unwrap()
+                .retain(|id, permission| {
+                    let remove = session_id.is_none_or(|session| permission.session_id == session);
+                    if remove {
+                        ids.push(id.clone());
+                    }
+                    !remove
+                });
+            ids
         };
-        self.pending_permissions.lock().unwrap().clear();
-        for permission in pending {
+        for id in ids {
             let _ = self.transport.send_line(encode_response(
-                &permission.request_id,
+                &id,
                 &json!({"outcome": {"outcome": "cancelled"}}),
             ));
         }
@@ -1360,22 +1078,21 @@ impl Drop for AcpClient {
 }
 
 fn parse_session_update(update: &Value) -> SessionUpdate {
-    let kind = update
-        .get("sessionUpdate")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    match kind.as_str() {
+    fn text(content: &Value) -> Option<&str> {
+        (content["type"] == "text")
+            .then_some(&content["text"])
+            .and_then(Value::as_str)
+    }
+    let string = |field| {
+        update
+            .get(field)
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+    };
+    let kind = update["sessionUpdate"].as_str().unwrap_or("unknown");
+    match kind {
         "agent_message_chunk" | "agent_thought_chunk" => {
-            let text = update
-                .get("content")
-                .filter(|content| content.get("type").and_then(Value::as_str) == Some("text"))
-                .and_then(|content| content.get("text"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .chars()
-                .take(MAX_TOOL_TEXT)
-                .collect::<String>();
+            let text = text(&update["content"]).unwrap_or_default().to_owned();
             if kind == "agent_message_chunk" {
                 SessionUpdate::AgentMessageChunk { text }
             } else {
@@ -1383,69 +1100,32 @@ fn parse_session_update(update: &Value) -> SessionUpdate {
             }
         }
         "tool_call" => SessionUpdate::ToolCall {
-            tool_call_id: update
-                .get("toolCallId")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            title: update
-                .get("title")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            status: update
-                .get("status")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            kind: update
-                .get("kind")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            raw_input: update.get("rawInput").cloned().unwrap_or(Value::Null),
+            tool_call_id: string("toolCallId").unwrap_or_default(),
+            title: string("title"),
+            status: string("status"),
+            kind: string("kind"),
+            raw_input: update["rawInput"].clone(),
         },
         "tool_call_update" => {
-            let mut text = String::new();
-            if let Some(content) = update.get("content").and_then(Value::as_array) {
-                for item in content {
-                    let Some(inner) = item.get("content") else {
-                        continue;
-                    };
-                    if inner.get("type").and_then(Value::as_str) == Some("text") {
-                        if let Some(value) = inner.get("text").and_then(Value::as_str) {
-                            if text.len() < MAX_TOOL_TEXT {
-                                text.extend(value.chars().take(MAX_TOOL_TEXT - text.len()));
-                            }
-                        }
-                    }
+            let mut preview = String::new();
+            for value in update["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|item| text(&item["content"]))
+            {
+                if preview.len() >= MAX_TOOL_TEXT {
+                    break;
                 }
+                preview.extend(value.chars().take(MAX_TOOL_TEXT - preview.len()));
             }
             SessionUpdate::ToolCallUpdate {
-                tool_call_id: update
-                    .get("toolCallId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                status: update
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                text,
+                tool_call_id: string("toolCallId").unwrap_or_default(),
+                status: string("status"),
+                text: preview,
             }
         }
-        "usage_update" => {
-            let used = update.get("used").and_then(Value::as_u64).unwrap_or(0);
-            let size = update.get("size").and_then(Value::as_u64).unwrap_or(0);
-            SessionUpdate::Usage(ContextUsage { used, size })
-        }
-        "config_option_update" => {
-            let options = parse_config_options(update.get("configOptions")).unwrap_or_default();
-            SessionUpdate::ConfigOptionUpdate {
-                config_options: options,
-            }
-        }
-        _ => SessionUpdate::Other {
-            kind,
-            raw: update.clone(),
-        },
+        _ => SessionUpdate::Other,
     }
 }
 
@@ -1459,16 +1139,6 @@ fn parse_config_options(value: Option<&Value>) -> Result<Vec<ConfigOption>, Clie
             .get("id")
             .and_then(Value::as_str)
             .ok_or_else(|| ClientError::Protocol("config option has no id".into()))?;
-        let name = value
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or(id)
-            .to_string();
-        let kind = value
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("select")
-            .to_string();
         let current_value = value
             .get("currentValue")
             .and_then(|current| match current {
@@ -1496,12 +1166,6 @@ fn parse_config_options(value: Option<&Value>) -> Result<Vec<ConfigOption>, Clie
         }
         options.push(ConfigOption {
             id: id.to_string(),
-            name,
-            category: value
-                .get("category")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
-            kind,
             current_value,
             choices,
         });
@@ -1521,14 +1185,25 @@ fn push_choice(choices: &mut Vec<ConfigChoice>, value: &Value, group: Option<Str
             .unwrap_or(choice_value)
             .to_string(),
         group,
-        description: value
-            .get("description")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
     });
 }
 
-/// Parse one line for tests/mock servers without exposing transport internals.
-pub fn parse_client_line(line: &[u8]) -> Result<Incoming, ClientError> {
-    decode_line(line, 8 * 1024 * 1024).map_err(|error| ClientError::Protocol(error.to_string()))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_chunks_are_complete_even_when_larger_than_a_tool_preview() {
+        let text = "完整文本🙂".repeat(MAX_TOOL_TEXT);
+        for kind in ["agent_message_chunk", "agent_thought_chunk"] {
+            let update = parse_session_update(
+                &json!({"sessionUpdate":kind,"content":{"type":"text","text":text}}),
+            );
+            match update {
+                SessionUpdate::AgentMessageChunk { text: actual }
+                | SessionUpdate::AgentThoughtChunk { text: actual } => assert_eq!(actual, text),
+                _ => panic!("expected text chunk"),
+            }
+        }
+    }
 }

@@ -4,8 +4,10 @@ use serde_json::{json, Value};
 use std::{
     collections::{BTreeMap, HashSet},
     fs,
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
 };
 
 fn runtime(kind: &str) -> bool {
@@ -22,6 +24,7 @@ fn runtime(kind: &str) -> bool {
                 | "error"
                 | "request_error"
                 | "analysis_result"
+                | "analysis_rejected"
                 | "archive_result"
                 | "archive_failed"
                 | "analysis_skipped"
@@ -39,6 +42,7 @@ fn matches_filter(row: &Value, filter: &str) -> bool {
             matches!(
                 kind,
                 "error"
+                    | "analysis_rejected"
                     | "request_error"
                     | "ai_failed"
                     | "ai_rejected"
@@ -67,6 +71,7 @@ fn matches_filter(row: &Value, filter: &str) -> bool {
                 || matches!(
                     kind,
                     "advice_auto_decision"
+                        | "analysis_rejected"
                         | "codex_visibility"
                         | "ai_start"
                         | "ai_success"
@@ -111,27 +116,113 @@ fn visit(path: &Path, mut row: impl FnMut(Value)) -> Result<usize, String> {
     }
     Ok(invalid)
 }
+
+fn day_range(day: Option<&str>) -> Result<(String, i64, i64), String> {
+    let day = day
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(date);
+    let parsed = chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| "日志日期无效")?;
+    if parsed.to_string() != day {
+        return Err("日志日期无效".into());
+    }
+    let start = parsed
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis()
+        - 28_800_000;
+    Ok((day, start, start + 86_400_000))
+}
+fn day_paths(root: &Path, day: &str) -> Result<Vec<PathBuf>, String> {
+    let mut paths = Vec::new();
+    match fs::read_dir(crate::storage::data_dir(root).join("logs")) {
+        Ok(entries) => {
+            for item in entries {
+                let item = item.map_err(|e| e.to_string())?;
+                let name = item.file_name().to_string_lossy().into_owned();
+                let rotated = name
+                    .strip_prefix(&format!("{day}-"))
+                    .and_then(|n| n.strip_suffix(".jsonl"))
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+                if (name == format!("{day}.jsonl") || rotated)
+                    && item.file_type().map_err(|e| e.to_string())?.is_file()
+                {
+                    paths.push(item.path());
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("日志目录读取失败：{e}")),
+    }
+    paths.sort();
+    Ok(paths)
+}
 impl App {
+    /// Only metadata is read here. The caller may reuse the audit token when
+    /// the business revision is unchanged; runtime progress cannot edit audit.
+    pub(crate) fn activity_day_revision(
+        &self,
+        day: Option<&str>,
+        known_audit: Option<&Value>,
+    ) -> Value {
+        let Ok((day, start, end)) = day_range(day) else {
+            return Value::Null;
+        };
+        let files = day_paths(&self.root, &day).map(|paths| {
+            paths
+                .iter()
+                .map(|path| match fs::metadata(path) {
+                    Ok(meta) => json!([
+                        path.file_name().map(|n| n.to_string_lossy()),
+                        meta.len(),
+                        meta.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_nanos().to_string())
+                    ]),
+                    Err(e) => json!([path.file_name().map(|n| n.to_string_lossy()), e.to_string()]),
+                })
+                .collect::<Vec<_>>()
+        });
+        let audit = known_audit
+            .filter(|v| v.is_string())
+            .cloned()
+            .unwrap_or_else(|| {
+                let state = self.state.lock().unwrap();
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                // Committed audit rows are immutable. Retention changes indices;
+                // new decisions append rows, including a late row for an older day.
+                for (index, row) in state
+                    .audit
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.time >= start && r.time < end)
+                {
+                    (
+                        index,
+                        row.time,
+                        &row.kind,
+                        &row.task_id,
+                        &row.detail,
+                        &row.change_summary,
+                    )
+                        .hash(&mut hash);
+                }
+                // Log labels and search use current task names/numbers.
+                for task in &state.tasks {
+                    (&task.id, &task.title, state.task_numbers.get(&task.id)).hash(&mut hash);
+                }
+                json!(hash.finish().to_string())
+            });
+        json!({"day":day,"files":files.unwrap_or_else(|error|vec![json!({"error":error})]),"audit":audit,
+            "live":if day == date() { self.activity_revision.load(Ordering::SeqCst) } else { 0 }})
+    }
     pub fn activity_query(&self, p: &Value) -> Result<Value, String> {
         self.log_writer.flush()?;
-        let day = p["day"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(date);
-        let parsed =
-            chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d").map_err(|_| "日志日期无效")?;
-        if parsed.to_string() != day {
-            return Err("日志日期无效".into());
-        }
-        let start = parsed
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp_millis()
-            - 8 * 3_600_000;
-        let end = start + 86_400_000;
+        let (day, start, end) = day_range(p["day"].as_str())?;
+        let revision = self.activity_day_revision(Some(&day), None);
         // Accept the retired UI token while new clients consistently use changes.
         let filter = match p["filter"].as_str().unwrap_or("ai") {
             "tasks" => "changes",
@@ -169,45 +260,10 @@ impl App {
             (labels, s.task_numbers.clone())
         };
         let size = p["page_size"].as_u64().unwrap_or(50).clamp(1, 100) as usize;
-        let mut paths = Vec::new();
-        match fs::read_dir(crate::storage::data_dir(&self.root).join("logs")) {
-            Ok(entries) => {
-                for item in entries {
-                    let item = item.map_err(|e| e.to_string())?;
-                    let name = item.file_name().to_string_lossy().into_owned();
-                    let rotated = name
-                        .strip_prefix(&format!("{day}-"))
-                        .and_then(|n| n.strip_suffix(".jsonl"))
-                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-                    if (name == format!("{day}.jsonl") || rotated)
-                        && item.file_type().map_err(|e| e.to_string())?.is_file()
-                    {
-                        paths.push(item.path());
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("日志目录读取失败：{e}")),
-        }
-        paths.sort();
-        let mut finished = HashSet::new();
-        for path in &paths {
-            visit(path, |r| {
-                if matches!(
-                    r["kind"].as_str(),
-                    Some("ai_success" | "ai_failed" | "ai_cancelled")
-                ) {
-                    if let Some(id) = r["detail"]["request_id"].as_str() {
-                        finished.insert(id.to_string());
-                    }
-                }
-            })?;
-        }
+        let paths = day_paths(&self.root, &day)?;
         let mut rows = BTreeMap::new();
         let mut total = 0usize;
-        let mut sequence = 0usize;
-        let mut insert = |mut r: Value| {
-            sequence += 1;
+        let mut insert = |mut r: Value, sequence: usize| {
             let task_id = r["task_id"]
                 .as_str()
                 .or_else(|| r["detail"]["task_id"].as_str())
@@ -238,13 +294,6 @@ impl App {
             {
                 return;
             }
-            if r["kind"] == "ai_start"
-                && r["detail"]["request_id"]
-                    .as_str()
-                    .is_some_and(|id| finished.contains(id))
-            {
-                return;
-            }
             total += 1;
             rows.insert((time, sequence), r);
             if rows.len() > page * size {
@@ -252,12 +301,35 @@ impl App {
             }
         };
         let mut invalid = 0;
+        let mut sequence = 0usize;
+        let mut finished = HashSet::new();
+        let mut starts = Vec::new();
         for path in &paths {
             invalid += visit(path, |r| {
+                sequence += 1;
+                if matches!(
+                    r["kind"].as_str(),
+                    Some("ai_success" | "ai_failed" | "ai_cancelled")
+                ) {
+                    if let Some(id) = r["detail"]["request_id"].as_str() {
+                        finished.insert(id.to_owned());
+                    }
+                }
+                // Only starts need to wait for later outcomes. Every line is
+                // parsed once and ordinary rows retain bounded pagination.
+                if r["kind"] == "ai_start" && r["detail"]["request_id"].is_string() {
+                    starts.push((r, sequence));
+                    return;
+                }
                 if runtime(r["kind"].as_str().unwrap_or("")) {
-                    insert(r);
+                    insert(r, sequence);
                 }
             })?;
+        }
+        for (row, sequence) in starts {
+            if !finished.contains(row["detail"]["request_id"].as_str().unwrap_or("")) {
+                insert(row, sequence);
+            }
         }
         {
             let state = self.state.lock().unwrap();
@@ -268,7 +340,8 @@ impl App {
                 let mut value = json!(audit);
                 value["audit"] = json!(true);
                 value["index"] = json!(index);
-                insert(value);
+                sequence += 1;
+                insert(value, sequence);
             }
         }
         let pages = total.div_ceil(size).max(1);
@@ -280,7 +353,8 @@ impl App {
             .take(size)
             .collect::<Vec<_>>();
         Ok(
-            json!({"day":day,"rows":rows,"page":page,"pages":pages,"total":total,"invalid_lines":invalid}),
+            json!({"day":day,"rows":rows,"page":page,"pages":pages,"total":total,"invalid_lines":invalid,
+                "revision":revision}),
         )
     }
 }
@@ -289,16 +363,68 @@ impl App {
 mod tests {
     use super::*;
     #[test]
+    fn historical_day_revision_ignores_today_but_detects_rotations_and_late_audit() {
+        let (root, app) = crate::test_support::scoped_app("shishi-log-revision");
+        let day = "2026-01-02";
+        let (_, start, _) = day_range(Some(day)).unwrap();
+        let before = app.activity_day_revision(Some(day), None);
+        app.log("ai_start", json!({"request_id":"today"}));
+        app.log_writer.flush().unwrap();
+        assert_eq!(before, app.activity_day_revision(Some(day), None));
+        let path = root.join(format!("data/logs/{day}-1.jsonl"));
+        let row = json!({"time":start+100,"kind":"ai_start","detail":{"request_id":"historical"}});
+        fs::write(&path, format!("{row}\n")).unwrap();
+        let rotation = app.activity_day_revision(Some(day), None);
+        assert_ne!(before, rotation);
+        app.state.lock().unwrap().audit.push(crate::model::Audit {
+            time: start + 200,
+            kind: "manual_edit".into(),
+            detail: "late historical audit".into(),
+            ..Default::default()
+        });
+        let audit = app.activity_day_revision(Some(day), None);
+        assert_ne!(rotation["audit"], audit["audit"]);
+        fs::remove_file(path).unwrap();
+        assert_ne!(audit, app.activity_day_revision(Some(day), None));
+    }
+    #[test]
+    fn single_pass_keeps_tie_order_and_merges_outcomes_across_rotations() {
+        let (root, app) = crate::test_support::scoped_app("shishi-log-single-pass");
+        let at = crate::model::now();
+        let records = [
+            json!({"time":at,"kind":"ai_start","detail":{"request_id":"finished","text":"search token"}}),
+            json!({"time":at,"kind":"ai_start","detail":{"request_id":"pending","text":"search token"}}),
+            json!({"time":at,"kind":"error","detail":{"text":"search token"}}),
+        ];
+        fs::write(
+            root.join(format!("data/logs/{}-1.jsonl", date())),
+            records
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        fs::write(root.join(format!("data/logs/{}.jsonl",date())), json!({"time":at,"kind":"ai_success","detail":{"request_id":"finished","text":"search token"}}).to_string()).unwrap();
+        let rows = app
+            .activity_query(&json!({"filter":"all","query":"search token","page_size":1,"page":2}))
+            .unwrap();
+        assert_eq!(rows["total"], 3);
+        assert_eq!(rows["rows"][0]["kind"], "error");
+        let last = app
+            .activity_query(&json!({"filter":"all","query":"search token","page_size":1,"page":3}))
+            .unwrap();
+        assert_eq!(last["rows"][0]["detail"]["request_id"], "pending");
+    }
+    #[test]
     fn fuzzy_search_combines_scope_and_matches_task_number_title_and_body_before_paging() {
-        let root = std::env::temp_dir().join(format!("shishi-log-search-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-log-search");
         {
             let mut s = app.state.lock().unwrap();
-            s.tasks.push(crate::model::Task {
-                id: "synthetic-task".into(),
-                title: "合成事项 Alpha".into(),
-                ..Default::default()
-            });
+            s.tasks.push(crate::test_support::task(
+                "synthetic-task",
+                "合成事项 Alpha",
+            ));
             s.task_numbers.insert("synthetic-task".into(), 42);
         }
         for i in 0..65 {
@@ -329,13 +455,10 @@ mod tests {
         assert!(app
             .activity_query(&json!({"query":"a".repeat(201)}))
             .is_err());
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn blank_dates_resolve_to_shanghai_today_without_changing_explicit_dates() {
-        let root = std::env::temp_dir().join(format!("shishi-log-date-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-log-date");
         for params in [
             json!({}),
             json!({"day":null}),
@@ -351,13 +474,10 @@ mod tests {
         for day in ["2026-99-01", "2026/10/01", "../state"] {
             assert!(app.activity_query(&json!({"day":day})).is_err());
         }
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn archive_commit_and_failure_are_visible_with_their_final_status() {
-        let root = std::env::temp_dir().join(format!("shishi-archive-log-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-archive-log");
         app.log(
             "ai_success",
             json!({"kind":"archive","request_id":"synthetic"}),
@@ -377,13 +497,10 @@ mod tests {
         let errors = app.activity_query(&json!({"filter":"errors"})).unwrap();
         assert_eq!(errors["total"], 1);
         assert_eq!(errors["rows"][0]["kind"], "archive_failed");
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn purpose_filtering_precedes_counts_pagination_and_start_finish_merging() {
-        let root = std::env::temp_dir().join(format!("shishi-purpose-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-purpose");
         let at = crate::model::now();
         let mut rows = Vec::new();
         for (purpose, count) in [
@@ -453,14 +570,11 @@ mod tests {
             changes
         );
         assert_eq!(fs::read_to_string(path).unwrap(), text);
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
     }
-    use crate::model::{id, now};
+    use crate::model::now;
     #[test]
     fn disk_query_keeps_early_ai_after_scan_noise_and_reads_rotations() {
-        let root = std::env::temp_dir().join(format!("shishi-log-query-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-log-query");
         let at = (now() + 28_800_000).div_euclid(86_400_000) * 86_400_000 - 28_800_000 + 43_200_000;
         let early = json!({"time":at-10000,"kind":"ai_success","detail":{"request_id":"early"}});
         fs::write(
@@ -507,7 +621,5 @@ mod tests {
             fs::read_to_string(root.join(format!("data/logs/{}.jsonl", date()))).unwrap(),
             lines.join("\n")
         );
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
     }
 }

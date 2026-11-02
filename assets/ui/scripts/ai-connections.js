@@ -5,7 +5,7 @@ function editConnection(c, isNew = false) {
   connectionEditor = {
     connection: {
       ...{ executable: '', base_url: '', key_env: null, credential_id: null },
-      ...structuredClone(c),
+      ...c,
     },
     expected: isNew ? null : structuredClone(c),
     models: structuredClone(c.models || []),
@@ -44,7 +44,7 @@ async function checkWorkspacePlugin(install = false) {
   if (host.hidden || !connection.executable) return;
   const button = host.querySelector('button'),
     label = host.querySelector('[data-workspace-plugin-status]');
-  if (install) editor.busy = true;
+  const done = install ? connectionActivity(editor) : () => {};
   button.disabled = true;
   label.textContent = install ? '正在安装 SS 会话插件…' : '正在检查 SS 会话接入…';
   try {
@@ -61,7 +61,7 @@ async function checkWorkspacePlugin(install = false) {
   } catch (error) {
     if (connectionEditor === editor) label.textContent = 'SS 会话插件：' + error.message;
   } finally {
-    if (install) editor.busy = false;
+    done();
     if (button.isConnected) {
       button.disabled = false;
       if (install) button.focus();
@@ -95,7 +95,7 @@ function connectionDraft() {
     base_url: value('base'),
     key_env: value('key-env') || null,
     stream: f.querySelector('[data-ai-stream]').checked,
-    models: structuredClone(connectionEditor.models),
+    models: connectionEditor.models,
   };
 }
 function connectionValue() {
@@ -106,46 +106,70 @@ function connectionValue() {
     $('[data-ai-model-id]').value.trim(),
   ]);
 }
-function connectionFingerprint() {
-  return connectionValue();
+function connectionActivity(editor) {
+  // A late completion may only release the activity it started.
+  const owner = (editor.busy = {});
+  return () => {
+    if (editor.busy === owner) editor.busy = false;
+  };
+}
+function connectionRequest(editor) {
+  const request = ++editor.request,
+    fingerprint = connectionValue();
+  const active = () => connectionEditor === editor && request === editor.request;
+  return {
+    active,
+    unchanged: () => active() && fingerprint === connectionValue(),
+    done: connectionActivity(editor),
+  };
 }
 function connectionDirty() {
   return !!connectionEditor && connectionValue() !== connectionEditor.baseline;
 }
-function modelProvider(m) {
-  let route;
-  try {
-    route = JSON.parse(m.model);
-  } catch {}
-  return (
-    m.providerName ||
-    m.provider ||
-    (Array.isArray(route) && route.length === 2 ? route[0] : '') ||
-    connectionEditor?.connection?.name ||
-    '当前接入'
-  );
-}
-function modelName(m) {
-  let route;
-  try {
-    route = JSON.parse(m.model);
-  } catch {}
-  return m.displayName || (Array.isArray(route) && route.length === 2 ? route[1] : m.model);
-}
-function modelSourceLabel(m, catalog) {
-  const source = modelProvider(m),
-    same = catalog.some(
-      (v) =>
-        v.model !== m.model &&
-        modelProvider(v) === source &&
-        v.provider &&
-        m.provider &&
-        v.provider !== m.provider,
-    );
-  return `${source}${same ? ' (' + m.provider + ')' : ''}`;
-}
-function modelLabel(m, catalog) {
-  return `${modelSourceLabel(m, catalog)} · ${modelName(m)}`;
+function modelLabels(catalog, connectionName = '') {
+  const sources = new Map(),
+    count = (map, key) => map.set(key, (map.get(key) || 0) + 1);
+  const rows = catalog.map((m, i) => {
+    let route;
+    if (!m.displayName || !(m.providerName || m.provider || connectionName)) {
+      try {
+        route = JSON.parse(m.model);
+      } catch {}
+    }
+    if (!Array.isArray(route) || route.length !== 2) route = null;
+    const source =
+      m.providerName ||
+      m.provider ||
+      connectionName ||
+      route?.[0] ||
+      connectionEditor?.connection?.name ||
+      '当前接入';
+    if (m.provider) {
+      if (!sources.has(source))
+        sources.set(source, { total: 0, models: new Map(), providers: new Map() });
+      const group = sources.get(source);
+      if (!group.providers.has(m.provider))
+        group.providers.set(m.provider, { total: 0, models: new Map() });
+      const provider = group.providers.get(m.provider);
+      group.total++;
+      provider.total++;
+      count(group.models, m.model);
+      count(provider.models, m.model);
+    }
+    return { m, i, source, name: m.displayName || (route ? route[1] : m.model) };
+  });
+  return rows.map((row) => {
+    const { m } = row,
+      group = sources.get(row.source),
+      provider = group?.providers.get(m.provider);
+    // Exclude this provider and this model; add back their counted intersection.
+    const conflict =
+      m.provider &&
+      group.total - provider.total - group.models.get(m.model) + provider.models.get(m.model) > 0;
+    row.source = `${row.source}${conflict ? ' (' + m.provider + ')' : ''}`;
+    row.label = `${row.source} · ${row.name}`;
+    return row;
+  });
 }
 function restoreConnectionFocus() {
   const form = $('#connection-form');
@@ -302,18 +326,10 @@ async function connectCandidate(path) {
   const editor = connectionEditor;
   if (!editor) return;
   const draft = connectionDraft();
-  if (
-    !editor.isNew &&
-    editor.expected?.executable &&
-    launcherIdentity(path) !== launcherIdentity(editor.expected.executable)
-  ) {
-    $('#connection-status').textContent = '已有配置已保留；修改路径后请刷新模型并保存。';
-    return;
-  }
   const existing = draftConnections().find(
     (c) => c.driver === draft.driver && launcherIdentity(c.executable) === launcherIdentity(path),
   );
-  if (existing && existing.id !== draft.id) {
+  if (editor.isNew && existing && existing.id !== draft.id) {
     closeConnectionEditor();
     toast('此程序已接入，已保留现有连接');
     return;
@@ -324,7 +340,12 @@ async function connectCandidate(path) {
     editor.connection.id = '';
     editor.expected = defaultConnection();
   }
-  if ((await discoverConnectionModels()) && connectionEditor === editor && editor.models.length) {
+  if (
+    (await discoverConnectionModels()) &&
+    editor.isNew &&
+    connectionEditor === editor &&
+    editor.models.length
+  ) {
     const after = connectionValue();
     if (after === editor.discoveredValue) {
       try {
@@ -347,10 +368,9 @@ function renderConnectionModels() {
   editor.catalog = catalog;
   const selected = new Set(editor.models.map((m) => m.model)),
     query = (editor.modelQuery || '').toLocaleLowerCase(),
-    visible = catalog
-      .map((m, i) => ({ m, i }))
-      .filter(({ m }) =>
-        [m.model, m.displayName, m.provider, m.providerName, modelLabel(m, catalog)].some((v) =>
+    visible = modelLabels(catalog)
+      .filter(({ m, label }) =>
+        [m.model, m.displayName, m.provider, m.providerName, label].some((v) =>
           String(v || '')
             .toLocaleLowerCase()
             .includes(query),
@@ -368,8 +388,8 @@ function renderConnectionModels() {
   host.innerHTML =
     visible
       .map(
-        ({ m, i }) =>
-          `<div class="model-chip model-catalog-row"><label class="check"><input type="checkbox" data-ai-model-toggle="${i}" ${selected.has(m.model) ? 'checked' : ''}><span class="model-catalog-text"><small>${esc(modelSourceLabel(m, catalog))}</small><strong>${esc(modelName(m))}</strong></span></label><button type="button" aria-label="删除模型 ${esc(modelLabel(m, catalog))}" data-ai-model-remove="${i}">×</button></div>`,
+        ({ m, i, source, name, label }) =>
+          `<div class="model-chip model-catalog-row"><label class="check"><input type="checkbox" data-ai-model-toggle="${i}" ${selected.has(m.model) ? 'checked' : ''}><span class="model-catalog-text"><small>${esc(source)}</small><strong>${esc(name)}</strong></span></label><button type="button" aria-label="删除模型 ${esc(label)}" data-ai-model-remove="${i}">×</button></div>`,
       )
       .join('') ||
     (catalog.length
@@ -385,21 +405,14 @@ async function discoverConnectionModels() {
     (connection.driver !== 'api' && !connection.executable)
   )
     return;
-  const request = ++editor.request,
-    fingerprint = connectionFingerprint();
-  editor.busy = true;
+  const request = connectionRequest(editor);
   editor.setup = null;
   $('#connection-setup').hidden = true;
   $('#connection-status').textContent = '正在读取模型…';
   try {
     if (connection.driver === 'dsh') {
       const setup = await rpc('ai_connection_status', { connection });
-      if (
-        connectionEditor !== editor ||
-        request !== editor.request ||
-        fingerprint !== connectionFingerprint()
-      )
-        return;
+      if (!request.unchanged()) return;
       editor.setup = setup;
       void checkWorkspacePlugin();
       $('#connection-setup').hidden = !setup.can_initialize_acp;
@@ -411,12 +424,7 @@ async function discoverConnectionModels() {
       }
     }
     const data = await rpc('models', { connection, key: $('[data-ai-key]').value });
-    if (
-      connectionEditor !== editor ||
-      request !== editor.request ||
-      fingerprint !== connectionFingerprint()
-    )
-      return;
+    if (!request.unchanged()) return;
     const rows = Array.isArray(data?.models) ? data.models : [];
     editor.models = [
       ...new Map(
@@ -439,7 +447,7 @@ async function discoverConnectionModels() {
           ]),
       ).values(),
     ];
-    editor.catalog = structuredClone(editor.models);
+    editor.catalog = editor.models;
     renderConnectionModels();
     $('#connection-status').textContent = editor.models.length
       ? `已读取 ${editor.models.length} 个模型`
@@ -447,11 +455,7 @@ async function discoverConnectionModels() {
     editor.discoveredValue = connectionValue();
     return true;
   } catch (error) {
-    if (
-      connectionEditor === editor &&
-      request === editor.request &&
-      fingerprint === connectionFingerprint()
-    )
+    if (request.unchanged())
       $('#connection-status').textContent =
         connection.driver === 'dsh'
           ? '模型检测失败：' +
@@ -459,44 +463,32 @@ async function discoverConnectionModels() {
             '\n处理后点击“刷新模型”重试；手动添加模型不能修复 ACP 启动环境。'
           : '模型检测失败，请手动添加或重试：' + error.message;
   } finally {
-    editor.busy = false;
+    request.done();
   }
 }
 async function initializeConnectionAcp() {
   const editor = connectionEditor;
   if (!editor || editor.busy || editor.saving || !editor.setup?.can_initialize_acp) return;
-  const connection = connectionDraft(),
-    fingerprint = connectionFingerprint();
+  const connection = connectionDraft();
   if (
     !confirm(
       `初始化 DSH 内置 ACP 环境？\n程序：${connection.executable}\n配置目录：${editor.setup.dsh_home}\n仅创建缺失的 ACP 配置，不重置已有配置或凭据，不发起 AI 推理。`,
     )
   )
     return;
-  const request = ++editor.request;
-  editor.busy = true;
+  const request = connectionRequest(editor);
   const button = $('[data-ai-initialize]');
   button.disabled = true;
   $('#connection-status').textContent = '正在初始化 ACP 环境…';
   try {
     await rpc('dsh_initialize_acp', { connection, confirmed: true });
-    if (
-      connectionEditor !== editor ||
-      request !== editor.request ||
-      fingerprint !== connectionFingerprint()
-    )
-      return;
-    editor.busy = false;
+    if (!request.unchanged()) return;
     await discoverConnectionModels();
   } catch (error) {
-    if (
-      connectionEditor === editor &&
-      request === editor.request &&
-      fingerprint === connectionFingerprint()
-    )
+    if (request.unchanged())
       $('#connection-status').textContent = 'ACP 初始化失败：' + error.message;
   } finally {
-    editor.busy = false;
+    request.done();
     if (button.isConnected) {
       button.disabled = false;
       if (connectionEditor === editor) button.focus();
@@ -507,20 +499,12 @@ async function detectConnection() {
   const editor = connectionEditor;
   if (!editor) return;
   const c = connectionDraft(),
-    request = ++editor.request,
-    original = c.executable,
-    fingerprint = connectionFingerprint();
-  editor.busy = true;
+    request = connectionRequest(editor),
+    original = c.executable;
   $('#connection-status').textContent = '正在查找…';
   try {
     const data = await rpc('detect', { driver: c.driver, saved: original });
-    if (
-      connectionEditor !== editor ||
-      request !== editor.request ||
-      connectionDraft().driver !== c.driver ||
-      fingerprint !== connectionFingerprint()
-    )
-      return;
+    if (!request.unchanged()) return;
     const rows =
       c.driver === 'dsh'
         ? data.candidates || []
@@ -550,10 +534,10 @@ async function detectConnection() {
         : '未找到安装，请选择新版启动器。';
     }
   } catch (error) {
-    if (connectionEditor === editor && request === editor.request)
+    if (request.active())
       $('#connection-status').textContent = error.message;
   } finally {
-    editor.busy = false;
+    request.done();
   }
 }
 function acceptConnectionConfig(config, syncProfiles = false) {
@@ -629,6 +613,8 @@ document.addEventListener('change', (e) => {
     if (e.target.matches('[data-ai-path],[data-ai-base]')) {
       $('#connection-setup').hidden = true;
       connectionEditor.setup = null;
+    }
+    if (e.target.matches('[data-ai-base]')) {
       connectionEditor.models = [];
       connectionEditor.catalog = [];
       renderConnectionModels();
@@ -655,7 +641,7 @@ document.addEventListener('click', async (e) => {
     return;
   try {
     if (b.hasAttribute('data-ai-add')) {
-      if (readConnections().length >= 20) throw Error('最多配置 20 个附加连接');
+      if ((state.config.ai_connections || []).length >= 20) throw Error('最多配置 20 个附加连接');
       editConnection(
         {
           id: 'connection-' + Date.now().toString(36) + '-' + ++connectionSequence,
@@ -710,7 +696,7 @@ document.addEventListener('click', async (e) => {
     }
     if (b.hasAttribute('data-ai-pick')) {
       const editor = connectionEditor;
-      editor.busy = true;
+      const done = connectionActivity(editor);
       try {
         const value = await rpc('pick', {
           kind: driverLabels[connectionDraft().driver],
@@ -721,7 +707,7 @@ document.addEventListener('click', async (e) => {
           editor.request++;
         }
       } finally {
-        editor.busy = false;
+        done();
       }
       return;
     }

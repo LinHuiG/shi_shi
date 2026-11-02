@@ -4,10 +4,10 @@
 //! parses prose or logs prompt content. Shutdown closes stdin, waits briefly,
 //! then terminates the job so descendants (MCP servers) cannot leak.
 
-use crate::jsonrpc::{decode_line, FrameError, Incoming};
+use crate::jsonrpc::{decode_line, read_line, FrameError, Incoming};
 use crate::process::{spawn_in_job, JobGuard};
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
@@ -15,53 +15,34 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy)]
-pub struct TransportConfig {
-    pub max_stdout_line: usize,
-    pub max_stderr_line: usize,
-    pub max_stderr_lines: usize,
-    pub writer_queue: usize,
-    pub shutdown_grace: Duration,
-}
-
-impl Default for TransportConfig {
-    fn default() -> Self {
-        Self {
-            max_stdout_line: 8 * 1024 * 1024,
-            max_stderr_line: 4 * 1024,
-            max_stderr_lines: 8,
-            writer_queue: 128,
-            shutdown_grace: Duration::from_secs(2),
-        }
+shishi_api::default_struct! {
+    #[derive(Debug, Clone, Copy)]
+    pub struct TransportConfig {
+        pub max_stdout_line: usize = 8 * 1024 * 1024,
+        pub max_stderr_line: usize = 4 * 1024,
+        pub max_stderr_lines: usize = 8,
+        pub writer_queue: usize = 128,
+        pub shutdown_grace: Duration = Duration::from_secs(2),
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum TransportError {
+    #[error("spawn failed: {0}")]
     Spawn(String),
+    #[error("job assignment failed: {0}")]
     Job(String),
+    #[error("ACP transport is closed")]
     Closed,
+    #[error("ACP stdin write failed: {0}")]
     Write(String),
+    #[error("ACP stdout read failed: {0}")]
     Read(String),
+    #[error("ACP protocol error: {0}")]
     Protocol(FrameError),
+    #[error("ACP transport timed out")]
     Timeout,
 }
-
-impl std::fmt::Display for TransportError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Spawn(message) => write!(f, "spawn failed: {message}"),
-            Self::Job(message) => write!(f, "job assignment failed: {message}"),
-            Self::Closed => f.write_str("ACP transport is closed"),
-            Self::Write(message) => write!(f, "ACP stdin write failed: {message}"),
-            Self::Read(message) => write!(f, "ACP stdout read failed: {message}"),
-            Self::Protocol(error) => write!(f, "ACP protocol error: {error}"),
-            Self::Timeout => f.write_str("ACP transport timed out"),
-        }
-    }
-}
-
-impl std::error::Error for TransportError {}
 
 #[derive(Debug)]
 enum ReadEvent {
@@ -152,7 +133,7 @@ impl Transport {
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
-        let (mut child, job) = spawn_in_job(command).map_err(TransportError::Job)?;
+        let (mut child, job) = spawn_in_job(&mut command).map_err(TransportError::Job)?;
         let stdin = child
             .stdin
             .take()
@@ -210,7 +191,7 @@ impl Transport {
         self.closed.load(Ordering::SeqCst)
     }
 
-    pub fn send_line(&self, line: Vec<u8>) -> Result<(), TransportError> {
+    pub fn send_line(&self, mut line: Vec<u8>) -> Result<(), TransportError> {
         if self.is_closed() {
             return Err(TransportError::Closed);
         }
@@ -225,9 +206,13 @@ impl Transport {
             .ok_or(TransportError::Closed)?;
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            match sender.try_send(line.clone()) {
+            if self.is_closed() {
+                return Err(TransportError::Closed);
+            }
+            match sender.try_send(line) {
                 Ok(()) => return Ok(()),
-                Err(TrySendError::Full(_)) if Instant::now() < deadline => {
+                Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
+                    line = returned;
                     thread::sleep(Duration::from_millis(2));
                 }
                 Err(TrySendError::Full(_)) => {
@@ -275,43 +260,36 @@ impl Transport {
     /// Idempotent, bounded teardown. Closing the writer drops the child stdin;
     /// the grace period lets the server drain; then the job is terminated.
     pub fn shutdown(&self) {
+        self.close(self.config.shutdown_grace);
+    }
+
+    /// Cancellation and an expired deadline must not wait for a graceful exit.
+    pub fn abort(&self) {
+        self.job.terminate();
+        self.close(Duration::ZERO);
+    }
+
+    fn close(&self, grace: Duration) {
         if self.shutdown_started.swap(true, Ordering::SeqCst) {
             return;
         }
         self.closed.store(true, Ordering::SeqCst);
         self.writer.lock().unwrap().take();
-        let deadline = Instant::now() + self.config.shutdown_grace;
+        let deadline = Instant::now() + grace;
         let mut child_lock = self.child.lock().unwrap();
         if let Some(child) = child_lock.as_mut() {
-            loop {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Ok(None) => {
-                        self.job.terminate();
-                        let kill_deadline = Instant::now() + Duration::from_secs(2);
-                        while Instant::now() < kill_deadline {
-                            if let Ok(Some(_)) = child.try_wait() {
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(10));
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    Err(_) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                }
+            while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
             }
         }
-        drop(child_lock);
+        // Kill descendants even if the direct child already exited. Waiting on
+        // that child's handle reaps it without another polling deadline.
         self.job.terminate();
+        if let Some(child) = child_lock.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        drop(child_lock);
         let threads = std::mem::take(&mut *self.threads.lock().unwrap());
         for handle in threads {
             let _ = handle.join();
@@ -356,128 +334,42 @@ fn send_event_retry(
 }
 
 fn read_stdout(
-    mut stdout: impl Read,
+    stdout: impl Read,
     max_line: usize,
     tx: SyncSender<ReadEvent>,
     closed: Arc<AtomicBool>,
 ) {
-    let mut reader = BufReader::new(&mut stdout);
+    let mut reader = BufReader::new(stdout);
     let mut line = Vec::new();
     loop {
-        line.clear();
-        let mut too_long = false;
-        loop {
-            let available = match reader.fill_buf() {
-                Ok(available) => available,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    let _ = send_event(
-                        &tx,
-                        ReadEvent::Failed(TransportError::Read(error.to_string())),
-                        &closed,
-                    );
-                    return;
-                }
-            };
-            if available.is_empty() {
-                if line.is_empty() {
-                    let _ = send_event(&tx, ReadEvent::Eof, &closed);
-                } else {
-                    let _ = dispatch_line(&line, max_line, &tx, &closed);
-                }
-                return;
-            }
-            if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
-                let take = position + 1;
-                if line.len() + take > max_line + 2 {
-                    too_long = true;
-                } else {
-                    line.extend_from_slice(&available[..take]);
-                }
-                reader.consume(take);
-                break;
-            }
-            if line.len() + available.len() > max_line + 2 {
-                too_long = true;
-            } else {
-                line.extend_from_slice(available);
-            }
-            let consumed = available.len();
-            reader.consume(consumed);
-        }
-        if too_long {
-            let _ = send_event(
-                &tx,
+        let event = match read_line(&mut reader, &mut line, max_line.saturating_add(2)) {
+            Ok(0) => ReadEvent::Eof,
+            Ok(bytes) if bytes > max_line.saturating_add(2) => {
                 ReadEvent::Failed(TransportError::Protocol(FrameError::TooLong {
-                    bytes: line.len(),
+                    bytes,
                     limit: max_line,
-                })),
-                &closed,
-            );
-            return;
-        }
-        if dispatch_line(&line, max_line, &tx, &closed).is_err() {
+                }))
+            }
+            Ok(_) => match decode_line(&line, max_line) {
+                Ok(message) => ReadEvent::Message(message),
+                Err(error) => ReadEvent::Failed(TransportError::Protocol(error)),
+            },
+            Err(error) => ReadEvent::Failed(TransportError::Read(error.to_string())),
+        };
+        let finished = !matches!(&event, ReadEvent::Message(_)) || !line.ends_with(b"\n");
+        if send_event(&tx, event, &closed).is_err() || finished {
             return;
         }
     }
 }
 
-fn dispatch_line(
-    line: &[u8],
-    max_line: usize,
-    tx: &SyncSender<ReadEvent>,
-    closed: &AtomicBool,
-) -> Result<(), ()> {
-    match decode_line(line, max_line) {
-        Ok(message) => send_event(tx, ReadEvent::Message(message), closed),
-        Err(error) => {
-            let _ = send_event(
-                tx,
-                ReadEvent::Failed(TransportError::Protocol(error)),
-                closed,
-            );
-            Err(())
-        }
-    }
-}
-
-fn read_stderr(mut stderr: impl Read, buffer: Arc<Mutex<StderrBuffer>>, max_line: usize) {
-    let mut reader = BufReader::new(&mut stderr);
+fn read_stderr(stderr: impl Read, buffer: Arc<Mutex<StderrBuffer>>, max_line: usize) {
+    let mut reader = BufReader::new(stderr);
     let mut line = Vec::new();
-    loop {
-        line.clear();
-        let mut too_long = false;
-        loop {
-            let available = match reader.fill_buf() {
-                Ok(available) => available,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return,
-            };
-            if available.is_empty() {
-                if !line.is_empty() {
-                    buffer.lock().unwrap().push(&line);
-                }
-                return;
-            }
-            if let Some(position) = available.iter().position(|byte| *byte == b'\n') {
-                let take = position + 1;
-                if line.len() + take <= max_line + 2 {
-                    line.extend_from_slice(&available[..take]);
-                } else {
-                    too_long = true;
-                }
-                reader.consume(take);
-                break;
-            }
-            if line.len() + available.len() <= max_line + 2 {
-                line.extend_from_slice(available);
-            } else {
-                too_long = true;
-            }
-            let consumed = available.len();
-            reader.consume(consumed);
-        }
-        let _ = too_long;
+    while matches!(
+        read_line(&mut reader, &mut line, max_line.saturating_add(2)),
+        Ok(1..)
+    ) {
         buffer.lock().unwrap().push(&line);
     }
 }
@@ -492,5 +384,93 @@ fn write_stdin(
             *error_slot.lock().unwrap() = Some(error.to_string());
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_stdout_cannot_be_accepted_as_a_truncated_json_prefix_at_eof() {
+        for ending in ["", "\n"] {
+            let mut input = br#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_vec();
+            input.resize(16 * 1024, b' ');
+            input.extend_from_slice(ending.as_bytes());
+            let (tx, rx) = sync_channel(2);
+            read_stdout(&input[..], 8192, tx, Arc::new(AtomicBool::new(false)));
+            assert!(
+                matches!(rx.recv().unwrap(), ReadEvent::Failed(TransportError::Protocol(
+                FrameError::TooLong { bytes, limit: 8192 }
+            )) if bytes == input.len())
+            );
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    fn queued_transport() -> (Transport, Receiver<Vec<u8>>) {
+        let (writer, receiver) = sync_channel(1);
+        let (_, incoming) = sync_channel(1);
+        let config = TransportConfig::default();
+        (
+            Transport {
+                child: Mutex::new(None),
+                job: JobGuard::create().unwrap(),
+                writer: Mutex::new(Some(writer)),
+                incoming: Mutex::new(incoming),
+                stderr: Arc::new(Mutex::new(StderrBuffer::new(1, 16))),
+                threads: Mutex::new(Vec::new()),
+                closed: Arc::new(AtomicBool::new(false)),
+                shutdown_started: AtomicBool::new(false),
+                write_error: Arc::new(Mutex::new(None)),
+                config,
+            },
+            receiver,
+        )
+    }
+
+    #[test]
+    fn full_writer_queue_reuses_the_original_buffer_when_capacity_returns() {
+        let (transport, receiver) = queued_transport();
+        transport.send_line(vec![1]).unwrap();
+        let frame = vec![7; 4 * 1024 * 1024];
+        let original = frame.as_ptr() as usize;
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| transport.send_line(frame));
+            thread::sleep(Duration::from_millis(30));
+            assert!(!writer.is_finished());
+            assert_eq!(receiver.recv().unwrap(), vec![1]);
+            let actual = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(actual.as_ptr() as usize, original);
+            assert!(actual.iter().all(|byte| *byte == 7));
+            writer.join().unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn full_writer_queue_keeps_backpressure_and_observes_shutdown() {
+        let (transport, _receiver) = queued_transport();
+        transport.send_line(vec![1]).unwrap();
+        thread::scope(|scope| {
+            let writer = scope.spawn(|| transport.send_line(vec![2; 1024]));
+            thread::sleep(Duration::from_millis(30));
+            assert!(!writer.is_finished());
+            let started = Instant::now();
+            transport.shutdown();
+            assert!(matches!(
+                writer.join().unwrap(),
+                Err(TransportError::Closed)
+            ));
+            assert!(started.elapsed() < Duration::from_secs(1));
+        });
+        let (transport, _receiver) = queued_transport();
+        transport.send_line(vec![1]).unwrap();
+        let started = Instant::now();
+        assert!(matches!(
+            transport.send_line(vec![2]),
+            Err(TransportError::Write(_))
+        ));
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 }

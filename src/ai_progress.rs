@@ -98,19 +98,21 @@ impl LiveProgress {
             }
             .into();
         }
-        if let Some(last) = self.entries.last_mut().filter(|e| e.kind == kind) {
-            if append {
-                last.text.push_str(text);
-            } else {
-                last.text = text.into();
-            }
-            last.text = tail(&last.text, 12000);
-        } else {
+        if self.entries.last().is_none_or(|entry| entry.kind != kind) {
             self.entries.push(Entry {
                 id: self.revision,
                 kind: kind.into(),
-                text: tail(text, 12000),
+                text: String::new(),
             });
+        }
+        let last = self.entries.last_mut().unwrap();
+        if !append {
+            last.text.clear();
+        }
+        last.text.push_str(tail(text, 12000));
+        let start = last.text.len() - tail(&last.text, 12000).len();
+        if start > 0 {
+            last.text.drain(..start);
         }
         while self.entries.iter().map(|e| e.text.len()).sum::<usize>() > 48_000
             || self.entries.len() > 64
@@ -119,9 +121,13 @@ impl LiveProgress {
         }
     }
 }
-fn tail(text: &str, count: usize) -> String {
-    let skip = text.chars().count().saturating_sub(count);
-    text.chars().skip(skip).collect()
+fn tail(text: &str, count: usize) -> &str {
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(count)
+        .map_or(0, |(i, ch)| i + ch.len_utf8());
+    &text[start..]
 }
 #[cfg(test)]
 mod tests {
@@ -214,7 +220,10 @@ mod tests {
         assert_eq!(p.entries[0].text, "核对");
         p.accept("reasoning", "核对完成", false);
         assert_eq!(p.entries[0].text, "核对完成");
-        p.accept("content", &"字".repeat(100_000), true);
+        p.accept("content", &"字🙂x".repeat(100_000), true);
+        p.accept("content", "尾", true);
+        assert_eq!(p.entries.last().unwrap().text.chars().count(), 12000);
+        assert!(p.entries.last().unwrap().text.ends_with("🙂x尾"));
         assert!(p.entries.iter().map(|e| e.text.len()).sum::<usize>() <= 48_000);
         p.start("second");
         assert!(p.entries.is_empty());

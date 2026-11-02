@@ -6,7 +6,6 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
-    process::Command,
 };
 pub const LIMIT: usize = 2;
 
@@ -75,8 +74,7 @@ pub fn attach(root: &Path, payload: &mut Value) {
             if record["kind"] != "message" {
                 continue;
             }
-            let refs: Vec<ImageRef> =
-                serde_json::from_value(record["data"]["images"].clone()).unwrap_or_default();
+            let refs: Vec<ImageRef> = from_json(&record["data"]["images"]).unwrap_or_default();
             if refs.is_empty() {
                 continue;
             }
@@ -95,6 +93,9 @@ pub fn attach(root: &Path, payload: &mut Value) {
     // The private catalog is the only authority for read_image. No arbitrary file names are accepted.
     payload["_local_context"]["images"] = json!(images);
     payload["_local_context"]["image_cache"] = json!(crate::storage::data_dir(&root).join("media"));
+    attach_hints(root, payload, &images);
+}
+pub(crate) fn attach_hints(root: &Path, payload: &mut Value, images: &[Value]) {
     for field in ["changes", "context"] {
         if let Some(rows) = payload[field].as_array_mut() {
             for row in rows {
@@ -150,20 +151,9 @@ fn preview(cache: &Path, image: &ImageRef) -> Result<(String, String), String> {
         format!("\u{feff}{}", include_str!("../assets/image-preview.ps1")),
     )
     .map_err(|e| e.to_string())?;
-    let mut command = Command::new(
-        PathBuf::from(std::env::var_os("SystemRoot").unwrap_or("C:\\Windows".into()))
-            .join("System32/WindowsPowerShell/v1.0/powershell.exe"),
-    );
-    command
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(&script);
+    let mut command =
+        process::powershell(std::env::var_os("SystemRoot").unwrap_or("C:\\Windows".into()));
+    command.arg("-File").arg(&script);
     let result = process::run(
         command,
         Some(&json!({"path":image.path}).to_string()),
@@ -376,7 +366,7 @@ mod tests {
         };
         let mut p = json!({"changes":[crate::context_budget::message(&message,500)],"_local_context":{"records":[{"kind":"message","id":"m","data":message}],"expires":now()+60000}});
         attach(Path::new("unused"), &mut p);
-        assert!(!crate::ai::public_payload(&p)
+        assert!(!json!(crate::ai::public_payload(&p))
             .to_string()
             .contains("private.png"));
         assert!(!p["_local_context"]["records"]

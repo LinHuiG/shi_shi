@@ -61,9 +61,6 @@ async function renderSystemPrompts() {
 function renderLearning() {
   $('#view').dataset.contentPage = 'prompts';
   $('#view').dataset.renderedPromptSection = 'advice';
-  const active = document.activeElement,
-    key = active?.dataset.adviceText,
-    caret = key ? [active.selectionStart, active.selectionEnd] : null;
   const rows = [
       ...(state.suggestions || []).filter((r) => !r.archived_at).map((r) => ['rule', r]),
       ...(state.tag_state?.proposals || []).filter((r) => !r.archived_at).map((r) => ['tag', r]),
@@ -92,15 +89,6 @@ function renderLearning() {
     '#view',
     `<div class="page advice-page">${systemPromptTabs()}<div class="box"><h2>待确认 ${pending.length} 条</h2>${help('保留历史及手动生成的建议；可预览、启用、拒绝或批复。归档不再修改或自动采用提示词。')}<div class="row"><button data-handle="learn">从处置记录生成建议</button><button data-prompt-section="history">提示词与版本</button></div></div>${pending.map(([k, r]) => adviceCard(k, r)).join('') || empty('没有待确认的建议', '继续使用和修正事项，有充分依据时会产生新建议。')}${done.length ? `<details class="box"><summary>已处理 ${done.length} 条 · 下次归档后收起</summary>${done.map(([k, r]) => adviceCard(k, r)).join('')}</details>` : ''}${tagHistory()}</div>`,
   );
-  if (key) {
-    const el = [...document.querySelectorAll('[data-advice-text]')].find(
-      (el) => el.dataset.adviceText === key,
-    );
-    if (el) {
-      el.focus({ preventScroll: true });
-      el.setSelectionRange(...caret);
-    }
-  }
 }
 let promptTarget = 'classify',
   promptEditing = false;

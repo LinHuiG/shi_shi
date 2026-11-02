@@ -1,9 +1,9 @@
-const assert=require('assert'),{chromium}=require('playwright'),fs=require('fs');
+const assert=require('assert'),{withBrowser}=require('./ui-driver.cjs'),fs=require('fs');
 const bundle=require('./ui-bundle.cjs');
 const fixture={config:{codex:'',enabled:true,auto_ai:true,interval_minutes:30,work_start:'09:00',work_end:'18:00',leaders:[],daily_calls:40},tasks:[{id:'t1',title:'Synthetic task',description:'Example',status:'待处理',priority:'普通',category:'日常事务',created:1,updated:2,today:true,tags:[]}],schedules:[],chat_sources:[],activity:[],suggestions:[],handling:[],audit:[],reports:[],evolution:{prompts:[],handling:[]},usage:{day:'2026-10-19',calls:0,input_tokens:0,output_tokens:0,cached_input_tokens:0,cached_reports:0,unreported_calls:0},messages_revision:[0,0,0],pending:0,last_scan:0,ai_busy:false,busy:false,root:'isolated',rule_version:0,tag_state:{groups:[],filters:{},proposals:[],versions:[]}};
 const mock=`window.requests=[];window.ipc={postMessage(raw){const {id,method,params:p}=JSON.parse(raw);requests.push({method,p});setTimeout(()=>{let data=true;if(method==='state')data=JSON.parse(JSON.stringify(${JSON.stringify(fixture)}));if(method==='messages_query')data={rows:[],page:1,pages:1,total:0};if(method==='prompt_history')data={versions:[],current:{}};if(method==='plugins')data={plugins:[],sources:[],errors:[]};window.receive({id,ok:true,data});},5)}};`;
 const html=bundle().replace('<script>','<script>'+mock+'\n');
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync)});try{
+withBrowser(async(browser)=>{
  const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.setContent(html);await page.waitForFunction(()=>document.querySelector('.task-row'));
  const title=()=>page.locator('#page-title').innerText();
@@ -40,4 +40,4 @@ const html=bundle().replace('<script>','<script>'+mock+'\n');
  assert.equal(await page.evaluate(()=>getComputedStyle(document.documentElement).backgroundColor),'rgba(32, 32, 32, 0.9)');
  assert.deepEqual(errors,[]);
  console.log('PASS Mica opaque fallback and transparent base; palette open/filter/select/run/toggle; Ctrl+1-8, Ctrl+N, "/" search, F5 data refresh; inert under dialogs; shortcut hints');
-}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1});
+}).catch(e=>{console.error(e);process.exitCode=1});

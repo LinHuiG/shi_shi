@@ -2,11 +2,8 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { chromium } = require('playwright');
-(async () => {
-  const browser = await chromium.launch({ headless: true,
-    executablePath: ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync) });
-  try {
+const { withBrowser } = require('./ui-driver.cjs');
+withBrowser(async(browser)=>{
     const page = await browser.newPage({ viewport: { width: 320, height: 140 }, deviceScaleFactor: 1.5 });
     const html = fs.readFileSync(path.join(__dirname, '../assets/task-notification.html'), 'utf8')
       .replace('/* THEME */', fs.readFileSync(path.join(__dirname, '../assets/ui/styles/tokens.css'), 'utf8'));
@@ -48,5 +45,4 @@ const { chromium } = require('playwright');
     await page.emulateMedia({ reducedMotion: 'reduce' });
     assert.equal(await page.locator('body').evaluate(el => getComputedStyle(el).transitionDuration), '0s');
     console.log('PASS compact task notification: full-card mouse and keyboard navigation, escaping, dismissal, replacement, long content and reduced motion; ' + output);
-  } finally { await browser.close(); }
-})().catch(error => { console.error(error); process.exitCode = 1; });
+  }).catch(error => { console.error(error); process.exitCode = 1; });

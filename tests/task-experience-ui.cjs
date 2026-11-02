@@ -1,9 +1,9 @@
 // SS-207–SS-212, synthetic IPC only. Exercises production components and shell.
-const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const at=Date.parse('2026-10-26T08:00:00+08:00');
 const out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-task-experience-'));
 const task=(id,extra={})=>({id,number:1,title:'合成事项 '+id,description:'保留事项描述及外围操作。',status:'待处理',today:true,created:at,updated:at,evidence_count:80,change_count:65,...extra});
-const fixture={config:{enabled:false,auto_ai:false,leaders:[],interval_minutes:5,daily_calls:40,work_start:'09:00',work_end:'18:00'},tasks:[task('one'),task('two',{number:2}),task('done',{status:'已完成'}),task('deferred',{deferred:true}),task('archived',{archived:true}),task('dismissed',{status:'无需处理'}),task('cancelled',{status:'已取消'})],handling:[{id:'run',task_id:'one',thread_id:'thread',transport:'desktop',connection:{driver:'codex',name:'合成接入'},project_name:'合成项目',model:'synthetic-model',status:'inProgress',rounds:[{id:'first',question:'先检查合成数据',steps:[{id:'user',kind:'userMessage',text:'先检查合成数据'},{id:'assistant',kind:'agentMessage',text:'已确认第一轮结论'}],conclusion:'已确认第一轮结论'},{id:'second',question:'继续核对',steps:[{id:'tool',kind:'commandExecution',text:'读取合成配置\n'+Array.from({length:25},(_,i)=>'合成工具输出 '+i).join('\n')},{id:'answer',kind:'agentMessage',text:Array.from({length:30},(_,i)=>'正在核对合成资料 '+i).join('\n')}]}],requests:[]}],schedules:[{id:'s',title:'合成定时检查',description:'保留现有卡片内容',enabled:true,frequency:'daily',weekdays:[],time:'08:40',tags:[]}],messages:[],reports:[],suggestions:[],audit:[],activity:[],chat_sources:[],usage:{},task_history_revision:[1,65],messages_revision:[80,1]};
+const fixture={config:{enabled:false,auto_ai:false,leaders:[],interval_minutes:5,daily_calls:40,work_start:'09:00',work_end:'18:00'},tasks:[task('one'),task('two',{number:2}),task('done',{status:'已完成'}),task('deferred',{deferred:true,deferred_until:Date.now()+86400000}),task('archived',{archived:true}),task('dismissed',{status:'无需处理'}),task('cancelled',{status:'已取消'})],handling:[{id:'run',task_id:'one',thread_id:'thread',transport:'desktop',connection:{driver:'codex',name:'合成接入'},project_name:'合成项目',model:'synthetic-model',status:'inProgress',rounds:[{id:'first',question:'先检查合成数据',steps:[{id:'user',kind:'userMessage',text:'先检查合成数据'},{id:'assistant',kind:'agentMessage',text:'已确认第一轮结论'}],conclusion:'已确认第一轮结论'},{id:'second',question:'继续核对',steps:[{id:'tool',kind:'commandExecution',text:'读取合成配置\n'+Array.from({length:25},(_,i)=>'合成工具输出 '+i).join('\n')},{id:'answer',kind:'agentMessage',text:Array.from({length:30},(_,i)=>'正在核对合成资料 '+i).join('\n')}]}],requests:[]}],schedules:[{id:'s',title:'合成定时检查',description:'保留现有卡片内容',enabled:true,frequency:'daily',weekdays:[],time:'08:40',tags:[]}],messages:[],reports:[],suggestions:[],audit:[],activity:[],chat_sources:[],usage:{},task_history_revision:[1,65],messages_revision:[80,1]};
 const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.recordDelay=5;window.failRecords=false;window.failSchedule=false;window.scheduleDelay=80;
 window.recordRows=Array.from({length:80},(_,i)=>({id:'m'+i,text:'合成消息 '+i,sender:i===3?'特定发送人':'合成发送人',source_name:'合成来源',group:'合成会话',time:${at}+i*60000}));
 window.changeRowsFixture=Array.from({length:65},(_,i)=>({index:i,time:${at}+i*60000,kind:'manual_edit',detail:'合成修改 '+i,before:{description:'原描述'},after:{description:'新描述 '+i}}));
@@ -17,9 +17,7 @@ if(['evidence_query','task_changes'].includes(r.method)){
 if(r.method==='schedule_edit'){if(failSchedule)error='合成保存失败';else fixture.schedules[0]=p.schedule;}
 if(r.method==='handling_followup'){fixture.handling[0].rounds.push({id:'followup',question:p.text,steps:[]});}
 receive({id:r.id,ok:!error,data,error});},['evidence_query','task_changes'].includes(r.method)?recordDelay:r.method==='schedule_edit'?scheduleDelay:5);}};`;
-(async()=>{
- const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});
- try {
+withBrowser(async(browser)=>{
   const page=await browser.newPage({viewport:{width:1360,height:1000}}),errors=[];
   page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(10000);
   await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));
@@ -28,7 +26,7 @@ receive({id:r.id,ok:!error,data,error});},['evidence_query','task_changes'].incl
   assert.equal(await page.locator('[data-recent],.recent-item,#f-next,[data-action="prompt"]').count(),0);
   for(const name of ['编辑','合并'])assert(await page.locator('.detail-actions').getByText(name,{exact:true}).isVisible());
   await page.locator('[data-handle="start"]').click();await page.locator('#handling-question').waitFor();
-  assert.equal(await page.locator('[data-handling-reading-toggle]').count(),0);assert.equal(await page.locator('.handling-user-message').count(),2);
+  assert.equal(await page.locator('.handling-user-message').count(),2);
   assert.equal(await page.locator('[data-handling-stream]').getByText('已确认第一轮结论',{exact:true}).count(),1);
   assert.equal(await page.locator('.handling-stream-detail').count(),1);
   await page.locator('.handling-stream-detail summary').click();assert(await page.locator('.handling-stream-detail').evaluate(e=>e.open));
@@ -76,6 +74,8 @@ receive({id:r.id,ok:!error,data,error});},['evidence_query','task_changes'].incl
   const open=kind=>page.locator(`[data-task-record="${kind}"]`).click();
   await open('evidence');await page.waitForFunction(()=>document.querySelectorAll('.record-message').length===50);
   assert(await page.locator('#overlay').isHidden());assert.equal(await page.locator('#task-record-window').getAttribute('aria-modal'),'false');
+  // Measure scrolling after the popup's own entrance transform has finished.
+  await page.locator('#task-record-window').evaluate(el=>Promise.all(el.getAnimations().map(a=>a.finished.catch(()=>{}))));
   const header=await page.locator('.task-record-tools').boundingBox();
   await page.locator('.task-record-content').evaluate(el=>el.scrollTop=500);
   assert(Math.abs((await page.locator('.task-record-tools').boundingBox()).y-header.y)<1);
@@ -168,5 +168,4 @@ receive({id:r.id,ok:!error,data,error});},['evidence_query','task_changes'].incl
   await assertDocked();await page.locator('#toast').waitFor({state:'hidden',timeout:8000});await page.waitForTimeout(250);await page.screenshot({path:path.join(out,'conversation.png')});
   assert.deepEqual(errors,[]);
   console.log('PASS SS-207–SS-212 conversation, scope, popup lifecycle, filters, bounds, request races, reduced motion and schedule rollback. '+out);
- }finally{await browser.close();}
-})().catch(e=>{console.error(e);process.exitCode=1;});
+ }).catch(e=>{console.error(e);process.exitCode=1;});

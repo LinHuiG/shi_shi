@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+pub(crate) use shishi_api::json::chars as json_chars;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The only state format this build can load. Product data written before the
@@ -7,56 +8,58 @@ use std::collections::{BTreeMap, BTreeSet};
 /// managed files and offers a scoped cleanup instead of silently defaulting.
 pub const STATE_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Config {
-    pub auto_update: bool,
-    pub ai_connections: Vec<crate::ai_backend::Connection>,
-    #[serde(skip)]
-    pub selected_connection: String,
-    #[serde(default = "legacy_model_profiles")]
-    pub model_profiles: Option<ModelProfiles>,
-    pub message_retention_days: u32,
-    pub handling_prompt: String,
-    pub tool_call_prompt: String,
-    pub tools: Vec<crate::tool_registry::ToolDefinition>,
-    pub review_prompt: String,
-    pub archive_prompt: String,
-    pub codex: String,
-    pub codex_models: Vec<Value>,
-    pub codex_name: String,
-    pub ai_timeout_seconds: u64,
-    pub analysis_workdir: String,
-    pub interval_minutes: u64,
-    pub analysis_interval_minutes: u64,
-    pub analysis_lookback_hours: u64,
-    /// Optional relevance gate; off includes all unanalysed incremental messages.
-    pub analysis_related_only: bool,
-    pub leaders: Vec<String>,
-    pub enabled: bool,
-    pub auto_ai: bool,
-    pub message_filter_enabled: bool,
-    pub auto_adopt_advice: bool,
-    /// Retired archive automation flags. Read old settings without activating them.
-    pub auto_adopt_prompt: bool,
-    pub retain_ai_traces: bool,
-    pub work_start: String,
-    pub work_end: String,
-    pub daily_calls: u64,
-    pub max_input_chars: usize,
-    /// Per-request cap on characters returned by read-only retrieval, counted
-    /// separately from the first-turn `max_input_chars`.
-    #[serde(alias = "context_read_chars")]
-    pub retrieval_budget_chars: usize,
-    /// Retired preference: accept old files, but choose the backdrop by runtime capability.
-    #[serde(skip_serializing)]
-    pub window_backdrop: bool,
-    pub model: String,
-    pub reasoning_effort: String,
-    pub classify_prompt: String,
-    pub format_prompt: String,
-    pub learning_prompt: String,
-    pub report_prompt: String,
+shishi_api::default_struct! {
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    pub struct Config {
+        pub auto_update: bool = true,
+        pub ai_connections: Vec<crate::ai_backend::Connection>,
+        #[serde(skip)]
+        pub selected_connection: String,
+        #[serde(default = "legacy_model_profiles")]
+        pub model_profiles: Option<ModelProfiles> = Some(ModelProfiles::default()),
+        pub message_retention_days: u32 = 90,
+        pub handling_prompt: String,
+        pub tool_call_prompt: String,
+        pub tools: Vec<crate::tool_registry::ToolDefinition>,
+        pub review_prompt: String,
+        pub archive_prompt: String,
+        pub codex: String,
+        pub codex_models: Vec<Value>,
+        pub codex_name: String = "默认 Codex".into(),
+        pub ai_timeout_seconds: u64 = 600,
+        pub analysis_workdir: String = "ShiShi".into(),
+        pub interval_minutes: u64 = 3,
+        pub analysis_interval_minutes: u64 = 30,
+        pub analysis_lookback_hours: u64 = 24,
+        /// Optional relevance gate; off includes all unanalysed incremental messages.
+        pub analysis_related_only: bool,
+        pub leaders: Vec<String>,
+        pub enabled: bool = true,
+        pub auto_ai: bool = true,
+        pub message_filter_enabled: bool = true,
+        pub auto_adopt_advice: bool,
+        /// Retired archive automation flags. Read old settings without activating them.
+        pub auto_adopt_prompt: bool,
+        pub retain_ai_traces: bool,
+        pub work_start: String = "08:00".into(),
+        pub work_end: String = "20:00".into(),
+        pub daily_calls: u64 = 150,
+        pub max_input_chars: usize = 80_000,
+        /// Shared continuation allowance for retrieval, command results and model
+        /// messages, separate from the initial request's `max_input_chars`.
+        #[serde(alias = "context_read_chars")]
+        pub retrieval_budget_chars: usize = 80_000,
+        /// Retired preference: accept old files, but choose the backdrop by runtime capability.
+        #[serde(skip_serializing)]
+        pub window_backdrop: bool = true,
+        pub model: String = "gpt-6-astra".into(),
+        pub reasoning_effort: String = "low".into(),
+        pub classify_prompt: String,
+        pub format_prompt: String,
+        pub learning_prompt: String,
+        pub report_prompt: String,
+    }
 }
 /// Every purpose that can reach a provider. Adding a purpose here forces
 /// connection validation, work-state gating and usage accounting to cover it.
@@ -94,56 +97,12 @@ fn legacy_model_choice() -> Option<ModelChoice> {
     Some(ModelChoice::default())
 }
 pub const UNCONFIGURED_CONNECTION: &str = "__unconfigured_purpose__";
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            auto_update: true,
-            ai_connections: vec![],
-            selected_connection: String::new(),
-            model_profiles: Some(ModelProfiles::default()),
-            message_retention_days: 90,
-            handling_prompt: String::new(),
-            tool_call_prompt: String::new(),
-            tools: vec![],
-            review_prompt: String::new(),
-            archive_prompt: String::new(),
-            codex: String::new(),
-            codex_models: vec![],
-            codex_name: "默认 Codex".into(),
-            ai_timeout_seconds: 600,
-            analysis_workdir: "ShiShi".into(),
-            interval_minutes: 3,
-            analysis_interval_minutes: 30,
-            analysis_lookback_hours: 24,
-            analysis_related_only: false,
-            leaders: vec![],
-            enabled: true,
-            auto_ai: true,
-            message_filter_enabled: true,
-            auto_adopt_advice: false,
-            auto_adopt_prompt: false,
-            retain_ai_traces: false,
-            work_start: "08:00".into(),
-            work_end: "20:00".into(),
-            daily_calls: 150,
-            max_input_chars: 80_000,
-            retrieval_budget_chars: 80_000,
-            window_backdrop: true,
-            model: "gpt-6-astra".into(),
-            reasoning_effort: "low".into(),
-            classify_prompt: String::new(),
-            format_prompt: String::new(),
-            learning_prompt: String::new(),
-            report_prompt: String::new(),
-        }
-    }
-}
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct ModelChoice {
-    pub connection_id: String,
-    pub model: String,
-    pub reasoning_effort: String,
+pub struct ModelChoice<T = String> {
+    pub connection_id: T,
+    pub model: T,
+    pub reasoning_effort: T,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -167,8 +126,12 @@ impl Config {
     pub fn early_analysis_enabled(&self) -> bool {
         self.automatic_analysis_enabled() && self.message_filter_enabled
     }
-    pub fn for_kind(&self, kind: &str) -> Self {
-        let mut c = self.clone();
+    pub fn model_choice(&self, kind: &str) -> ModelChoice<&str> {
+        let mut c = ModelChoice {
+            connection_id: self.selected_connection.as_str(),
+            model: self.model.as_str(),
+            reasoning_effort: self.reasoning_effort.as_str(),
+        };
         if let Some(p) = &self.model_profiles {
             let choice = match kind {
                 "message_filter" => &p.filter,
@@ -178,53 +141,63 @@ impl Config {
                 _ => &p.analysis,
             };
             let Some(choice) = choice else {
-                c.selected_connection = UNCONFIGURED_CONNECTION.into();
-                c.model.clear();
-                c.reasoning_effort.clear();
-                return c;
+                return ModelChoice {
+                    connection_id: UNCONFIGURED_CONNECTION,
+                    model: "",
+                    reasoning_effort: "",
+                };
             };
             // A legacy partial profile (for example one saved before the filter
             // purpose existed) keeps the base value for fields it does not set.
             // It never silently becomes an empty model or connection.
             if !choice.connection_id.is_empty() {
-                c.selected_connection = choice.connection_id.clone();
+                c.connection_id = &choice.connection_id;
             }
             if !choice.model.trim().is_empty() {
-                c.model = choice.model.clone();
+                c.model = &choice.model;
             }
             if !choice.reasoning_effort.trim().is_empty() {
-                c.reasoning_effort = choice.reasoning_effort.clone();
+                c.reasoning_effort = &choice.reasoning_effort;
             }
         }
         c
     }
+    pub fn for_kind(&self, kind: &str) -> Self {
+        let choice = self.model_choice(kind);
+        Self {
+            selected_connection: choice.connection_id.into(),
+            model: choice.model.into(),
+            reasoning_effort: choice.reasoning_effort.into(),
+            ..self.clone()
+        }
+    }
     pub fn clear_connection_routes(&mut self, id: &str) {
-        let resolved =
-            ["message_filter", "classify", "handling", "archive"].map(|kind| self.for_kind(kind));
-        let materialized = |c: &Config| {
-            Some(ModelChoice {
-                connection_id: c.selected_connection.clone(),
-                model: c.model.clone(),
-                reasoning_effort: c.reasoning_effort.clone(),
-            })
-        };
-        let p = self.model_profiles.get_or_insert_with(|| ModelProfiles {
-            filter: materialized(&resolved[0]),
-            analysis: materialized(&resolved[1]),
-            handling: materialized(&resolved[2]),
-            review: materialized(&resolved[3]),
-            legacy_tool_call: None,
+        let matching = ["message_filter", "classify", "handling", "archive"]
+            .map(|kind| self.model_choice(kind).connection_id == id);
+        let p = self.model_profiles.get_or_insert_with(|| {
+            let base = Some(ModelChoice {
+                connection_id: self.selected_connection.clone(),
+                model: self.model.clone(),
+                reasoning_effort: self.reasoning_effort.clone(),
+            });
+            ModelProfiles {
+                filter: base.clone(),
+                analysis: base.clone(),
+                handling: base.clone(),
+                review: base,
+                legacy_tool_call: None,
+            }
         });
-        for (choice, c) in [
+        for (choice, matching) in [
             &mut p.filter,
             &mut p.analysis,
             &mut p.handling,
             &mut p.review,
         ]
         .into_iter()
-        .zip(resolved)
+        .zip(matching)
         {
-            if c.selected_connection == id {
+            if matching {
                 *choice = None;
             }
         }
@@ -283,13 +256,14 @@ pub struct TaskEvidence {
     pub completion: Vec<String>,
 }
 impl TaskEvidence {
-    pub fn all(&self) -> BTreeSet<String> {
-        self.direct
-            .iter()
-            .chain(self.background.iter())
-            .chain(self.completion.iter())
-            .cloned()
-            .collect()
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        [&self.direct, &self.background, &self.completion]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+    }
+    pub fn all(&self) -> BTreeSet<&str> {
+        self.iter().collect()
     }
 }
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -309,7 +283,7 @@ pub struct TaskStep {
     pub retired_next_step: (),
     pub confirmed: bool,
 }
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Task {
     /// Legacy storage only; all tasks now use the global enabled tool registry.
@@ -364,8 +338,44 @@ pub struct Task {
     pub follow_deadline: bool,
     pub deadline_changed: i64,
     pub deferred_until: i64,
+    pub resume_processing: bool,
     pub schedule_id: String,
     pub scheduled_for: String,
+}
+impl Task {
+    /// The textual fields accepted by task patches; metadata is never writable
+    /// through this path. Callers enforce their narrower edit policy.
+    pub(crate) fn text_field_mut(&mut self, field: &str) -> Option<&mut String> {
+        Some(match field {
+            "title" => &mut self.title,
+            "description" => &mut self.description,
+            "status" => &mut self.status,
+            "blocker" => &mut self.blocker,
+            "waiting_for" => &mut self.waiting_for,
+            "due" => &mut self.due,
+            "summary" => &mut self.summary,
+            _ => return None,
+        })
+    }
+
+    /// Mutually exclusive focus views; the stored status remains unchanged.
+    pub fn focus(&self, at: i64) -> Option<&'static str> {
+        if self.archived
+            || !self.merged_into.is_empty()
+            || !["待处理", "处理中"].contains(&self.status.as_str())
+        {
+            return None;
+        }
+        Some(if self.deferred_until > at {
+            "延后处理"
+        } else if !self.blocker.trim().is_empty() || !self.waiting_for.trim().is_empty() {
+            "被阻塞"
+        } else if self.status == "处理中" {
+            "处理中"
+        } else {
+            "待处理"
+        })
+    }
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
@@ -430,6 +440,11 @@ pub struct MemoryEntry {
 #[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalysisMemory {
+    /// None reads the legacy entries losslessly, including content above the
+    /// new limit. Some("") is an intentional clear, not a legacy fallback.
+    pub archived: Option<String>,
+    pub archived_updated: i64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub archived_entries: Vec<MemoryEntry>,
     pub archived_version: u64,
     pub temporary: String,
@@ -438,12 +453,21 @@ pub struct AnalysisMemory {
 }
 impl AnalysisMemory {
     pub fn archived_text(&self) -> String {
+        if let Some(text) = &self.archived {
+            return text.clone();
+        }
         self.archived_entries
             .iter()
             .filter(|entry| !entry.text.trim().is_empty())
             .map(|entry| format!("- {}：{}", entry.key, entry.text.trim()))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    pub fn replace_archived(&mut self, text: String, at: i64) {
+        self.archived = Some(text);
+        self.archived_entries.clear();
+        self.archived_version += 1;
+        self.archived_updated = at;
     }
 }
 #[derive(Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -471,7 +495,7 @@ impl ArchiveAttempt {
 }
 /// One immutable snapshot of everything an archive generation changed. A
 /// rollback always appends a new group; it never rewrites history.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ArchiveGroup {
     pub id: String,
@@ -497,167 +521,82 @@ pub struct ArchiveGroup {
     pub archived_entries: Vec<MemoryEntry>,
     pub archived_version: u64,
 }
-impl Default for ArchiveGroup {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            created: 0,
-            action: String::new(),
-            restored_from: String::new(),
-            attempt_id: String::new(),
-            report_id: String::new(),
-            reason: String::new(),
-            prompt: String::new(),
-            prompt_version: String::new(),
-            active_rules: Vec::new(),
-            rule_version: 0,
-            tag_groups: Vec::new(),
-            tag_version: String::new(),
-            archived_entries: Vec::new(),
-            archived_version: 0,
-        }
-    }
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct State {
-    /// Monotonic local update clock and independent stage watermarks.
-    pub message_updated_at: i64,
-    pub filter_updated_at: i64,
-    pub analysis_updated_at: i64,
-    pub message_filter: crate::message_filter::FilterState,
-    pub analysis_retries: BTreeMap<String, String>,
-    /// Bounded conflict retries per message revision. A conflicting action keeps
-    /// its messages pending for a few attempts; after the cap they are consumed
-    /// with an explicit reason instead of retrying forever.
-    pub analysis_retry_counts: BTreeMap<String, u32>,
-    pub work_scheduler: crate::work_scheduler::SchedulerState,
-    pub calendar_overrides: Vec<crate::holiday::ManualOverride>,
-    pub morning_jobs: Vec<crate::calendar_service::MorningJob>,
-    /// Explicit data-format version. Missing/unsupported values are handled by
-    /// the managed-data cleanup flow, never by silently defaulting this struct.
-    pub schema_version: u32,
-    pub last_scan_finished_at: i64,
-    pub analysis_pending_since: i64,
-    pub last_analysis_at: i64,
-    #[serde(default)]
-    pub last_analysis_success_at: i64,
-    pub ai_interrupted_at: i64,
-    pub analysis_interrupted_at: i64,
-    pub archive_ai_cursor: Option<usize>,
-    pub archive_attempt_day: String,
-    pub archive_attempts: Vec<ArchiveAttempt>,
-    #[serde(with = "crate::archive_storage")]
-    pub archive_versions: crate::shared::Shared<Vec<ArchiveGroup>>,
-    pub analysis_memory: AnalysisMemory,
-    /// A hard budget failure pauses automatic retries until a manual analysis
-    /// succeeds. It never advances cursors or marks messages analyzed.
-    pub auto_analysis_blocked: bool,
-    pub auto_analysis_blocked_at: i64,
-    pub auto_analysis_block_reason: String,
-    pub deleted_messages: BTreeMap<String, i64>,
-    pub advice_revisions: crate::shared::Shared<Vec<Value>>,
-    pub archive_review_cursor: usize,
-    pub archive_log_cursor: i64,
-    pub tag_state: crate::tags::TagState,
-    pub handling: crate::handling::HandlingState,
-    pub tool_runs: crate::shared::Shared<Vec<crate::tool_calling::ToolRun>>,
-    pub config: Config,
-    pub messages: crate::shared::Shared<BTreeMap<String, Message>>,
-    pub tasks: crate::shared::Shared<Vec<Task>>,
-    pub task_numbers: BTreeMap<String, u64>,
-    pub schedules: Vec<Schedule>,
-    pub audit: crate::shared::Shared<Vec<Audit>>,
-    pub suggestions: Vec<Suggestion>,
-    pub rule_version: u64,
-    pub last_scan: i64,
-    pub last_error: String,
-    pub analyzed: BTreeMap<String, String>,
-    pub jobs: Vec<String>,
-    pub usage_day: String,
-    pub calls: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub cached_reports: u64,
-    pub unreported_calls: u64,
-    pub reports: crate::shared::Shared<Vec<Value>>,
-    pub retention_digest: Value,
-    pub revision: u64,
-    pub pending_scan: bool,
-    pub pending_analysis: bool,
-    pub pending_learning: bool,
-    pub learning_cursor: usize,
-    pub report_cursor: usize,
-    pub prompt_versions: Vec<PromptVersion>,
-    pub prompt_reviews: Vec<PromptReview>,
-    pub chat_sources: Vec<ChatSource>,
-}
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            schema_version: STATE_SCHEMA_VERSION,
-            message_updated_at: 0,
-            filter_updated_at: 0,
-            analysis_updated_at: 0,
-            work_scheduler: Default::default(),
-            message_filter: Default::default(),
-            analysis_retries: BTreeMap::new(),
-            analysis_retry_counts: BTreeMap::new(),
-            calendar_overrides: vec![],
-            morning_jobs: vec![],
-            last_scan_finished_at: 0,
-            analysis_pending_since: 0,
-            last_analysis_at: 0,
-            last_analysis_success_at: 0,
-            ai_interrupted_at: 0,
-            analysis_interrupted_at: 0,
-            archive_ai_cursor: None,
-            archive_attempt_day: String::new(),
-            archive_attempts: Vec::new(),
-            archive_versions: Default::default(),
-            analysis_memory: AnalysisMemory::default(),
-            auto_analysis_blocked: false,
-            auto_analysis_blocked_at: 0,
-            auto_analysis_block_reason: String::new(),
-            deleted_messages: BTreeMap::new(),
-            advice_revisions: Default::default(),
-            archive_review_cursor: 0,
-            archive_log_cursor: 0,
-            tag_state: crate::tags::TagState::default(),
-            handling: crate::handling::HandlingState::default(),
-            tool_runs: Default::default(),
-            config: Config::default(),
-            messages: Default::default(),
-            tasks: Default::default(),
-            task_numbers: BTreeMap::new(),
-            schedules: Vec::new(),
-            audit: Default::default(),
-            suggestions: Vec::new(),
-            rule_version: 0,
-            last_scan: 0,
-            last_error: String::new(),
-            analyzed: BTreeMap::new(),
-            jobs: Vec::new(),
-            usage_day: String::new(),
-            calls: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_input_tokens: 0,
-            cached_reports: 0,
-            unreported_calls: 0,
-            reports: Default::default(),
-            retention_digest: Value::Null,
-            revision: 0,
-            pending_scan: false,
-            pending_analysis: false,
-            pending_learning: false,
-            learning_cursor: 0,
-            report_cursor: 0,
-            prompt_versions: Vec::new(),
-            prompt_reviews: Vec::new(),
-            chat_sources: Vec::new(),
-        }
+shishi_api::default_struct! {
+    #[derive(Clone, Serialize, Deserialize)]
+    #[serde(default, deny_unknown_fields)]
+    pub struct State {
+        /// Monotonic local update clock and independent stage watermarks.
+        pub message_updated_at: i64,
+        pub filter_updated_at: i64,
+        pub analysis_updated_at: i64,
+        pub message_filter: crate::message_filter::FilterState,
+        pub analysis_retries: BTreeMap<String, String>,
+        /// Ordinary failures sort after new messages; counts never retire them.
+        pub analysis_retry_counts: BTreeMap<String, u32>,
+        /// Local input failures may retry after relevant preparation inputs change.
+        pub analysis_retry_scopes: BTreeMap<String, String>,
+        pub work_scheduler: crate::work_scheduler::SchedulerState,
+        pub calendar_overrides: Vec<crate::holiday::ManualOverride>,
+        pub morning_jobs: Vec<crate::calendar_service::MorningJob>,
+        /// Explicit data-format version. Missing/unsupported values are handled by
+        /// the managed-data cleanup flow, never by silently defaulting this struct.
+        pub schema_version: u32 = STATE_SCHEMA_VERSION,
+        pub last_scan_finished_at: i64,
+        pub analysis_pending_since: i64,
+        pub last_analysis_at: i64,
+        #[serde(default)]
+        pub last_analysis_success_at: i64,
+        pub ai_interrupted_at: i64,
+        pub analysis_interrupted_at: i64,
+        pub archive_ai_cursor: Option<usize>,
+        pub archive_attempt_day: String,
+        pub archive_attempts: Vec<ArchiveAttempt>,
+        #[serde(with = "crate::archive_storage")]
+        pub archive_versions: crate::shared::Shared<Vec<ArchiveGroup>>,
+        pub analysis_memory: AnalysisMemory,
+        /// A fixed-input budget failure pauses unchanged automatic attempts.
+        /// Relevant input changes permit a fresh bounded preparation attempt.
+        pub auto_analysis_blocked: bool,
+        pub auto_analysis_blocked_at: i64,
+        pub auto_analysis_block_reason: String,
+        pub auto_analysis_block_fingerprint: String,
+        pub deleted_messages: BTreeMap<String, i64>,
+        pub advice_revisions: crate::shared::Shared<Vec<Value>>,
+        pub archive_review_cursor: usize,
+        pub archive_log_cursor: i64,
+        pub tag_state: crate::tags::TagState,
+        pub handling: crate::handling::HandlingState,
+        pub tool_runs: crate::shared::Shared<Vec<crate::tool_calling::ToolRun>>,
+        pub config: Config,
+        pub messages: crate::shared::Shared<BTreeMap<String, Message>>,
+        pub tasks: crate::shared::Shared<Vec<Task>>,
+        pub task_numbers: BTreeMap<String, u64>,
+        pub schedules: Vec<Schedule>,
+        pub audit: crate::shared::Shared<Vec<Audit>>,
+        pub suggestions: Vec<Suggestion>,
+        pub rule_version: u64,
+        pub last_scan: i64,
+        pub last_error: String,
+        pub analyzed: crate::shared::Shared<BTreeMap<String, String>>,
+        pub jobs: Vec<String>,
+        pub usage_day: String,
+        pub calls: u64,
+        pub input_tokens: u64,
+        pub output_tokens: u64,
+        pub cached_input_tokens: u64,
+        pub cached_reports: u64,
+        pub unreported_calls: u64,
+        pub reports: crate::shared::Shared<Vec<Value>>,
+        pub retention_digest: Value,
+        pub revision: u64,
+        pub pending_scan: bool,
+        pub pending_analysis: bool,
+        pub pending_learning: bool,
+        pub learning_cursor: usize,
+        pub report_cursor: usize,
+        pub prompt_versions: Vec<PromptVersion>,
+        pub prompt_reviews: Vec<PromptReview>,
+        pub chat_sources: Vec<ChatSource>,
     }
 }
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -726,6 +665,27 @@ pub fn stamp(t: i64) -> String {
         })
         .unwrap_or_default()
 }
+/// Decode an already parsed value without copying an intermediate JSON tree.
+pub(crate) fn from_json<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, String> {
+    T::deserialize(value).map_err(|error| error.to_string())
+}
+
+/// Ignore known projection metadata while preserving strict field validation.
+pub(crate) fn from_json_ignoring<T: serde::de::DeserializeOwned>(
+    value: &Value,
+    ignored: &[&str],
+) -> Result<T, String> {
+    let Some(object) = value.as_object() else {
+        return from_json(value);
+    };
+    let fields = object
+        .iter()
+        .filter(|(key, _)| !ignored.contains(&key.as_str()))
+        .map(|(key, value)| (key.as_str(), value));
+    T::deserialize(serde::de::value::MapDeserializer::<_, serde_json::Error>::new(fields))
+        .map_err(|error| error.to_string())
+}
+
 pub fn fingerprint(m: &Message) -> String {
     serde_json::json!({"text":m.text,"withdrawn":m.withdrawn}).to_string()
 }
@@ -743,7 +703,8 @@ pub fn canonical_fingerprint(stored: &str) -> Option<String> {
 }
 pub fn fingerprint_matches(m: &Message, stored: Option<&String>) -> bool {
     stored.is_some_and(|stored| {
-        *stored == fingerprint(m) || canonical_fingerprint(stored) == Some(fingerprint(m))
+        let expected = fingerprint(m);
+        *stored == expected || canonical_fingerprint(stored).as_ref() == Some(&expected)
     })
 }
 pub fn id() -> String {
@@ -758,7 +719,8 @@ pub fn deadline_ms(due: &str) -> Option<i64> {
         .map(|d| d.timestamp_millis())
 }
 pub fn normalize_task(t: &mut Task) {
-    if !["待处理", "已完成", "无需处理", "已取消"].contains(&t.status.as_str()) {
+    if !["待处理", "处理中", "已完成", "无需处理", "已取消"].contains(&t.status.as_str())
+    {
         t.status = "待处理".into();
     }
     crate::tags::sync_category_tags(t);
@@ -768,12 +730,12 @@ pub fn normalize_task(t: &mut Task) {
 /// Deterministic content-only fallback. The AI can improve the summary while
 /// retaining the same content timestamps; generation failures keep this text.
 pub fn summary_fallback(text: &str) -> String {
-    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.is_empty() {
-        return String::new();
-    }
-    let mut out = compact.chars().take(240).collect::<String>();
-    if compact.chars().count() > 240 {
+    let mut chars = text
+        .split_whitespace()
+        .enumerate()
+        .flat_map(|(index, word)| (index > 0).then_some(' ').into_iter().chain(word.chars()));
+    let mut out = chars.by_ref().take(240).collect::<String>();
+    if chars.next().is_some() {
         out.push('…');
     }
     out
@@ -830,13 +792,7 @@ pub fn merge_evidence(
         (&mut t.evidence.background, background),
         (&mut t.evidence.completion, completion),
     ] {
-        for id in rows {
-            if !id.is_empty() && !target.contains(id) {
-                target.push(id.clone());
-            }
-        }
-        target.sort();
-        target.dedup();
+        target.extend_from_slice(rows);
     }
     normalize_evidence(t);
 }
@@ -857,11 +813,7 @@ mod tests {
     }
     #[test]
     fn message_revisions_ignore_all_metadata_including_replies_and_paths() {
-        let original = Message {
-            id: "m1".into(),
-            text: "Original body".into(),
-            ..Default::default()
-        };
+        let original = crate::test_support::message("m1", "Original body", 0);
         let mut changed = Message {
             inserted_at: 1,
             updated_at: 2,
@@ -902,12 +854,89 @@ mod tests {
         }
     }
     #[test]
-    fn default_policy() {
-        let c = Config::default();
-        assert_eq!(c.interval_minutes, 3);
-        assert!(c.enabled);
-        assert!(c.leaders.is_empty());
+    fn profiles_preserve_legacy_inheritance_explicit_null_and_all_purpose_routes() {
+        fn check(c: &Config, kind: &str, expected: (&str, &str)) {
+            let choice = c.model_choice(kind);
+            let frozen = c.for_kind(kind);
+            assert_eq!(
+                (choice.model, choice.reasoning_effort),
+                expected,
+                "borrowed {kind}"
+            );
+            assert_eq!(
+                (frozen.model.as_str(), frozen.reasoning_effort.as_str()),
+                expected,
+                "frozen {kind}"
+            );
+            assert_eq!(choice.connection_id, frozen.selected_connection);
+        }
+        let legacy: Config = serde_json::from_value(
+            json!({"codex":"original.exe","model":"old","reasoning_effort":"high"}),
+        )
+        .unwrap();
+        for (kind, effort) in [
+            ("classify", "low"),
+            ("format", "low"),
+            ("handling", "medium"),
+            ("archive", "high"),
+            ("report", "high"),
+        ] {
+            check(&legacy, kind, ("gpt-6-astra", effort));
+        }
+        let saved = json!(legacy);
+        assert!(saved.get("selected_connection").is_none());
+        let restored: Config = serde_json::from_value(saved).unwrap();
+        assert_eq!(
+            crate::ai_backend::connection(&restored).unwrap(),
+            crate::ai_backend::connection(&legacy).unwrap()
+        );
+        assert_eq!(
+            crate::ai_backend::connection(&restored).unwrap().executable,
+            "original.exe"
+        );
+        let partial: Config = serde_json::from_value(json!({"model":"base","reasoning_effort":"low","model_profiles":{"analysis":{"model":"selected"},"handling":null}})).unwrap();
+        check(&partial, "classify", ("selected", "low"));
+        check(&partial, "archive", ("base", "low"));
+        check(&partial, "handling", ("", ""));
+        assert!(crate::ai_backend::connection(&partial.for_kind("handling")).is_err());
+        let restored: Config = serde_json::from_value(json!(partial)).unwrap();
+        assert_eq!(
+            restored.model_choice("handling").connection_id,
+            UNCONFIGURED_CONNECTION
+        );
+        let mut c = Config {
+            model: "base".into(),
+            reasoning_effort: "low".into(),
+            model_profiles: None,
+            ..Default::default()
+        };
+        check(&c, "handling", ("base", "low"));
+        c.model_profiles = Some(serde_json::from_value(json!({"filter":{"model":"filter"},"analysis":{"model":"analysis","reasoning_effort":"medium"},"handling":{"model":"handling","reasoning_effort":"high"},"review":{"model":"review"}})).unwrap());
+        for (kinds, expected) in [
+            (&["message_filter"][..], ("filter", "low")),
+            (
+                &["classify", "format", "edit", "schedule"][..],
+                ("analysis", "medium"),
+            ),
+            (&["handling"][..], ("handling", "high")),
+            (
+                &[
+                    "archive",
+                    "learning",
+                    "prompt_review",
+                    "report",
+                    "handling_learning",
+                    "advice_revision",
+                ][..],
+                ("review", "low"),
+            ),
+        ] {
+            for kind in kinds {
+                check(&c, kind, expected);
+            }
+        }
     }
+
     #[test]
     fn automation_effective_states_cascade_and_retired_backdrop_is_read_only_compatibility() {
         let mut c = Config::default();
@@ -951,6 +980,18 @@ mod tests {
     }
     #[test]
     fn current_schema_keeps_config_and_derives_only_missing_summary_content() {
+        for (input, expected) in [
+            (" \t\u{2003}\n".into(), String::new()),
+            ("  甲\t乙\n🙂 ".into(), "甲 乙 🙂".into()),
+            ("字".repeat(240), "字".repeat(240)),
+            ("字".repeat(241), format!("{}…", "字".repeat(240))),
+            (
+                format!("{} \t tail", "a".repeat(239)),
+                format!("{} …", "a".repeat(239)),
+            ),
+        ] {
+            assert_eq!(summary_fallback(&input), expected);
+        }
         let s: State = serde_json::from_value(json!({
             "schema_version": STATE_SCHEMA_VERSION,
             "config":{"max_input_chars":70000,"classify_prompt":"用户规则","auto_adopt_advice":false},
@@ -995,7 +1036,7 @@ mod tests {
         assert!(legacy.is_err());
     }
     #[test]
-    fn business_code_is_not_priority() {
+    fn task_normalization_preserves_codes_and_canonicalizes_evidence() {
         let mut t = Task {
             title: "项目代号A0".into(),
             ..Default::default()
@@ -1004,6 +1045,12 @@ mod tests {
         assert!(t.priority.is_empty());
         assert!(t.environment.is_empty());
         assert!(t.tags.is_empty());
+        t.evidence.direct = ["m2", "m1", "m1", " "].map(String::from).to_vec();
+        let incoming = ["m2", "m3", "m3", "", "\u{2003}"].map(String::from);
+        merge_evidence(&mut t, &incoming, &incoming, &incoming);
+        assert_eq!(t.evidence.direct, ["m1", "m2", "m3"]);
+        assert_eq!(t.evidence.background, ["m2", "m3"]);
+        assert_eq!(t.evidence.completion, t.evidence.background);
     }
     #[test]
     fn approaching_deadline_raises_priority() {

@@ -1,15 +1,12 @@
-//! Plain model text is adapted to the same SS-owned tool loop as an HTTP API.
+//! Native model rounds share the tool loop directly, without an HTTP adapter.
 use super::{AnalysisEvent, AnalysisRequest, Connection};
 use serde_json::{json, Value};
-use shishi_api::{
-    ChatCompletionsClient, Endpoint, Transport, TransportError, TransportErrorKind,
-    TransportRequest, TransportResponse,
-};
+use shishi_api::json::chars as json_chars;
+use shishi_api::openai::{analyze_with_model, ModelReply, ModelRound};
+use shishi_api::{ApiError, ApiErrorKind, ApiEvent};
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Mutex,
-    },
+    cell::RefCell,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -64,6 +61,29 @@ fn frame(body: &Value) -> (String, Vec<Value>) {
     )
 }
 
+/// Query messages keep their ordinary JSON framing for accounting. The tool
+/// loop credits them in full under the independent retrieval/image budgets;
+/// the remaining command history therefore matches the native text frame.
+pub(crate) fn body_input_chars(schema: &Value, body: &Value) -> usize {
+    let messages = body["messages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let message_chars = 2
+        + messages
+            .iter()
+            .map(shishi_api::openai::message_input_chars)
+            .sum::<usize>()
+        + messages.len().saturating_sub(1);
+    crate::prompt_config::get("model_api_protocol")
+        .chars()
+        .count()
+        + "\n\n工具目录：\n\n本次对话：".chars().count()
+        + json_chars(&body["tools"])
+        + message_chars
+        + json_chars(&envelope(schema, &body["tools"]))
+}
+
 fn usage_step(value: &Value) -> Value {
     let input = value["input_tokens"].as_u64();
     let output = value["output_tokens"].as_u64();
@@ -104,68 +124,67 @@ pub(crate) fn input_chars(
         schema,
         &tools,
     );
-    let schema = envelope(schema, &body["tools"]);
-    frame(&body).0.chars().count() + schema.to_string().chars().count()
+    body_input_chars(schema, &body)
 }
 
-struct ModelTransport<'a, 'r> {
+struct NativeModel<'a, 'r, 'e> {
     connection: &'a Connection,
     request: &'a AnalysisRequest<'r>,
-    events: mpsc::SyncSender<AnalysisEvent>,
-    counter: Mutex<usize>,
-    completed_output: Mutex<Option<u64>>,
-    completed_usage: Mutex<Option<Value>>,
-    observed_usage: Mutex<Option<Value>>,
-    error: Mutex<Option<String>>,
+    events: &'a RefCell<&'e mut dyn FnMut(AnalysisEvent)>,
+    counter: usize,
+    completed_usage: Option<Value>,
+    observed_usage: Option<Value>,
+    error: Option<String>,
+    dsh: Option<super::dsh::AnalysisProcess>,
     id: String,
 }
-impl Transport for ModelTransport<'_, '_> {
-    fn send(
-        &self,
-        request: &TransportRequest<'_>,
-        timeout: Duration,
+impl NativeModel<'_, '_, '_> {
+    fn round(
+        &mut self,
+        body: &Value,
+        deadline: Instant,
         cancel: &AtomicBool,
-    ) -> Result<TransportResponse, TransportError> {
-        let failed = || TransportError::new(TransportErrorKind::Protocol);
-        let result = (|| -> Result<TransportResponse, String> {
-            let body: Value = serde_json::from_slice(request.body().ok_or("缺少模型请求")?)
-                .map_err(|e| e.to_string())?;
-            let schema = envelope(self.request.schema, &body["tools"]);
-            let (prompt, images) = frame(&body);
-            if prompt.chars().count() + schema.to_string().chars().count()
-                > self.request.config.max_input_chars
-            {
-                return Err(format!(
-                    "{}：工具续轮超过全局输入预算，已停止；已执行的工具不会重放",
-                    crate::ai::INPUT_LIMIT_ERROR
-                ));
-            }
-            let round = {
-                let mut n = self.counter.lock().unwrap();
-                *n += 1;
-                *n
-            };
-            let trace = self.request.trace.join(format!("round-{round:04}"));
-            if self.request.config.retain_ai_traces {
-                std::fs::create_dir_all(&trace).map_err(|e| e.to_string())?;
-                std::fs::write(trace.join("input.txt"), &prompt).map_err(|e| e.to_string())?;
+        output_base: Option<u64>,
+    ) -> Result<ModelReply, String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(crate::ai_control::CANCELLED.into());
+        }
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let schema = envelope(self.request.schema, &body["tools"]);
+        let (prompt, images) = frame(&body);
+        // The shared tool loop has measured this native frame's chargeable
+        // history. Independently metered query results remain in the full
+        // prompt and must not be charged again against the initial limit.
+        self.counter += 1;
+        let round = self.counter;
+        let trace = self.request.trace.join(format!("round-{round:04}"));
+        if self.request.config.retain_ai_traces {
+            let recorded = (|| -> std::io::Result<()> {
+                std::fs::create_dir_all(&trace)?;
+                std::fs::write(trace.join("input.txt"), &prompt)?;
                 std::fs::write(trace.join("schema.json"), schema.to_string())
-                    .map_err(|e| e.to_string())?;
+            })();
+            if let Err(error) = recorded {
+                (self.events.borrow_mut())(AnalysisEvent::Stream {
+                    kind: "diagnostic".into(),
+                    text: format!("分析跟踪保存失败，继续本次分析：{error}"),
+                    append: false,
+                });
             }
-            let mut config = self.request.config.clone();
-            config.ai_timeout_seconds = timeout.as_secs().min(config.ai_timeout_seconds);
-            if config.ai_timeout_seconds == 0 {
-                return Err("AI 总时限已到".into());
-            }
-            let payload = json!({"_model_only":true,"_model_images":images});
-            // DSH's submission tool is a structured response channel, not an
-            // executor. No query or registered command is exposed over MCP.
-            let submission = json!({"tools":[{"name":"submit_analysis","description":"Submit the single model response object.","inputSchema":schema}]});
-            let stopped = AtomicBool::new(false);
-            let local_cancel = AtomicBool::new(cancel.load(Ordering::SeqCst));
-            let deadline = Instant::now() + timeout;
-            let backend = super::backend(self.connection)?;
-            let raw = std::thread::scope(|scope| {
+        }
+        let mut config = self.request.config.clone();
+        config.ai_timeout_seconds = timeout
+            .as_secs()
+            .saturating_add(u64::from(timeout.subsec_nanos() != 0))
+            .min(config.ai_timeout_seconds);
+        if config.ai_timeout_seconds == 0 {
+            return Err("AI 总时限已到".into());
+        }
+        let payload = json!({"_model_images":images});
+        let stopped = AtomicBool::new(false);
+        let local_cancel = AtomicBool::new(cancel.load(Ordering::SeqCst));
+        let raw = std::thread::scope(|scope| {
+            if self.connection.driver != "dsh" {
                 scope.spawn(|| {
                     while !stopped.load(Ordering::SeqCst) {
                         if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
@@ -175,82 +194,131 @@ impl Transport for ModelTransport<'_, '_> {
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 });
-                let result = backend.analyze(
-                    self.connection,
-                    AnalysisRequest {
-                        show_session: self.request.show_session,
-                        config: &config,
-                        kind: self.request.kind,
-                        payload: &payload,
-                        root: self.request.root,
-                        trace: &trace,
-                        prompt: &prompt,
-                        schema: &schema,
-                        tools: (self.connection.driver == "dsh").then_some(&submission),
-                        registered_tools: None,
-                        cancel: &local_cancel,
-                    },
-                    &mut |event| match event {
-                        AnalysisEvent::Usage(value) => {
-                            let combined =
-                                usage_sum(self.completed_usage.lock().unwrap().as_ref(), &value);
-                            *self.observed_usage.lock().unwrap() = Some(combined.clone());
-                            let _ = self.events.send(AnalysisEvent::Usage(combined));
-                        }
-                        AnalysisEvent::OutputTokens(value) => {
-                            let previous = *self.completed_output.lock().unwrap();
-                            let _ = self.events.send(AnalysisEvent::OutputTokens(
-                                previous.zip(value).map(|(a, b)| a.saturating_add(b)),
-                            ));
-                        }
-                        event => {
-                            let _ = self.events.send(event);
-                        }
-                    },
-                );
-                stopped.store(true, Ordering::SeqCst);
-                result
-            })?;
-            let (value, usage) = raw;
-            let combined = usage_sum(self.completed_usage.lock().unwrap().as_ref(), &usage);
-            *self.completed_usage.lock().unwrap() = Some(combined.clone());
-            *self.observed_usage.lock().unwrap() = Some(combined.clone());
-            let _ = self.events.send(AnalysisEvent::Usage(combined));
-            if !value.as_object().is_some_and(|v| {
-                v.len() == 2 && v.contains_key("tool_call") && v.contains_key("result")
-            }) {
-                return Err("模型未返回有效的结构化调用或最终结果".into());
             }
-            let call = &value["tool_call"];
-            let result = &value["result"];
-            if !call.is_null() && !call.is_object() {
-                return Err("工具请求必须是对象".into());
-            }
-            if call.is_null() == result.is_null() {
-                return Err("模型必须返回一次工具请求或最终结果，不能同时返回或全部留空".into());
-            }
-            let message = if call.is_object() {
-                json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("text:{}:{round}",self.id),"type":"function","function":{"name":call["name"],"arguments":call["arguments"]}}]})
-            } else {
-                json!({"role":"assistant","content":result.to_string()})
+            let model_request = AnalysisRequest {
+                show_session: self.request.show_session,
+                config: &config,
+                kind: self.request.kind,
+                payload: &payload,
+                root: self.request.root,
+                trace: &trace,
+                prompt: &prompt,
+                schema: &schema,
+                tools: None,
+                registered_tools: None,
+                cancel: if self.connection.driver == "dsh" {
+                    cancel
+                } else {
+                    &local_cancel
+                },
             };
-            let input = usage["input_tokens"].as_u64();
-            let output = usage["output_tokens"].as_u64();
-            {
-                let mut completed = self.completed_output.lock().unwrap();
-                *completed = completed.zip(output).map(|(a, b)| a.saturating_add(b));
+            let mut forward = |event| match event {
+                AnalysisEvent::Usage(value) => {
+                    let combined = usage_sum(self.completed_usage.as_ref(), &value);
+                    self.observed_usage = Some(combined.clone());
+                    (self.events.borrow_mut())(AnalysisEvent::Usage(combined));
+                }
+                AnalysisEvent::OutputTokens(value) => {
+                    (self.events.borrow_mut())(AnalysisEvent::OutputTokens(
+                        output_base.zip(value).map(|(a, b)| a.saturating_add(b)),
+                    ));
+                }
+                event => {
+                    (self.events.borrow_mut())(event);
+                }
+            };
+            let result = (|| {
+                if self.connection.driver == "dsh" {
+                    let process = &mut self.dsh;
+                    if process.is_none() {
+                        *process = Some(super::dsh::AnalysisProcess::prepare(
+                            self.connection,
+                            &model_request,
+                            deadline,
+                        )?);
+                    }
+                    let result =
+                        process
+                            .as_ref()
+                            .unwrap()
+                            .analyze(model_request, deadline, &mut forward);
+                    if result.is_err() || !process.as_ref().unwrap().is_connected() {
+                        // A failed or cancelled process never survives into
+                        // another round; tools are not replayed.
+                        process.take();
+                    }
+                    result
+                } else {
+                    super::codex::analyze_round(model_request, self.connection, &mut forward)
+                }
+            })();
+            stopped.store(true, Ordering::SeqCst);
+            if cancel.load(Ordering::SeqCst) {
+                Err(crate::ai_control::CANCELLED.into())
+            } else if Instant::now() >= deadline {
+                Err("AI 总时限已到".into())
+            } else {
+                result
             }
-            let response = json!({"choices":[{"index":0,"finish_reason":if call.is_object(){"tool_calls"}else{"stop"},"message":message}],
-                "usage":{"prompt_tokens":input,"completion_tokens":output,"total_tokens":usage["total_tokens"].as_u64().or_else(||input.zip(output).map(|(a,b)|a.saturating_add(b))),"prompt_tokens_details":{"cached_tokens":usage["cached_input_tokens"]}}});
-            Ok(TransportResponse::new(
-                200,
-                serde_json::to_vec(&response).map_err(|e| e.to_string())?,
-            ))
-        })();
-        result.map_err(|error| {
-            *self.error.lock().unwrap() = Some(error);
-            failed()
+        })?;
+        let (value, usage) = raw;
+        let combined = usage_sum(self.completed_usage.as_ref(), &usage);
+        self.completed_usage = Some(combined.clone());
+        self.observed_usage = Some(combined.clone());
+        (self.events.borrow_mut())(AnalysisEvent::Usage(combined));
+        if !value.as_object().is_some_and(|v| {
+            v.len() == 2 && v.contains_key("tool_call") && v.contains_key("result")
+        }) {
+            return Err("模型未返回有效的结构化调用或最终结果".into());
+        }
+        let call = &value["tool_call"];
+        let result = &value["result"];
+        if !call.is_null() && !call.is_object() {
+            return Err("工具请求必须是对象".into());
+        }
+        let model_output_error = (call.is_null() == result.is_null()).then_some(
+                "模型必须返回一次工具请求或最终结果，不能同时返回或全部留空；本次封装未执行工具，也未采用结果",
+            );
+        let is_tool = model_output_error.is_none() && call.is_object();
+        let message = if model_output_error.is_some() {
+            // Preserve the rejected reply for one bounded correction in
+            // the shared loop. It must never become an executable call.
+            json!({"role":"assistant","content":value.to_string()})
+        } else if is_tool {
+            json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("text:{}:{round}",self.id),"type":"function","function":{"name":call["name"],"arguments":call["arguments"]}}]})
+        } else {
+            json!({"role":"assistant","content":result.to_string()})
+        };
+        let input = usage["input_tokens"].as_u64();
+        let output = usage["output_tokens"].as_u64();
+        let usage = json!({"prompt_tokens":input,"completion_tokens":output,"total_tokens":usage["total_tokens"].as_u64().or_else(||input.zip(output).map(|(a,b)|a.saturating_add(b))),"prompt_tokens_details":{"cached_tokens":usage["cached_input_tokens"]}});
+        let reply = ModelReply::from_message(
+            message,
+            Some(if is_tool { "tool_calls" } else { "stop" }.into()),
+            Some(usage),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(match model_output_error {
+            Some(error) => reply.with_output_error(error),
+            None => reply,
         })
+    }
+}
+impl ModelRound for NativeModel<'_, '_, '_> {
+    fn complete(
+        &mut self,
+        body: &Value,
+        _serialized: &str,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        output_base: Option<u64>,
+        _event: &mut dyn FnMut(ApiEvent),
+    ) -> Result<ModelReply, ApiError> {
+        self.round(body, deadline, cancel, output_base)
+            .map_err(|error| {
+                self.error = Some(error);
+                ApiError::simple(ApiErrorKind::MalformedResponse)
+            })
     }
 }
 
@@ -259,71 +327,45 @@ pub(crate) fn analyze(
     request: AnalysisRequest<'_>,
     event: &mut dyn FnMut(AnalysisEvent),
 ) -> Result<(Value, Value), String> {
-    let (tx, rx) = mpsc::sync_channel(64);
-    let transport = ModelTransport {
+    let events = RefCell::new(event);
+    let mut model = NativeModel {
         connection,
         request: &request,
-        events: tx.clone(),
-        counter: Mutex::new(0),
-        completed_output: Mutex::new(Some(0)),
-        completed_usage: Mutex::new(None),
-        observed_usage: Mutex::new(None),
-        error: Mutex::new(None),
+        events: &events,
+        counter: 0,
+        completed_usage: None,
+        observed_usage: None,
+        error: None,
+        dsh: None,
         id: crate::model::id(),
     };
-    let client = ChatCompletionsClient::with_transport(
-        Endpoint::parse("https://ss-model.invalid/v1").unwrap(),
-        &transport,
+    let result = super::api::analyze_with(
+        &request,
+        &mut |e| (events.borrow_mut())(e),
+        "",
+        false,
+        |request, event| analyze_with_model(request, &mut model, event),
     );
-    let result = std::thread::scope(|scope| {
-        let worker = scope.spawn(|| {
-            super::api::analyze_client(
-                &request,
-                &mut |e| {
-                    let _ = tx.send(e);
-                },
-                &client,
-                "local-model-adapter",
-                false,
-                false,
+    result.map_err(|error| {
+        if let Some(mut usage) = model.observed_usage.take() {
+            usage["partial"] = json!(true);
+            (events.borrow_mut())(AnalysisEvent::Usage(usage));
+        }
+        model.error.take().unwrap_or_else(|| {
+            error.replacen(
+                "API 分析失败",
+                &format!(
+                    "{} 分析失败",
+                    if connection.driver == "codex" {
+                        "Codex"
+                    } else {
+                        "DSH"
+                    }
+                ),
+                1,
             )
-        });
-        while !worker.is_finished() {
-            if let Ok(value) = rx.recv_timeout(Duration::from_millis(20)) {
-                event(value);
-            }
-        }
-        let result = worker
-            .join()
-            .map_err(|_| "模型接入工作线程已停止".to_string())?;
-        for value in rx.try_iter() {
-            event(value);
-        }
-        result
-    });
-    match result {
-        Err(error) => {
-            if let Some(mut usage) = transport.observed_usage.lock().unwrap().clone() {
-                usage["partial"] = json!(true);
-                event(AnalysisEvent::Usage(usage));
-            }
-            Err(transport.error.lock().unwrap().take().unwrap_or_else(|| {
-                error.replacen(
-                    "API 分析失败",
-                    &format!(
-                        "{} 分析失败",
-                        if connection.driver == "codex" {
-                            "Codex"
-                        } else {
-                            "DSH"
-                        }
-                    ),
-                    1,
-                )
-            }))
-        }
-        value => value,
-    }
+        })
+    })
 }
 
 #[cfg(test)]

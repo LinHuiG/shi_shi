@@ -4,13 +4,10 @@ use crate::{
     engine::App,
     plugins::{Library, Plugin},
 };
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -33,14 +30,6 @@ enum Phase {
     Closed,
 }
 pub type Sessions = BTreeMap<String, Arc<Session>>;
-#[derive(Serialize, Deserialize)]
-struct Ticket {
-    manifest: PathBuf,
-    config: Value,
-    method: String,
-    params: Value,
-}
-
 pub fn begin(app: &App, plugin: &Plugin, config: &Value) -> Result<Value, String> {
     let settings = plugin
         .manifest
@@ -163,84 +152,21 @@ pub fn dispatch(app: &App, value: &Value) -> Result<Value, String> {
     {
         return Err("插件未声明此配置方法".into());
     }
-    let directory = crate::storage::data_dir(&app.root)
-        .join("tmp/plugin-settings")
-        .join(uuid::Uuid::new_v4().to_string());
-    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    // Request parameters may contain a manually entered secret. Keep neither
-    // request nor response after the bounded helper has exited or been killed.
-    struct Temporary(PathBuf);
-    impl Drop for Temporary {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    let result = crate::plugin_worker::call(
+        &current,
+        true,
+        json!({"protocol":1,"method":method,"config":session.config,"params":value["params"]}),
+        Some(&session.cancelled),
+    );
+    if let Err(error) = &result {
+        app.log(
+            "plugin_failed",
+            json!({"plugin":current.manifest.id,"method":method,"error":error}),
+        );
     }
-    let _temporary = Temporary(directory.clone());
-    let ticket = directory.join("request.json");
-    let bytes = serde_json::to_vec(&Ticket {
-        manifest: current.dir.join("plugin.json"),
-        config: session.config.clone(),
-        method: method.into(),
-        params: value["params"].clone(),
-    })
-    .map_err(|e| e.to_string())?;
-    if bytes.len() > 2 * 1024 * 1024 {
-        return Err("插件配置请求过大".into());
-    }
-    fs::write(&ticket, bytes).map_err(|e| e.to_string())?;
-    let mut command = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
-    command.arg("--plugin-settings-call").arg(&ticket);
-    let mut child = crate::process::spawn_owned(&mut command)?;
-    let started = Instant::now();
-    loop {
-        if session.cancelled.load(Ordering::Acquire) {
-            return Err("插件配置已取消".into());
-        }
-        if started.elapsed() > Duration::from_secs(95) {
-            return Err("插件配置操作超时".into());
-        }
-        crate::process::check_running()?;
-        if let Some(status) = child.child.try_wait().map_err(|e| e.to_string())? {
-            let path = directory.join("result.json");
-            if fs::metadata(&path)
-                .map_err(|_| "插件配置调用未正常完成")?
-                .len()
-                > 32 * 1024 * 1024
-            {
-                return Err("插件配置响应过大".into());
-            }
-            let response: Value =
-                serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-            if !status.success() || response["ok"] != true {
-                return Err(response["error"]
-                    .as_str()
-                    .unwrap_or("插件配置调用失败")
-                    .into());
-            }
-            return Ok(response["result"].clone());
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    result
 }
 
-pub fn run(path: &Path) -> Result<(), String> {
-    let ticket: Ticket = serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    let plugin = Plugin::read(&ticket.manifest)?;
-    let result = call(
-        &plugin,
-        &ticket.config,
-        &ticket.method,
-        &ticket.params,
-        Arc::new(AtomicBool::new(false)),
-    );
-    let response = match result {
-        Ok(value) => json!({"ok":true,"result":value}),
-        Err(error) => json!({"ok":false,"error":error}),
-    };
-    fs::write(path.with_file_name("result.json"), response.to_string()).map_err(|e| e.to_string())
-}
 struct Cancellation {
     closed: Arc<AtomicBool>,
     deadline: Instant,
@@ -250,12 +176,12 @@ unsafe extern "C" fn cancelled(context: usize) -> u32 {
     u32::from(state.closed.load(Ordering::Acquire) || Instant::now() >= state.deadline)
 }
 
-fn call(
+pub(crate) fn call_loaded(
     plugin: &Plugin,
+    library: &Library,
     config: &Value,
     method: &str,
     params: &Value,
-    closed: Arc<AtomicBool>,
 ) -> Result<Value, String> {
     let settings = plugin
         .manifest
@@ -269,9 +195,8 @@ fn call(
     if input.len() > 2 * 1024 * 1024 {
         return Err("插件配置请求过大".into());
     }
-    let library = Library::open(&plugin.dir.join(&plugin.manifest.entrypoint))?;
     let cancel = Cancellation {
-        closed,
+        closed: Arc::new(AtomicBool::new(false)),
         deadline: Instant::now() + Duration::from_secs(90),
     };
     unsafe {

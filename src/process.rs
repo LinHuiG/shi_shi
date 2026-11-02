@@ -1,6 +1,6 @@
 #[path = "process_output.rs"]
 mod output;
-use std::os::windows::process::CommandExt;
+use shishi_acp::process::{spawn_in_job, JobGuard};
 use std::{
     fs,
     path::Path,
@@ -8,14 +8,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use std::os::windows::io::AsRawHandle;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Mutex,
+    Arc, Mutex,
 };
-use windows_sys::Win32::{Foundation::CloseHandle, System::JobObjects::*};
 static STOPPING: AtomicBool = AtomicBool::new(false);
-static JOBS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+static JOBS: Mutex<Vec<Arc<JobGuard>>> = Mutex::new(Vec::new());
 pub fn stopping() -> bool {
     STOPPING.load(Ordering::SeqCst)
 }
@@ -29,82 +27,47 @@ pub fn check_running() -> Result<(), String> {
 pub fn shutdown() {
     let jobs = JOBS.lock().unwrap();
     STOPPING.store(true, Ordering::SeqCst);
-    for &job in jobs.iter() {
-        unsafe {
-            TerminateJobObject(job as _, 1);
-        }
+    for job in jobs.iter() {
+        job.terminate();
     }
 }
 pub struct OwnedChild {
     pub child: std::process::Child,
-    job: usize,
+    job: Arc<JobGuard>,
 }
 impl OwnedChild {
     pub fn terminate(&self) {
-        unsafe {
-            TerminateJobObject(self.job as _, 1);
-        }
+        self.job.terminate();
     }
 }
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        let mut jobs = JOBS.lock().unwrap();
-        jobs.retain(|j| *j != self.job);
-        unsafe {
-            CloseHandle(self.job as _);
-        }
-        drop(jobs);
+        self.terminate();
+        JOBS.lock().unwrap().retain(|j| !Arc::ptr_eq(j, &self.job));
         let _ = self.child.wait();
     }
 }
 pub fn spawn_owned(cmd: &mut Command) -> Result<OwnedChild, String> {
     let mut jobs = JOBS.lock().unwrap();
     check_running()?;
-    unsafe {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        if job.is_null() {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if SetInformationJobObject(
-            job,
-            JobObjectExtendedLimitInformation,
-            &info as *const _ as _,
-            std::mem::size_of_val(&info) as u32,
-        ) == 0
-        {
-            CloseHandle(job);
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        // Assign the job before any child code can launch grandchildren.
-        cmd.creation_flags(0x08000000 | 0x00000004);
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                CloseHandle(job);
-                return Err(e.to_string());
-            }
-        };
-        if AssignProcessToJobObject(job, child.as_raw_handle()) == 0 {
-            let e = std::io::Error::last_os_error();
-            let _ = child.kill();
-            let _ = child.wait();
-            CloseHandle(job);
-            return Err(format!("无法管理子进程生命周期：{e}"));
-        }
-        if let Err(e) = resume_child(child.id()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            CloseHandle(job);
-            return Err(e);
-        }
-        jobs.push(job as usize);
-        Ok(OwnedChild {
-            child,
-            job: job as usize,
-        })
-    }
+    let (child, job) = spawn_in_job(cmd)?;
+    let job = Arc::new(job);
+    jobs.push(job.clone());
+    Ok(OwnedChild { child, job })
+}
+
+pub fn powershell(system_root: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut command = Command::new(
+        Path::new(system_root.as_ref()).join("System32/WindowsPowerShell/v1.0/powershell.exe"),
+    );
+    command.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+    ]);
+    command
 }
 
 pub fn run(
@@ -113,16 +76,7 @@ pub fn run(
     timeout: u64,
     dir: &Path,
 ) -> Result<(String, String), String> {
-    run_with_progress(cmd, input, timeout, dir, &mut |_| {})
-}
-pub fn run_with_progress(
-    cmd: Command,
-    input: Option<&str>,
-    timeout: u64,
-    dir: &Path,
-    progress: &mut dyn FnMut(&str),
-) -> Result<(String, String), String> {
-    run_cancellable(cmd, input, timeout, dir, None, progress)
+    run_cancellable(cmd, input, timeout, dir, None, &mut |_| {})
 }
 pub fn run_cancellable(
     cmd: Command,
@@ -133,17 +87,7 @@ pub fn run_cancellable(
     progress: &mut dyn FnMut(&str),
 ) -> Result<(String, String), String> {
     let cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
-    run_guarded(cmd, input, timeout, dir, &cancelled, progress)
-}
-pub fn run_guarded(
-    cmd: Command,
-    input: Option<&str>,
-    timeout: u64,
-    dir: &Path,
-    cancelled: &dyn Fn() -> bool,
-    progress: &mut dyn FnMut(&str),
-) -> Result<(String, String), String> {
-    run_guarded_polling(cmd, input, timeout, dir, cancelled, &mut |line| {
+    run_guarded_polling(cmd, input, timeout, dir, &cancelled, &mut |line| {
         if !line.is_empty() {
             progress(line);
         }
@@ -198,9 +142,7 @@ pub fn run_guarded_polling(
         }
         let interrupted = cancelled();
         if interrupted || start.elapsed() > Duration::from_secs(timeout) {
-            unsafe {
-                TerminateJobObject(owned.job as _, 1);
-            }
+            owned.job.terminate();
             let _ = child.kill();
             let _ = child.wait();
             if interrupted {
@@ -249,43 +191,10 @@ pub fn run_guarded_polling(
     Ok((stdout, stderr))
 }
 
-fn resume_child(pid: u32) -> Result<(), String> {
-    use windows_sys::Win32::{
-        Foundation::INVALID_HANDLE_VALUE,
-        System::{Diagnostics::ToolHelp::*, Threading::*},
-    };
-    unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        if snapshot == INVALID_HANDLE_VALUE {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-        let mut entry: THREADENTRY32 = std::mem::zeroed();
-        entry.dwSize = std::mem::size_of_val(&entry) as u32;
-        let mut more = Thread32First(snapshot, &mut entry);
-        let mut resumed = false;
-        while more != 0 {
-            if entry.th32OwnerProcessID == pid {
-                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
-                if !thread.is_null() {
-                    resumed = ResumeThread(thread) != u32::MAX;
-                    CloseHandle(thread);
-                }
-                break;
-            }
-            more = Thread32Next(snapshot, &mut entry);
-        }
-        CloseHandle(snapshot);
-        if resumed {
-            Ok(())
-        } else {
-            Err("无法恢复已受管的子进程".into())
-        }
-    }
-}
-
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+    use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };

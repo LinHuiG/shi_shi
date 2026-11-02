@@ -2,6 +2,16 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
   try {
+    if (b.dataset.taskStatusValue) {
+      const group = b.closest('[role="radiogroup"]');
+      $('#f-status').value = b.dataset.taskStatusValue;
+      group.querySelectorAll('[role="radio"]').forEach(button => {
+        const selected = button === b;
+        button.setAttribute('aria-checked', String(selected));
+        button.tabIndex = selected ? 0 : -1;
+      });
+      return;
+    }
     if (b.dataset.imageId) {
       b.disabled = true;
       try {
@@ -38,8 +48,8 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.view && !(await leaveSettings())) return;
     if (b.dataset.view) {
       page = 'tasks';
-      tab = '待处理';
-      quickView = b.dataset.view === 'pending' ? '' : b.dataset.view;
+      tab = taskFocusViews[b.dataset.view] || '全部';
+      quickView = taskFocusViews[b.dataset.view] ? '' : b.dataset.view;
       render();
       return;
     }
@@ -70,7 +80,7 @@ document.addEventListener('click', async (e) => {
       const m =
         inboxRows().find((m) => m.id === b.dataset.build) ||
         state.messages.find((m) => m.id === b.dataset.build);
-      newModal(readableMessage(m?.text || '').text, [b.dataset.build]);
+      newModal(String(m?.text || ''), [b.dataset.build]);
       return;
     }
     if (b.dataset.rule) {
@@ -109,28 +119,14 @@ document.addEventListener('click', async (e) => {
           $('#modal-error').textContent = '请描述这条事项需要怎么修改';
           break;
         }
-        const task = readTaskForm(),
-          controls = [...$('#dialog').querySelectorAll('input,select,textarea,button')];
-        controls.forEach((el) => (el.disabled = true));
-        b.dataset.pending = 'true';
-        const label = b.textContent;
-        b.textContent = '正在分析并更新…';
-        $('#modal-error').textContent = '';
-        try {
-          const saved = await rpc('edit_ai', { task, text });
-          delete b.dataset.pending;
+        const task = readTaskForm();
+        await modalRequest(b, 'edit_ai', { task, text }, async saved => {
           closeModal();
           page = 'tasks';
           selected = saved.id;
           await refreshState(true);
           toast('已根据你的说明更新当前事项');
-        } catch (err) {
-          $('#modal-error').textContent = err.message;
-        } finally {
-          delete b.dataset.pending;
-          controls.forEach((el) => (el.disabled = false));
-          b.textContent = label;
-        }
+        }, { label: '正在分析并更新…', lockForm: true });
         break;
       }
 
@@ -144,14 +140,7 @@ document.addEventListener('click', async (e) => {
           break;
         }
         const draft = readScheduleForm();
-        const controls = [...$('#dialog').querySelectorAll('input,select,textarea,button')];
-        controls.forEach((el) => (el.disabled = true));
-        b.dataset.pending = 'true';
-        const label = b.textContent;
-        b.textContent = '正在填写…';
-        $('#modal-error').textContent = '';
-        try {
-          const parsed = await rpc('schedule_format', { text });
+        await modalRequest(b, 'schedule_format', { text }, parsed => {
           scheduleForm(
             {
               ...draft,
@@ -163,65 +152,25 @@ document.addEventListener('click', async (e) => {
             },
             text,
           );
-        } catch (err) {
-          $('#modal-error').textContent = err.message;
-        } finally {
-          delete b.dataset.pending;
-          controls.forEach((el) => (el.disabled = false));
-          b.textContent = label;
-        }
+        }, { label: '正在填写…', lockForm: true });
         break;
       }
-      case 'save-schedule': {
-        const schedule = readScheduleForm();
-        b.disabled = true;
-        b.dataset.pending = 'true';
-        try {
-          await rpc('schedule_edit', { schedule });
-          delete b.dataset.pending;
-          closeModal();
-          page = 'schedules';
-          await refreshState(true);
-          toast('定时事项已保存');
-        } catch (err) {
-          $('#modal-error').textContent = err.message;
-        } finally {
-          delete b.dataset.pending;
-          b.disabled = false;
-        }
-        break;
-      }
+      case 'save-schedule':
       case 'delete-schedule': {
-        b.disabled = true;
-        b.dataset.pending = 'true';
-        try {
-          await rpc('schedule_delete', { id: modalSchedule.id, updated: modalSchedule.updated });
-          delete b.dataset.pending;
+        const saving = action === 'save-schedule';
+        const params = saving ? { schedule: readScheduleForm() } : { id: modalSchedule.id, updated: modalSchedule.updated };
+        await modalRequest(b, saving ? 'schedule_edit' : 'schedule_delete', params, async () => {
           closeModal();
+          if (saving) page = 'schedules';
           await refreshState(true);
-          toast('已删除定时规则，已生成事项保留');
-        } catch (err) {
-          $('#modal-error').textContent = err.message;
-        } finally {
-          delete b.dataset.pending;
-          b.disabled = false;
-        }
+          toast(saving ? '定时事项已保存' : '已删除定时规则，已生成事项保留');
+        });
         break;
       }
-      case 'tomorrow':
-      case 'resume-today': {
+      case 'defer': {
         b.disabled = true;
-        try {
-          await perform(
-            'action',
-            { id: t.id, action: action === 'tomorrow' ? 'tomorrow' : 'resume_today' },
-            action === 'tomorrow'
-              ? '已移至明日，明天自动回到待处理；可在“全部”中提前恢复'
-              : '已恢复今日处理',
-          );
-        } finally {
-          b.disabled = false;
-        }
+        try { await perform('action', {id:t.id, updated:t.updated, action:'defer', choice:b.dataset.deferChoice || 'tomorrow'}, '已延后处理'); }
+        finally { b.disabled = false; }
         break;
       }
 
@@ -233,21 +182,16 @@ document.addEventListener('click', async (e) => {
         break;
       }
       case 'save-archive': {
-        b.disabled = true;
-        try {
-          await rpc('archive_task', {
-            id: modalTask.id,
-            updated: modalTask.updated,
-            status: $('#archive-status').value,
-            note: $('#archive-note').value,
-          });
+        await modalRequest(b, 'archive_task', {
+          id: modalTask.id,
+          updated: modalTask.updated,
+          status: $('#archive-status').value,
+          note: $('#archive-note').value,
+        }, async () => {
           closeModal();
           await refreshState(true);
           toast('归档已保存，等待晚间或手动归档分析');
-        } catch (err) {
-          $('#modal-error').textContent = err.message;
-          b.disabled = false;
-        }
+        });
         break;
       }
       case 'toggle-scan': {
@@ -302,9 +246,7 @@ document.addEventListener('click', async (e) => {
           $('#modal-error').textContent = '请输入事项描述';
           break;
         }
-        b.disabled = true;
-        try {
-          const draft = await rpc('generate', { text, sources: manualSources });
+        await modalRequest(b, 'generate', { text, sources: manualSources }, async draft => {
           closeModal();
           page = 'tasks';
           tab = '待处理';
@@ -312,10 +254,7 @@ document.addEventListener('click', async (e) => {
           selected = draft.id;
           await refreshState(true);
           toast('已添加，正在后台整理');
-        } catch (err) {
-          $('#modal-error').textContent = err.message;
-          b.disabled = false;
-        }
+        });
         break;
       }
       case 'retry-generation':
@@ -323,25 +262,21 @@ document.addEventListener('click', async (e) => {
         break;
       case 'save-task': {
         const edit = readTaskForm();
-        b.disabled = true;
-        try {
-          const saved = await rpc('edit', { task: edit });
+        await modalRequest(b, 'edit', { task: edit }, async saved => {
           closeModal();
           page = 'tasks';
           selected = saved.id;
           await refreshState(true);
           toast('事项已保存');
-        } catch (err) {
-          $('#modal-error').textContent = err.message;
-          b.disabled = false;
-        }
+        });
         break;
       }
+      case 'start':
       case 'done':
       case 'reopen':
       case 'dismiss':
       case 'unlock':
-        await perform('action', { id: t.id, action }, '已更新事项');
+        await perform('action', { id: t.id, updated:t.updated, action }, '已更新事项');
         break;
       case 'merge':
         mergeForm(t);
@@ -402,6 +337,9 @@ document.addEventListener('click', async (e) => {
       case 'report':
       case 'archive':
       case 'learn': {
+        const scanning = action === 'scan' || action === 'refresh-messages';
+        if (scanning && (scanPending || state.busy || (action === 'scan' && state.ai_busy))) break;
+        if (scanning) scanPending = true;
         b.disabled = true;
         const original = b.innerHTML;
         b.setAttribute('aria-busy', 'true');
@@ -420,9 +358,14 @@ document.addEventListener('click', async (e) => {
                   : '处理完成'),
           );
         } finally {
-          b.disabled = false;
           b.innerHTML = original;
           b.removeAttribute('aria-busy');
+          if (scanning) {
+            scanPending = false;
+            status();
+          } else {
+            b.disabled = false;
+          }
         }
         break;
       }

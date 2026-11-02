@@ -3,44 +3,31 @@ use crate::model::Config;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    borrow::Cow,
     path::Path,
     sync::{atomic::AtomicBool, Arc},
 };
 
-pub mod agent_approval;
 pub mod api;
 pub mod codex;
 pub mod dsh;
 pub mod model_api;
 
-/// No credentials belong in this serializable descriptor. Future API adapters
-/// must use a separate credential store and retain only credential references.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
-pub struct Connection {
-    pub id: String,
-    pub name: String,
-    pub driver: String,
-    pub executable: String,
-    pub base_url: String,
-    pub key_env: Option<String>,
-    pub credential_id: Option<String>,
-    pub models: Vec<Value>,
-    pub stream: bool,
-}
-impl Default for Connection {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: "Codex".into(),
-            driver: "codex".into(),
-            executable: String::new(),
-            base_url: String::new(),
-            key_env: None,
-            credential_id: None,
-            models: vec![],
-            stream: true,
-        }
+shishi_api::default_struct! {
+    /// No credentials belong in this serializable descriptor. Future API adapters
+    /// must use a separate credential store and retain only credential references.
+    #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(default)]
+    pub struct Connection {
+        pub id: String,
+        pub name: String = "Codex".into(),
+        pub driver: String = "codex".into(),
+        pub executable: String,
+        pub base_url: String,
+        pub key_env: Option<String>,
+        pub credential_id: Option<String>,
+        pub models: Vec<Value>,
+        pub stream: bool = true,
     }
 }
 impl Connection {
@@ -58,18 +45,21 @@ impl Connection {
     }
 }
 
-pub fn connection(config: &Config) -> Result<Connection, String> {
-    if config.selected_connection == crate::model::UNCONFIGURED_CONNECTION {
+pub fn connection(config: &Config) -> Result<Cow<'_, Connection>, String> {
+    connection_by_id(config, &config.selected_connection)
+}
+pub fn connection_by_id<'a>(config: &'a Config, id: &str) -> Result<Cow<'a, Connection>, String> {
+    if id == crate::model::UNCONFIGURED_CONNECTION {
         return Err("AI_UNCONFIGURED:未配置此用途的 AI 接入或模型".into());
     }
-    if config.selected_connection.is_empty() {
-        return Ok(default_codex_connection(config));
+    if id.is_empty() {
+        return Ok(Cow::Owned(default_codex_connection(config)));
     }
     config
         .ai_connections
         .iter()
-        .find(|c| c.id == config.selected_connection)
-        .cloned()
+        .find(|c| c.id == id)
+        .map(Cow::Borrowed)
         .ok_or_else(|| "所选 AI 连接不存在，请重新选择接入".into())
 }
 
@@ -99,9 +89,7 @@ pub fn source_info(config: &Config) -> Value {
 }
 pub fn connection_source(c: &Connection, model_id: &str) -> Value {
     let item = c.models.iter().find(|m| m["model"] == model_id);
-    let route = serde_json::from_str::<Vec<String>>(model_id)
-        .ok()
-        .filter(|r| r.len() == 2);
+    let route = serde_json::from_str::<[String; 2]>(model_id).ok();
     let provider = item
         .and_then(|m| m["providerName"].as_str().filter(|s| !s.trim().is_empty()))
         .or_else(|| item.and_then(|m| m["provider"].as_str().filter(|s| !s.trim().is_empty())))
@@ -152,14 +140,15 @@ pub fn validate_connections(config: &Config) -> Result<(), String> {
         }
     }
     for kind in crate::model::PURPOSES {
-        if config.for_kind(kind).selected_connection == crate::model::UNCONFIGURED_CONNECTION {
+        let choice = config.model_choice(kind);
+        if choice.connection_id == crate::model::UNCONFIGURED_CONNECTION {
             continue;
         }
         if kind == "handling" && !handling_available(config) {
             continue;
         }
-        let c = connection(&config.for_kind(kind))?;
-        backend(&c)?.validate(&c, &config.for_kind(kind))?;
+        let c = connection_by_id(config, choice.connection_id)?;
+        backend(&c)?.validate(&c, choice.model, choice.reasoning_effort)?;
         if kind == "handling" && c.driver == "api" {
             return Err("官方 API 仅用于分析，不能用于一键处置".into());
         }
@@ -188,6 +177,7 @@ pub const NOT_SUBMITTED: &str = "处置未提交：";
 #[derive(Debug, PartialEq)]
 pub enum AnalysisEvent {
     SessionStarted(String),
+    OutputValidationFailed,
     Usage(Value),
     /// Live cumulative output only; never used for persisted billing totals.
     OutputTokens(Option<u64>),
@@ -215,9 +205,11 @@ pub trait Backend: Sync {
         connection: &Connection,
         request: AnalysisRequest<'_>,
         event: &mut dyn FnMut(AnalysisEvent),
-    ) -> Result<(Value, Value), String>;
+    ) -> Result<(Value, Value), String> {
+        model_api::analyze(connection, request, event)
+    }
     fn models(&self, connection: &Connection, root: &Path) -> Result<Value, String>;
-    fn validate(&self, connection: &Connection, config: &Config) -> Result<(), String>;
+    fn validate(&self, connection: &Connection, model: &str, effort: &str) -> Result<(), String>;
     fn status(&self, connection: &Connection, root: &Path) -> Result<Value, String>;
     fn agent(&self, connection: &Connection) -> Result<Arc<dyn AgentSession>, String>;
     fn open_session(&self, thread: &str) -> Result<(), String>;
@@ -235,21 +227,14 @@ pub fn backend(connection: &Connection) -> Result<&'static dyn Backend, String> 
     }
 }
 
-/// Session operations, independent of RPC method names. Value results follow
+/// Retained ACP sessions; Codex handling belongs to the desktop. Results follow
 /// ShiShi's existing history/approval DTOs for persistence and UI compatibility;
 /// new adapters must translate their native events and history to those DTOs.
 /// Methods that submit work must never automatically retry ambiguous failures.
 pub trait AgentSession: Send + Sync {
     fn close(&self) -> Result<(), String>;
     fn is_alive(&self) -> bool;
-    fn start(
-        &self,
-        cwd: &str,
-        project: &str,
-        context: &ContextTool,
-        config: &Config,
-    ) -> Result<Value, String>;
-    fn rename(&self, thread: &str, name: &str) -> Result<(), String>;
+    fn start(&self, context: &ContextTool, config: &Config) -> Result<Value, String>;
     fn submit(
         &self,
         thread: &str,
@@ -257,21 +242,13 @@ pub trait AgentSession: Send + Sync {
         config: &Config,
         message_id: &str,
     ) -> Result<Value, String>;
-    fn steer(&self, thread: &str, turn: &str, text: &str, message_id: &str) -> Result<(), String>;
     fn read(&self, thread: &str) -> Result<Value, String>;
     fn history(&self, thread: &str) -> Result<Value, String>;
     fn resume(&self, thread: &str, context: &ContextTool) -> Result<Value, String>;
-    fn unsubscribe(&self, thread: &str) -> Result<(), String>;
-    fn interrupt(&self, thread: &str, turn: &str) -> Result<(), String>;
-    fn events(&self) -> Vec<UsageEvent>;
+    fn interrupt(&self, thread: &str) -> Result<(), String>;
+    fn events(&self) -> Vec<AgentEvent>;
     fn requests(&self, thread: &str) -> Vec<Value>;
-    fn respond(
-        &self,
-        thread: &str,
-        key: &str,
-        request: &Value,
-        answer: &Value,
-    ) -> Result<(), String>;
+    fn respond(&self, thread: &str, key: &str, answer: &Value) -> Result<(), String>;
 }
 
 pub struct ContextTool {
@@ -280,11 +257,23 @@ pub struct ContextTool {
     pub context_path: std::path::PathBuf,
 }
 
-pub struct UsageEvent {
-    pub notification: Value,
+pub struct AgentEvent {
     pub thread_id: String,
-    pub turn_id: Option<String>,
-    pub usage: Value,
+    pub turn_id: String,
+    pub update: AgentUpdate,
+}
+pub enum AgentUpdate {
+    MessageDelta {
+        item_id: String,
+        text: String,
+    },
+    Item(Value),
+    Completed(Value),
+    Usage {
+        input: u64,
+        output: u64,
+        cached: Option<u64>,
+    },
 }
 
 #[cfg(test)]
@@ -312,23 +301,6 @@ mod tests {
         assert_eq!(captured["model_name"], "共享模型");
         assert!(!captured.to_string().contains("private.example"));
         assert_ne!(captured, source_info(&config));
-    }
-
-    #[test]
-    fn new_configs_use_factory_profiles_and_default_connection() {
-        let config: Config = serde_json::from_value(
-            json!({"codex":"original.exe","model":"old-model","reasoning_effort":"high"}),
-        )
-        .unwrap();
-        for kind in ["classify", "format", "handling", "archive", "report"] {
-            let resolved = config.for_kind(kind);
-            assert_eq!(resolved.model, "gpt-6-astra");
-            assert_eq!(connection(&resolved).unwrap().executable, "original.exe");
-        }
-        let serialized = serde_json::to_value(&config).unwrap();
-        assert!(serialized.get("selected_connection").is_none());
-        let restored: Config = serde_json::from_value(serialized).unwrap();
-        assert_eq!(connection(&restored).unwrap(), connection(&config).unwrap());
     }
 
     #[test]

@@ -5,8 +5,8 @@ use std::{fs, path::Path};
 const PLUGIN: &str = include_str!("../../../examples/dsh-workspace-bridge/index.js");
 const PACKAGE: &str = include_str!("../../../examples/dsh-workspace-bridge/package.json");
 const ID: &str = "shishi-workspace-bridge";
-fn plugin_row(rows: &[serde_yaml_ng::Value]) -> Option<serde_yaml_ng::Value> {
-    let mut result: Option<serde_yaml_ng::Value> = None;
+fn plugin_row(rows: &[yaml_serde::Value]) -> Option<yaml_serde::Value> {
+    let mut result: Option<yaml_serde::Value> = None;
     for row in rows {
         let entries = row["insert"]
             .as_sequence()
@@ -16,10 +16,7 @@ fn plugin_row(rows: &[serde_yaml_ng::Value]) -> Option<serde_yaml_ng::Value> {
             if entry["id"].as_str() != Some(ID) {
                 continue;
             }
-            if let Some(current) = result
-                .as_mut()
-                .and_then(serde_yaml_ng::Value::as_mapping_mut)
-            {
+            if let Some(current) = result.as_mut().and_then(yaml_serde::Value::as_mapping_mut) {
                 if let Some(next) = entry.as_mapping() {
                     for (k, v) in next {
                         current.insert(k.clone(), v.clone());
@@ -33,7 +30,7 @@ fn plugin_row(rows: &[serde_yaml_ng::Value]) -> Option<serde_yaml_ng::Value> {
     result
 }
 
-fn rows(home: &Path) -> Result<(std::path::PathBuf, String, Vec<serde_yaml_ng::Value>), String> {
+fn rows(home: &Path) -> Result<(std::path::PathBuf, String, Vec<yaml_serde::Value>), String> {
     let path = home.join("profiles/desktop/cordis.patch.yml");
     let text = match fs::read_to_string(&path) {
         Ok(s) if s.len() <= 2_000_000 => s,
@@ -41,8 +38,8 @@ fn rows(home: &Path) -> Result<(std::path::PathBuf, String, Vec<serde_yaml_ng::V
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(_) => return Err("DSH desktop 配置不可读".into()),
     };
-    let value: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(&text).map_err(|_| "DSH desktop YAML 损坏，未修改")?;
+    let value: yaml_serde::Value =
+        yaml_serde::from_str(&text).map_err(|_| "DSH desktop YAML 损坏，未修改")?;
     let rows = if value.is_null() {
         vec![]
     } else {
@@ -85,7 +82,7 @@ pub fn install(home: &Path) -> Result<Value, String> {
     fs::create_dir_all(&index).map_err(|e| e.to_string())?;
     let row = json!({"id":ID,"name":dir.join("index.js").to_string_lossy(),"config":{"indexDir":index.to_string_lossy()}});
     let addition =
-        serde_yaml_ng::to_string(&vec![json!({"insert":[row]})]).map_err(|e| e.to_string())?;
+        yaml_serde::to_string(&vec![json!({"insert":[row]})]).map_err(|e| e.to_string())?;
     fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     // Preserve the exact user document and keep a recoverable pre-install copy.
     if !text.is_empty() {
@@ -111,7 +108,7 @@ pub fn install(home: &Path) -> Result<Value, String> {
         )
     };
     // Parse the composed document before publication (also rejects YAML end markers).
-    let check: Vec<serde_yaml_ng::Value> = serde_yaml_ng::from_str(&next)
+    let check: Vec<yaml_serde::Value> = yaml_serde::from_str(&next)
         .map_err(|_| "无法安全追加插件，请在 DSH 中手动安装；原配置未修改")?;
     if check.len() != rows.len() + 1 {
         return Err("追加插件校验失败，原配置未修改".into());
@@ -171,14 +168,7 @@ pub fn projects(home: &Path) -> Result<Vec<Value>, String> {
 mod tests {
     use super::*;
     fn root() -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "ss-workspace-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = crate::test_path("workspace");
         fs::create_dir_all(&root).unwrap();
         root
     }

@@ -3,11 +3,10 @@
 //! All timestamps in this module are explicit Unix **milliseconds**, matching
 //! the application's `model::now()` and persisted state. There is no
 //! seconds-based API here. Shanghai is fixed +08:00. Scanning is deliberately
-//! not part of [`AiPurpose`]: message ingestion must continue in every state;
-//! only model calls pass through [`gate`].
+//! separate from the AI time gate: message ingestion continues in every state.
+//! The application checks AI dispatch against this runtime and its archive store.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Timelike, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -20,37 +19,21 @@ pub const WORK_MAX_YEAR: i32 = 2100;
 pub const SHANGHAI_OFFSET_MS: i64 = 8 * 60 * 60 * 1000;
 pub const MAX_CLAIM_ID_CHARS: usize = 128;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WorkError {
+    #[error("invalid Unix millisecond timestamp {0}")]
     InvalidTimestampMs(i64),
+    #[error("{field} must be strict HH:MM, got {value:?}")]
     InvalidTime { field: &'static str, value: String },
+    #[error("work start and end must differ")]
     EqualWorkTimes,
+    #[error("date {0} is outside the supported range")]
     DateOutOfRange(NaiveDate),
-    MalformedState(String),
+    #[error("unsupported work runtime schema version {found} (expected {expected})")]
     UnsupportedSchemaVersion { found: u32, expected: u32 },
+    #[error("work runtime is invalid: {0}")]
     InvalidState(&'static str),
 }
-
-impl fmt::Display for WorkError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidTimestampMs(at) => write!(f, "invalid Unix millisecond timestamp {at}"),
-            Self::InvalidTime { field, value } => {
-                write!(f, "{field} must be strict HH:MM, got {value:?}")
-            }
-            Self::EqualWorkTimes => write!(f, "work start and end must differ"),
-            Self::DateOutOfRange(date) => write!(f, "date {date} is outside the supported range"),
-            Self::MalformedState(detail) => write!(f, "work runtime is malformed: {detail}"),
-            Self::UnsupportedSchemaVersion { found, expected } => write!(
-                f,
-                "unsupported work runtime schema version {found} (expected {expected})"
-            ),
-            Self::InvalidState(detail) => write!(f, "work runtime is invalid: {detail}"),
-        }
-    }
-}
-
-impl std::error::Error for WorkError {}
 
 /// The only two schedule settings. Cross-midnight is represented by
 /// `end_minute < start_minute`; equality is rejected.
@@ -106,14 +89,6 @@ impl WorkSchedule {
         })
     }
 
-    pub fn start_minute(self) -> u16 {
-        self.start_minute
-    }
-
-    pub fn end_minute(self) -> u16 {
-        self.end_minute
-    }
-
     pub fn is_overnight(self) -> bool {
         self.end_minute < self.start_minute
     }
@@ -160,31 +135,20 @@ impl WorkSchedule {
 
 fn parse_hhmm(field: &'static str, value: &str) -> Result<u16, WorkError> {
     let bytes = value.as_bytes();
-    if bytes.len() != 5
-        || bytes[2] != b':'
-        || !bytes[..2].iter().all(u8::is_ascii_digit)
-        || !bytes[3..].iter().all(u8::is_ascii_digit)
+    if bytes.len() == 5
+        && bytes[2] == b':'
+        && bytes[..2].iter().chain(&bytes[3..]).all(u8::is_ascii_digit)
     {
-        return Err(WorkError::InvalidTime {
-            field,
-            value: value.to_owned(),
-        });
+        let hour = (bytes[0] - b'0') * 10 + bytes[1] - b'0';
+        let minute = (bytes[3] - b'0') * 10 + bytes[4] - b'0';
+        if hour < 24 && minute < 60 {
+            return Ok(u16::from(hour) * 60 + u16::from(minute));
+        }
     }
-    let hour: u16 = value[..2].parse().map_err(|_| WorkError::InvalidTime {
+    Err(WorkError::InvalidTime {
         field,
         value: value.to_owned(),
-    })?;
-    let minute: u16 = value[3..].parse().map_err(|_| WorkError::InvalidTime {
-        field,
-        value: value.to_owned(),
-    })?;
-    if hour >= 24 || minute >= 60 {
-        return Err(WorkError::InvalidTime {
-            field,
-            value: value.to_owned(),
-        });
-    }
-    Ok(hour * 60 + minute)
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -241,7 +205,7 @@ pub struct EndArchiveClaim {
     pub eligibility: EndEligibility,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkDayRecord {
     pub first_worked_at_ms: Option<i64>,
@@ -252,16 +216,6 @@ pub struct WorkDayRecord {
 }
 
 impl WorkDayRecord {
-    pub fn empty() -> Self {
-        Self {
-            first_worked_at_ms: None,
-            first_overtime_at_ms: None,
-            end_eligibility: None,
-            morning_claim: None,
-            end_claim: None,
-        }
-    }
-
     fn observe_first_worked(&mut self, at_ms: i64) {
         self.first_worked_at_ms = Some(self.first_worked_at_ms.map_or(at_ms, |old| old.min(at_ms)));
     }
@@ -274,41 +228,17 @@ impl WorkDayRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WorkRuntime {
-    pub schema_version: u32,
-    pub active_overtime: Option<ActiveOvertime>,
-    pub day_records: BTreeMap<NaiveDate, WorkDayRecord>,
-}
-
-impl Default for WorkRuntime {
-    fn default() -> Self {
-        Self::new()
+shishi_api::default_struct! {
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub struct WorkRuntime {
+        pub schema_version: u32 = WORK_RUNTIME_SCHEMA_VERSION,
+        pub active_overtime: Option<ActiveOvertime>,
+        pub day_records: BTreeMap<NaiveDate, WorkDayRecord>,
     }
 }
 
 impl WorkRuntime {
-    pub fn new() -> Self {
-        Self {
-            schema_version: WORK_RUNTIME_SCHEMA_VERSION,
-            active_overtime: None,
-            day_records: BTreeMap::new(),
-        }
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, WorkError> {
-        let runtime: Self =
-            serde_json::from_slice(bytes).map_err(|e| WorkError::MalformedState(e.to_string()))?;
-        runtime.validate()?;
-        Ok(runtime)
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, WorkError> {
-        self.validate()?;
-        serde_json::to_vec(self).map_err(|e| WorkError::MalformedState(e.to_string()))
-    }
-
     pub fn validate(&self) -> Result<(), WorkError> {
         if self.schema_version != WORK_RUNTIME_SCHEMA_VERSION {
             return Err(WorkError::UnsupportedSchemaVersion {
@@ -345,14 +275,13 @@ impl WorkRuntime {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn day_record(&self, day: NaiveDate) -> Option<&WorkDayRecord> {
         self.day_records.get(&day)
     }
 
     pub fn day_record_mut(&mut self, day: NaiveDate) -> &mut WorkDayRecord {
-        self.day_records
-            .entry(day)
-            .or_insert_with(WorkDayRecord::empty)
+        self.day_records.entry(day).or_default()
     }
 
     /// Clear manual overtime when the business day has rolled. The day record
@@ -496,14 +425,11 @@ impl WorkRuntime {
         Ok(EndEligibility::NotEligible)
     }
 
-    pub fn find_end_claim(&self, attempt_id: &str) -> Option<(NaiveDate, EndArchiveClaim)> {
-        self.day_records.iter().find_map(|(day, record)| {
-            record
-                .end_claim
-                .as_ref()
-                .filter(|claim| claim.attempt_id == attempt_id)
-                .map(|claim| (*day, claim.clone()))
-        })
+    pub fn find_end_claim(&self, attempt_id: &str) -> Option<(NaiveDate, &EndArchiveClaim)> {
+        self.day_records
+            .iter()
+            .filter_map(|(day, record)| record.end_claim.as_ref().map(|claim| (*day, claim)))
+            .find(|(_, claim)| claim.attempt_id == attempt_id)
     }
 }
 
@@ -517,337 +443,6 @@ pub struct WorkSnapshot {
     pub first_worked_at_ms: Option<i64>,
     pub first_overtime_at_ms: Option<i64>,
     pub end_eligibility: EndEligibility,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AiPurpose {
-    ToolCall,
-    Classify,
-    Format,
-    Edit,
-    Schedule,
-    Report,
-    Learning,
-    PromptReview,
-    Archive,
-    Handling,
-    HandlingLearning,
-    AdviceRevision,
-    MessageFilter,
-}
-
-impl AiPurpose {
-    pub const ALL: [Self; 13] = [
-        Self::ToolCall,
-        Self::Classify,
-        Self::Format,
-        Self::Edit,
-        Self::Schedule,
-        Self::Report,
-        Self::Learning,
-        Self::PromptReview,
-        Self::Archive,
-        Self::Handling,
-        Self::HandlingLearning,
-        Self::AdviceRevision,
-        Self::MessageFilter,
-    ];
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AiTrigger {
-    Manual,
-    Scheduled,
-    Boundary,
-    QueuedArchive,
-    Retry,
-    Filter,
-    ProviderCheck,
-}
-
-impl AiTrigger {
-    pub const ALL: [Self; 7] = [
-        Self::Manual,
-        Self::Scheduled,
-        Self::Boundary,
-        Self::QueuedArchive,
-        Self::Retry,
-        Self::Filter,
-        Self::ProviderCheck,
-    ];
-}
-
-/// Read-only projection of the archive module's authoritative attempt state.
-///
-/// This value is deliberately **not** persisted in [`WorkRuntime`]: the archive
-/// store remains the one source of truth. The integration maps its stored status
-/// into this enum when it dispatches the already-claimed end archive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArchiveAttemptStatus {
-    Queued,
-    Running,
-    Succeeded,
-    Failed,
-}
-
-impl ArchiveAttemptStatus {
-    /// Only a queued/running attempt may dispatch AI. A succeeded or failed
-    /// attempt is terminal for gate purposes.
-    pub fn is_active(self) -> bool {
-        matches!(self, Self::Queued | Self::Running)
-    }
-}
-
-/// Authoritative read-only lookup for the narrow end-archive gate exception.
-///
-/// The integration must implement this over the archive module's committed
-/// attempt state and read it in the same dispatch critical section that reserves
-/// or runs the attempt. It must not be a gate-owned cache, UI hint, or a
-/// caller-supplied allow flag. Missing attempts fail closed.
-pub trait EndArchiveAttemptLookup {
-    fn end_archive_attempt_status(&self, attempt_id: &str) -> Option<ArchiveAttemptStatus>;
-}
-
-/// Explicit fail-closed authority for call sites that cannot have an end-archive
-/// exception (tests, dry runs). Production end-archive dispatch must pass the
-/// archive module's real lookup instead.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoArchiveAttempts;
-
-impl EndArchiveAttemptLookup for NoArchiveAttempts {
-    fn end_archive_attempt_status(&self, _attempt_id: &str) -> Option<ArchiveAttemptStatus> {
-        None
-    }
-}
-
-/// The id is checked against a persisted end-archive claim **and** the
-/// authoritative archive attempt status. This is not a caller-selected allow
-/// flag; a missing/mismatched id or a terminal attempt cannot bypass the gate.
-#[derive(Debug, Clone, Copy)]
-pub struct AiGateRequest<'a> {
-    pub purpose: AiPurpose,
-    pub trigger: AiTrigger,
-    pub at_ms: i64,
-    pub end_attempt_id: Option<&'a str>,
-}
-
-impl<'a> AiGateRequest<'a> {
-    pub fn new(purpose: AiPurpose, trigger: AiTrigger, at_ms: i64) -> Self {
-        Self {
-            purpose,
-            trigger,
-            at_ms,
-            end_attempt_id: None,
-        }
-    }
-
-    pub fn with_end_attempt_id(mut self, attempt_id: &'a str) -> Self {
-        self.end_attempt_id = Some(attempt_id);
-        self
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GateCode {
-    AllowedManual,
-    AllowedWorking,
-    AllowedOvertime,
-    AllowedEndArchiveClaim,
-    BlockedOffDuty,
-    BlockedHoliday,
-    BlockedCalendarUnknown,
-    EndArchiveClaimRequired,
-    EndArchiveAttemptInactive,
-}
-
-impl GateCode {
-    pub fn message(self) -> &'static str {
-        match self {
-            Self::AllowedManual => "allowed: explicit manual operation",
-            Self::AllowedWorking => "allowed: working",
-            Self::AllowedOvertime => "allowed: overtime",
-            Self::AllowedEndArchiveClaim => "allowed: persisted end-boundary archive claim",
-            Self::BlockedOffDuty => "blocked: off duty; enable overtime to allow AI",
-            Self::BlockedHoliday => "blocked: holiday; enable overtime to allow AI",
-            Self::BlockedCalendarUnknown => {
-                "blocked: calendar unknown; confirm the day or enable overtime"
-            }
-            Self::EndArchiveClaimRequired => {
-                "blocked: end archive requires its persisted boundary claim"
-            }
-            Self::EndArchiveAttemptInactive => {
-                "blocked: end archive attempt is no longer queued or running"
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GateException {
-    pub business_day: NaiveDate,
-    pub attempt_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GateDecision {
-    pub allowed: bool,
-    pub code: GateCode,
-    pub business_date: NaiveDate,
-    pub status: WorkStatus,
-    pub can_enable_overtime: bool,
-    pub exception: Option<GateException>,
-}
-
-/// The one work-time gate for all model purposes. Explicit manual operations
-/// are allowed at any time; provider, quota and permission checks remain separate.
-///
-/// The sole exception is `Archive` + `Boundary`/`QueuedArchive` with an id that
-/// exactly matches a stored end claim **and** whose authoritative archive
-/// attempt is `Queued` or `Running`. `Succeeded`, `Failed`, and missing attempts
-/// never authorize a new model call. The status is read through
-/// [`EndArchiveAttemptLookup`], not duplicated inside the scheduler/work state.
-/// A supplied claimed-attempt id is checked before the general state allowance,
-/// so a terminal attempt cannot authorize the claimed archive even while the
-/// state is otherwise `Working`/`Overtime`.
-pub fn gate(
-    runtime: &WorkRuntime,
-    schedule: &WorkSchedule,
-    calendar: &CalendarData,
-    attempts: &dyn EndArchiveAttemptLookup,
-    request: &AiGateRequest<'_>,
-) -> Result<GateDecision, WorkError> {
-    let snapshot = runtime.snapshot(request.at_ms, schedule, calendar)?;
-    if request.trigger == AiTrigger::Manual && request.end_attempt_id.is_none() {
-        return Ok(GateDecision {
-            allowed: true,
-            code: GateCode::AllowedManual,
-            business_date: snapshot.business_date,
-            status: snapshot.status,
-            can_enable_overtime: false,
-            exception: None,
-        });
-    }
-    let exception_shape = is_end_archive_exception_shape(request);
-
-    // A supplied claimed-attempt id is authoritative even while the work state
-    // is otherwise AI-enabled. A succeeded/failed attempt must never dispatch
-    // the claimed end archive; missing claims fall through so a plain working
-    // archive is still governed by the normal state allowance below.
-    if exception_shape && request.end_attempt_id.is_some() {
-        match check_end_claim(runtime, attempts, request) {
-            EndClaimCheck::Allowed(exception) => {
-                return Ok(GateDecision {
-                    allowed: true,
-                    code: GateCode::AllowedEndArchiveClaim,
-                    business_date: snapshot.business_date,
-                    status: snapshot.status,
-                    can_enable_overtime: false,
-                    exception: Some(exception),
-                });
-            }
-            EndClaimCheck::AttemptInactive => {
-                return Ok(GateDecision {
-                    allowed: false,
-                    code: GateCode::EndArchiveAttemptInactive,
-                    business_date: snapshot.business_date,
-                    status: snapshot.status,
-                    can_enable_overtime: !snapshot.status.ai_allowed(),
-                    exception: None,
-                });
-            }
-            EndClaimCheck::ClaimRequired => {
-                return Ok(GateDecision {
-                    allowed: false,
-                    code: GateCode::EndArchiveClaimRequired,
-                    business_date: snapshot.business_date,
-                    status: snapshot.status,
-                    can_enable_overtime: !snapshot.status.ai_allowed(),
-                    exception: None,
-                })
-            }
-        }
-    }
-
-    if snapshot.status.ai_allowed() {
-        let code = if snapshot.status == WorkStatus::Overtime {
-            GateCode::AllowedOvertime
-        } else {
-            GateCode::AllowedWorking
-        };
-        return Ok(GateDecision {
-            allowed: true,
-            code,
-            business_date: snapshot.business_date,
-            status: snapshot.status,
-            can_enable_overtime: false,
-            exception: None,
-        });
-    }
-
-    let code = if exception_shape {
-        GateCode::EndArchiveClaimRequired
-    } else {
-        match snapshot.status {
-            WorkStatus::OffDuty => GateCode::BlockedOffDuty,
-            WorkStatus::Holiday => GateCode::BlockedHoliday,
-            WorkStatus::CalendarUnknown => GateCode::BlockedCalendarUnknown,
-            WorkStatus::Working | WorkStatus::Overtime => unreachable!(),
-        }
-    };
-    Ok(GateDecision {
-        allowed: false,
-        code,
-        business_date: snapshot.business_date,
-        status: snapshot.status,
-        can_enable_overtime: true,
-        exception: None,
-    })
-}
-
-fn is_end_archive_exception_shape(request: &AiGateRequest<'_>) -> bool {
-    request.purpose == AiPurpose::Archive
-        && matches!(
-            request.trigger,
-            AiTrigger::Boundary | AiTrigger::QueuedArchive
-        )
-}
-
-enum EndClaimCheck {
-    Allowed(GateException),
-    ClaimRequired,
-    AttemptInactive,
-}
-
-fn check_end_claim(
-    runtime: &WorkRuntime,
-    attempts: &dyn EndArchiveAttemptLookup,
-    request: &AiGateRequest<'_>,
-) -> EndClaimCheck {
-    let Some(attempt_id) = request.end_attempt_id else {
-        return EndClaimCheck::ClaimRequired;
-    };
-    let Some((business_day, claim)) = runtime.find_end_claim(attempt_id) else {
-        return EndClaimCheck::ClaimRequired;
-    };
-    let Some(status) = attempts.end_archive_attempt_status(attempt_id) else {
-        return EndClaimCheck::ClaimRequired;
-    };
-    if !status.is_active() {
-        return EndClaimCheck::AttemptInactive;
-    }
-    if !claim.eligibility.is_eligible() || claim.claimed_at_ms > request.at_ms {
-        return EndClaimCheck::ClaimRequired;
-    }
-    EndClaimCheck::Allowed(GateException {
-        business_day,
-        attempt_id: claim.attempt_id,
-    })
 }
 
 /// Convert a Unix-millisecond timestamp to the Shanghai local date.
@@ -915,25 +510,17 @@ mod tests {
         WorkSchedule::parse("08:00", "20:00").unwrap()
     }
 
-    struct OneAttempt {
-        id: &'static str,
-        status: ArchiveAttemptStatus,
-    }
-
-    impl EndArchiveAttemptLookup for OneAttempt {
-        fn end_archive_attempt_status(&self, attempt_id: &str) -> Option<ArchiveAttemptStatus> {
-            (attempt_id == self.id).then_some(self.status)
-        }
-    }
-
     #[test]
     fn schedule_parsing_rejects_invalid_and_equal_times() {
         let schedule = WorkSchedule::parse("08:00", "20:00").unwrap();
-        assert_eq!(schedule.start_minute(), 8 * 60);
-        assert_eq!(schedule.end_minute(), 20 * 60);
+        assert_eq!(schedule.start_minute, 8 * 60);
+        assert_eq!(schedule.end_minute, 20 * 60);
         assert!(!schedule.is_overnight());
 
-        for invalid in ["8:00", "08:0", "0800", "24:00", "08:60", "08:00:00", ""] {
+        for invalid in [
+            "8:00", "08:0", "0800", "24:00", "08:60", "08:00:00", "", "99:99", "ab:cd", " 8:00",
+            "０8:00",
+        ] {
             assert!(
                 WorkSchedule::parse(invalid, "20:00").is_err(),
                 "start {invalid:?} must be rejected"
@@ -1019,7 +606,7 @@ mod tests {
     fn statuses_cover_work_weekend_makeup_holiday_unknown_and_manual() {
         let calendar = calendar();
         let schedule = schedule();
-        let runtime = WorkRuntime::new();
+        let runtime = WorkRuntime::default();
 
         let working = runtime
             .snapshot(ts_ms(2025, 1, 2, 10, 0), &schedule, &calendar)
@@ -1102,7 +689,7 @@ mod tests {
     #[test]
     fn overnight_shift_uses_its_start_business_day_calendar_across_midnight() {
         let schedule = WorkSchedule::parse("22:00", "06:00").unwrap();
-        let runtime = WorkRuntime::new();
+        let runtime = WorkRuntime::default();
 
         // Jan 2 is a workday; Jan 3 is explicitly a holiday. At 00:30 the
         // overnight shift must still be Working under the Jan 2 business day.
@@ -1153,7 +740,7 @@ mod tests {
         let calendar = calendar();
         let schedule = schedule();
         let start = ts_ms(2025, 1, 1, 10, 0);
-        let mut runtime = WorkRuntime::new();
+        let mut runtime = WorkRuntime::default();
         runtime.begin_overtime(start, &schedule).unwrap();
         assert_eq!(
             runtime
@@ -1171,8 +758,9 @@ mod tests {
             WorkStatus::Holiday
         );
 
-        let bytes = runtime.to_bytes().unwrap();
-        let mut restored = WorkRuntime::from_bytes(&bytes).unwrap();
+        let bytes = serde_json::to_vec(&runtime).unwrap();
+        let mut restored: WorkRuntime = serde_json::from_slice(&bytes).unwrap();
+        restored.validate().unwrap();
         assert_eq!(restored, runtime);
         assert_eq!(
             restored
@@ -1218,7 +806,7 @@ mod tests {
         let calendar = calendar();
         let schedule = schedule();
 
-        let mut exited = WorkRuntime::new();
+        let mut exited = WorkRuntime::default();
         exited
             .begin_overtime(ts_ms(2025, 1, 1, 9, 0), &schedule)
             .unwrap();
@@ -1235,7 +823,7 @@ mod tests {
             EndEligibility::OvertimeBeforeEnd
         );
 
-        let mut worked = WorkRuntime::new();
+        let mut worked = WorkRuntime::default();
         worked
             .observe(ts_ms(2025, 1, 2, 9, 0), &schedule, &calendar)
             .unwrap();
@@ -1244,7 +832,7 @@ mod tests {
             EndEligibility::WorkedBeforeEnd
         );
 
-        let mut after_end = WorkRuntime::new();
+        let mut after_end = WorkRuntime::default();
         after_end
             .begin_overtime(ts_ms(2025, 1, 1, 20, 0), &schedule)
             .unwrap();
@@ -1266,7 +854,7 @@ mod tests {
     fn runtime_serialization_is_versioned_and_strict() {
         let schedule = schedule();
         let calendar = calendar();
-        let mut runtime = WorkRuntime::new();
+        let mut runtime = WorkRuntime::default();
         runtime
             .observe(ts_ms(2025, 1, 2, 9, 0), &schedule, &calendar)
             .unwrap();
@@ -1275,281 +863,32 @@ mod tests {
             claimed_at_ms: ts_ms(2025, 1, 2, 20, 0),
             eligibility: EndEligibility::WorkedBeforeEnd,
         });
-        let bytes = runtime.to_bytes().unwrap();
-        let restored = WorkRuntime::from_bytes(&bytes).unwrap();
+        let bytes = serde_json::to_vec(&runtime).unwrap();
+        let restored: WorkRuntime = serde_json::from_slice(&bytes).unwrap();
+        restored.validate().unwrap();
         assert_eq!(restored, runtime);
 
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         value["schema_version"] = json!(99);
         assert!(matches!(
-            WorkRuntime::from_bytes(&serde_json::to_vec(&value).unwrap()),
+            serde_json::from_value::<WorkRuntime>(value)
+                .unwrap()
+                .validate(),
             Err(WorkError::UnsupportedSchemaVersion { found: 99, .. })
         ));
 
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         value.as_object_mut().unwrap().remove("schema_version");
-        assert!(matches!(
-            WorkRuntime::from_bytes(&serde_json::to_vec(&value).unwrap()),
-            Err(WorkError::MalformedState(_))
-        ));
+        assert!(serde_json::from_value::<WorkRuntime>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `schema_version`"));
 
         let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         value["extra"] = json!(true);
-        assert!(matches!(
-            WorkRuntime::from_bytes(&serde_json::to_vec(&value).unwrap()),
-            Err(WorkError::MalformedState(_))
-        ));
-    }
-
-    #[test]
-    fn all_ai_purposes_are_blocked_off_duty_and_allowed_while_working() {
-        let calendar = calendar();
-        let schedule = schedule();
-        let runtime = WorkRuntime::new();
-        let off_duty = ts_ms(2025, 1, 2, 21, 0);
-
-        for purpose in AiPurpose::ALL {
-            for trigger in AiTrigger::ALL {
-                let request = AiGateRequest::new(purpose, trigger, off_duty);
-                let decision =
-                    gate(&runtime, &schedule, &calendar, &NoArchiveAttempts, &request).unwrap();
-                assert_eq!(
-                    decision.allowed,
-                    trigger == AiTrigger::Manual,
-                    "{purpose:?}/{trigger:?}"
-                );
-                assert_eq!(decision.can_enable_overtime, trigger != AiTrigger::Manual);
-            }
-        }
-
-        let working = ts_ms(2025, 1, 2, 10, 0);
-        for purpose in AiPurpose::ALL {
-            for trigger in AiTrigger::ALL {
-                let request = AiGateRequest::new(purpose, trigger, working);
-                let decision =
-                    gate(&runtime, &schedule, &calendar, &NoArchiveAttempts, &request).unwrap();
-                assert!(decision.allowed, "{purpose:?}/{trigger:?} must be allowed");
-            }
-        }
-
-        let holiday = ts_ms(2025, 1, 1, 10, 0);
-        for purpose in AiPurpose::ALL {
-            let request = AiGateRequest::new(purpose, AiTrigger::Manual, holiday);
-            assert!(
-                gate(&runtime, &schedule, &calendar, &NoArchiveAttempts, &request)
-                    .unwrap()
-                    .allowed
-            );
-        }
-        let unknown = ts_ms(2026, 1, 5, 10, 0);
-        for purpose in AiPurpose::ALL {
-            let request = AiGateRequest::new(purpose, AiTrigger::Manual, unknown);
-            assert_eq!(
-                gate(&runtime, &schedule, &calendar, &NoArchiveAttempts, &request)
-                    .unwrap()
-                    .code,
-                GateCode::AllowedManual
-            );
-        }
-        for purpose in AiPurpose::ALL {
-            let request = AiGateRequest::new(purpose, AiTrigger::Scheduled, unknown);
-            assert!(
-                !gate(&runtime, &schedule, &calendar, &NoArchiveAttempts, &request)
-                    .unwrap()
-                    .allowed
-            );
-        }
-    }
-
-    #[test]
-    fn overtime_state_allows_all_purposes() {
-        let calendar = calendar();
-        let schedule = schedule();
-        let mut runtime = WorkRuntime::new();
-        runtime
-            .begin_overtime(ts_ms(2025, 1, 2, 21, 0), &schedule)
-            .unwrap();
-        for purpose in AiPurpose::ALL {
-            for trigger in AiTrigger::ALL {
-                let request = AiGateRequest::new(purpose, trigger, ts_ms(2025, 1, 2, 21, 30));
-                let decision =
-                    gate(&runtime, &schedule, &calendar, &NoArchiveAttempts, &request).unwrap();
-                assert!(decision.allowed);
-                assert_eq!(decision.status, WorkStatus::Overtime);
-            }
-        }
-    }
-
-    #[test]
-    fn only_a_stored_end_archive_claim_opens_the_narrow_exception() {
-        let calendar = calendar();
-        let schedule = schedule();
-        let mut runtime = WorkRuntime::new();
-        let claimed_at_ms = ts_ms(2025, 1, 1, 20, 0);
-        runtime.day_record_mut(d(2025, 1, 1)).end_eligibility =
-            Some(EndEligibility::OvertimeBeforeEnd);
-        runtime.day_record_mut(d(2025, 1, 1)).end_claim = Some(EndArchiveClaim {
-            attempt_id: "end-2025-01-01".to_owned(),
-            claimed_at_ms,
-            eligibility: EndEligibility::OvertimeBeforeEnd,
-        });
-        let at_ms = ts_ms(2025, 1, 1, 20, 5);
-        let queued = OneAttempt {
-            id: "end-2025-01-01",
-            status: ArchiveAttemptStatus::Queued,
-        };
-
-        let claim_request = AiGateRequest::new(AiPurpose::Archive, AiTrigger::QueuedArchive, at_ms)
-            .with_end_attempt_id("end-2025-01-01");
-        let decision = gate(&runtime, &schedule, &calendar, &queued, &claim_request).unwrap();
-        assert!(decision.allowed);
-        assert_eq!(decision.code, GateCode::AllowedEndArchiveClaim);
-        assert_eq!(decision.status, WorkStatus::Holiday);
-        let exception = decision.exception.unwrap();
-        assert_eq!(exception.business_day, d(2025, 1, 1));
-        assert_eq!(exception.attempt_id, "end-2025-01-01");
-
-        let running = OneAttempt {
-            id: "end-2025-01-01",
-            status: ArchiveAttemptStatus::Running,
-        };
-        let boundary_claim = AiGateRequest::new(AiPurpose::Archive, AiTrigger::Boundary, at_ms)
-            .with_end_attempt_id("end-2025-01-01");
-        assert!(
-            gate(&runtime, &schedule, &calendar, &running, &boundary_claim)
-                .unwrap()
-                .allowed
-        );
-
-        let no_id = AiGateRequest::new(AiPurpose::Archive, AiTrigger::QueuedArchive, at_ms);
-        let no_id_decision = gate(&runtime, &schedule, &calendar, &queued, &no_id).unwrap();
-        assert!(!no_id_decision.allowed);
-        assert_eq!(no_id_decision.code, GateCode::EndArchiveClaimRequired);
-
-        let wrong_id = AiGateRequest::new(AiPurpose::Archive, AiTrigger::QueuedArchive, at_ms)
-            .with_end_attempt_id("end-other");
-        assert!(
-            !gate(&runtime, &schedule, &calendar, &queued, &wrong_id)
-                .unwrap()
-                .allowed
-        );
-
-        for terminal in [
-            ArchiveAttemptStatus::Succeeded,
-            ArchiveAttemptStatus::Failed,
-        ] {
-            let attempts = OneAttempt {
-                id: "end-2025-01-01",
-                status: terminal,
-            };
-            let decision = gate(&runtime, &schedule, &calendar, &attempts, &claim_request).unwrap();
-            assert!(
-                !decision.allowed,
-                "a {terminal:?} attempt must not authorize AI"
-            );
-            assert_eq!(decision.code, GateCode::EndArchiveAttemptInactive);
-            assert!(decision.exception.is_none());
-        }
-
-        let missing_attempt = NoArchiveAttempts;
-        let missing_decision = gate(
-            &runtime,
-            &schedule,
-            &calendar,
-            &missing_attempt,
-            &claim_request,
-        )
-        .unwrap();
-        assert!(!missing_decision.allowed);
-        assert_eq!(
-            missing_decision.code,
-            GateCode::EndArchiveClaimRequired,
-            "a claim without a queued/running attempt must fail closed"
-        );
-
-        for purpose in AiPurpose::ALL {
-            if purpose == AiPurpose::Archive {
-                continue;
-            }
-            let request = AiGateRequest::new(purpose, AiTrigger::QueuedArchive, at_ms)
-                .with_end_attempt_id("end-2025-01-01");
-            let decision = gate(&runtime, &schedule, &calendar, &queued, &request).unwrap();
-            assert!(!decision.allowed, "claim must not open {purpose:?}");
-        }
-
-        for trigger in [
-            AiTrigger::Manual,
-            AiTrigger::Scheduled,
-            AiTrigger::Retry,
-            AiTrigger::Filter,
-            AiTrigger::ProviderCheck,
-        ] {
-            let request = AiGateRequest::new(AiPurpose::Archive, trigger, at_ms)
-                .with_end_attempt_id("end-2025-01-01");
-            let decision = gate(&runtime, &schedule, &calendar, &queued, &request).unwrap();
-            assert!(!decision.allowed, "claim must not open trigger {trigger:?}");
-        }
-
-        // A claim is not valid before it was created.
-        let future_claim = AiGateRequest::new(
-            AiPurpose::Archive,
-            AiTrigger::QueuedArchive,
-            claimed_at_ms - 1,
-        )
-        .with_end_attempt_id("end-2025-01-01");
-        assert!(
-            !gate(&runtime, &schedule, &calendar, &queued, &future_claim)
-                .unwrap()
-                .allowed
-        );
-    }
-
-    #[test]
-    fn terminal_claimed_attempt_never_authorizes_even_while_working() {
-        let calendar = calendar();
-        let schedule = schedule();
-        let mut runtime = WorkRuntime::new();
-        runtime
-            .observe(ts_ms(2025, 1, 2, 9, 0), &schedule, &calendar)
-            .unwrap();
-        runtime.day_record_mut(d(2025, 1, 2)).end_claim = Some(EndArchiveClaim {
-            attempt_id: "end-2025-01-02".to_owned(),
-            claimed_at_ms: ts_ms(2025, 1, 2, 9, 30),
-            eligibility: EndEligibility::WorkedBeforeEnd,
-        });
-        let at_ms = ts_ms(2025, 1, 2, 10, 0);
-        let request = AiGateRequest::new(AiPurpose::Archive, AiTrigger::QueuedArchive, at_ms)
-            .with_end_attempt_id("end-2025-01-02");
-
-        for terminal in [
-            ArchiveAttemptStatus::Succeeded,
-            ArchiveAttemptStatus::Failed,
-        ] {
-            let attempts = OneAttempt {
-                id: "end-2025-01-02",
-                status: terminal,
-            };
-            let decision = gate(&runtime, &schedule, &calendar, &attempts, &request).unwrap();
-            assert_eq!(decision.status, WorkStatus::Working);
-            assert!(!decision.allowed);
-            assert_eq!(decision.code, GateCode::EndArchiveAttemptInactive);
-            assert!(!decision.can_enable_overtime);
-        }
-
-        let queued = OneAttempt {
-            id: "end-2025-01-02",
-            status: ArchiveAttemptStatus::Queued,
-        };
-        let allowed = gate(&runtime, &schedule, &calendar, &queued, &request).unwrap();
-        assert!(allowed.allowed);
-        assert_eq!(allowed.code, GateCode::AllowedEndArchiveClaim);
-    }
-
-    #[test]
-    fn scanning_is_not_part_of_the_ai_purpose_set() {
-        // Scanning has no gate function in this crate; this length is a guard
-        // that adding a Scan purpose to the AI enum is an explicit review event.
-        assert_eq!(AiPurpose::ALL.len(), 13);
-        assert_eq!(AiTrigger::ALL.len(), 7);
+        assert!(serde_json::from_value::<WorkRuntime>(value)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `extra`"));
     }
 }

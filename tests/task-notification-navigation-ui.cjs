@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
-const { chromium } = require('playwright');
+const { withBrowser } = require('./ui-driver.cjs');
 const bundle = require('./ui-bundle.cjs');
 const now = Date.now();
 const task = (id, changes = {}) => ({
@@ -29,11 +29,7 @@ const mock = `window.fixture=${JSON.stringify(fixture)};window.requests=[];windo
   if(method==='plugins')data={plugins:[],sources:[],errors:[]};
   receive({id,ok:true,data});},method==='state'?(window.stateDelay?.[p.task]||0):0);
 }};`;
-(async () => {
-  const browser = await chromium.launch({ headless: true,
-    executablePath: process.env.SHISHI_UI_BROWSER || ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),
-    args: ['--disable-background-networking'] });
-  try {
+withBrowser(async(browser)=>{
     const page = await browser.newPage({ viewport: { width: 1500, height: 900 }, reducedMotion: 'reduce' });
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
@@ -49,7 +45,7 @@ const mock = `window.fixture=${JSON.stringify(fixture)};window.requests=[];windo
     const open = id => page.evaluate(id => openNotifiedTask(id), id);
     const selected = id => page.locator(`.task-row[data-task="${id}"].selected`).count();
 
-    const matching = { tab: '待处理', quickView: 'blocked', query: '合成事项',
+    const matching = { tab: '被阻塞', quickView: 'blocked', query: '合成事项',
       tags: { 事项等级: ['高', '低'], 事项类型: ['检查'], 提出者: ['甲'] }, priorities: ['高'] };
     await configure(matching);
     assert.equal(await open('target'), true);
@@ -71,11 +67,11 @@ const mock = `window.fixture=${JSON.stringify(fixture)};window.requests=[];windo
       assert.deepEqual(await filters(), { tab: scope, quickView: '', query: '合成事项', tags: { 提出者: ['甲'] }, priorities: [] });
       assert.equal(await page.evaluate(() => JSON.stringify(fixture.tasks)), before, 'navigation must not change business data');
     }
-    await configure({ tab: '待处理', quickView: 'today', query: 'target', tags: { 事项类型: ['检查'] } });
+    await configure({ tab: '全部', quickView: 'today', query: 'target', tags: { 事项类型: ['检查'] } });
     assert.equal(await open('target'), true);
     assert.equal((await filters()).quickView, 'today');
     assert.equal(await open('clear'), true);
-    assert.deepEqual(await filters(), { tab: '待处理', quickView: '', query: '', tags: { 事项类型: ['检查'] }, priorities: [] });
+    assert.deepEqual(await filters(), { tab: '全部', quickView: '', query: '', tags: { 事项类型: ['检查'] }, priorities: [] });
 
     for (const id of ['deleted', 'merged']) {
       const before = await filters();
@@ -144,5 +140,4 @@ const mock = `window.fixture=${JSON.stringify(fixture)};window.requests=[];windo
     assert(await page.locator('.tag-groups').evaluate(el => el.scrollWidth <= el.clientWidth + 1));
     assert.deepEqual(errors, []);
     console.log('PASS notification navigation: selective filters, archived/deferred tasks, drafts, failed/stale requests; content-sized tags and real-overflow masks');
-  } finally { await browser.close(); }
-})().catch(error => { console.error(error); process.exitCode = 1; });
+  }).catch(error => { console.error(error); process.exitCode = 1; });

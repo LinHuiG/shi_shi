@@ -1,10 +1,10 @@
 //! Share only the built-in provider definitions, never Desktop plugins or tools.
 use crate::restricted::MaterializedProfile;
-use serde_yaml_ng::{Mapping, Value};
 use std::{
     fs,
     path::{Path, PathBuf},
 };
+use yaml_serde::{Mapping, Value};
 
 pub fn inherit_desktop_providers(
     profile: &MaterializedProfile,
@@ -20,8 +20,8 @@ pub fn inherit_desktop_providers(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err("DSH 供应商配置不可读，请检查 profile 权限".into()),
         };
-        let document: Value = serde_yaml_ng::from_str(&text)
-            .map_err(|_| "DSH profile YAML 配置无效；未修改原文件")?;
+        let document: Value =
+            yaml_serde::from_str(&text).map_err(|_| "DSH profile YAML 配置无效；未修改原文件")?;
         if document.is_null() {
             continue;
         }
@@ -76,8 +76,8 @@ pub fn inherit_desktop_providers(
         Value::String("@deepseek-ai/dsh-llm-pi-ai".into()),
     );
     row.insert(Value::String("config".into()), Value::Mapping(config));
-    let text = serde_yaml_ng::to_string(&vec![Value::Mapping(row)])
-        .map_err(|_| "无法生成供应商临时配置")?;
+    let text =
+        yaml_serde::to_string(&vec![Value::Mapping(row)]).map_err(|_| "无法生成供应商临时配置")?;
     let patch = profile.patch.with_file_name("providers.patch.yml");
     fs::write(&patch, &text).map_err(|_| "无法写入供应商临时配置")?;
     let restricted = fs::read_to_string(&profile.patch).map_err(|_| "无法读取受限配置")?;
@@ -122,9 +122,10 @@ fn chat_role_compat(value: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn deepseek_chat_defaults_keep_explicit_overrides_and_other_models() {
-        let value:Value=serde_yaml_ng::from_str("api: openai-completions\nmodels:\n- id: deepseek-fixture\n- id: another-model\n- id: deepseek-explicit\n  compat: {supportsDeveloperRole: true}\n").unwrap();
+        let value:Value=yaml_serde::from_str("api: openai-completions\nmodels:\n- id: deepseek-fixture\n- id: another-model\n- id: deepseek-explicit\n  compat: {supportsDeveloperRole: true}\n").unwrap();
         let next = chat_role_compat(&value);
         assert_eq!(
             next["models"][0]["compat"]["supportsDeveloperRole"].as_bool(),
@@ -139,13 +140,7 @@ mod tests {
     }
     #[test]
     fn absent_disabled_and_invalid_profiles_do_not_import_plugins_or_change_sources() {
-        let base = std::env::temp_dir().join(format!(
-            "shishi-provider-errors-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let base = crate::test_path("provider-errors");
         let profile = crate::restricted::materialize_profile(&base.join("job")).unwrap();
         let home = base.join("home");
         assert!(inherit_desktop_providers(&profile, &home)
@@ -175,22 +170,22 @@ mod tests {
     }
     #[test]
     fn provider_only_overlay_keeps_routes_and_acp_overrides_without_changing_source() {
-        let base = std::env::temp_dir().join(format!(
-            "shishi-provider-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let base = crate::test_path("provider");
         let home = base.join("home");
         fs::create_dir_all(home.join("profiles/desktop")).unwrap();
         fs::create_dir_all(home.join("profiles/acp")).unwrap();
-        let desktop="- id: llm-pi-ai\n  name: '@deepseek-ai/dsh-llm-pi-ai'\n  config:\n    providers:\n      source-a: {apiKeyEnv: FIXTURE_KEY, models: [{id: shared}]}\n      source-b: {models: [{id: shared}]}\n- id: ui-chat\n  name: unsafe-ui\n  config: {secret: synthetic-private-sentinel}\n";
+        let desktop="- id: llm-pi-ai\n  name: '@deepseek-ai/dsh-llm-pi-ai'\n  config:\n    providers:\n      source-a: {apiKeyEnv: FIXTURE_KEY, models: [{id: shared}]}\n      source-b: {models: [&model {id: shared, name: 合成模型, enabled: false, code: '000123'}, *model]}\n- id: ui-chat\n  name: unsafe-ui\n  config: {secret: synthetic-private-sentinel}\n";
         fs::write(home.join("profiles/desktop/cordis.patch.yml"), desktop).unwrap();
         fs::write(home.join("profiles/acp/cordis.patch.yml"),"- id: llm-pi-ai\n  config:\n    providers:\n      source-a: {models: [{id: override}]}\n").unwrap();
         let profile = crate::restricted::materialize_profile(&base.join("job")).unwrap();
         let patch = inherit_desktop_providers(&profile, &home).unwrap().unwrap();
         let text = fs::read_to_string(patch).unwrap();
+        let inherited: Value = yaml_serde::from_str(&text).unwrap();
+        let models = &inherited[0]["config"]["providers"]["source-b"]["models"];
+        assert_eq!(models[0], models[1]);
+        assert_eq!(models[0]["name"].as_str(), Some("合成模型"));
+        assert_eq!(models[0]["code"].as_str(), Some("000123"));
+        assert_eq!(models[0]["enabled"].as_bool(), Some(false));
         assert!(
             text.contains("source-a")
                 && text.contains("source-b")

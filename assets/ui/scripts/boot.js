@@ -18,6 +18,7 @@ document.addEventListener('visibilitychange', () => {
 });
 refreshState(true);
 setInterval(() => {
+  refreshTaskClock();
   if (state?.ai_busy) status();
   if (state) {
     syncUpdateNotice();

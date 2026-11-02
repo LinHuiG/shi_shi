@@ -1,8 +1,8 @@
 //! Self-contained staging crate for the OpenAI Chat Completions analysis
 //! provider and its local structured-output validator.
 //!
-//! The HTTP module extends the finalized WinHTTP transport with incremental
-//! body callbacks while retaining its deadline, cancellation and HTTPS rules. No credentials, provider
+//! The pooled HTTP transport retains overall deadlines, cancellation and HTTPS
+//! rules, with incremental body callbacks. No credentials, provider
 //! storage, engine state, or UI code is duplicated here: callers resolve a
 //! borrowed credential and pass it to the client for one analysis run.
 //!
@@ -10,11 +10,15 @@
 //! under `cfg(test)` for deterministic local integration tests; there is no
 //! production insecure switch.
 
+mod defaults;
 pub mod endpoint;
 pub mod http_client;
+pub mod json;
 pub mod openai;
 pub mod schema_validate;
 pub mod streaming;
+#[cfg(test)]
+mod test_support;
 pub mod transport;
 pub use streaming::ApiEvent;
 

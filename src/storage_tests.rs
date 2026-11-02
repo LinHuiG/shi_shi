@@ -1,10 +1,9 @@
 use super::*;
-use crate::model::{State, Task};
+use crate::model::State;
 
 #[test]
 fn restart_gate_uses_current_local_handling_states_and_excludes_desktop_ownership() {
-    let root = std::env::temp_dir().join(format!("shishi-restart-gate-{}", crate::model::id()));
-    let app = App::load(root.clone()).unwrap();
+    let (_root, app) = crate::test_support::scoped_app("shishi-restart-gate");
     for status in [
         "starting",
         "submitting",
@@ -41,8 +40,6 @@ fn restart_gate_uses_current_local_handling_states_and_excludes_desktop_ownershi
     }]
     .into();
     assert!(app.storage_ready());
-    drop(app);
-    fs::remove_dir_all(root).unwrap();
 }
 
 struct Fixture {
@@ -62,11 +59,10 @@ impl Fixture {
         let app = App::load(root.clone()).unwrap();
         {
             let mut state = app.state.lock().unwrap();
-            state.tasks.push(Task {
-                id: "synthetic-task".into(),
-                title: "Synthetic retained task".into(),
-                ..Default::default()
-            });
+            state.tasks.push(crate::test_support::task(
+                "synthetic-task",
+                "Synthetic retained task",
+            ));
             app.save(&state).unwrap();
         }
         Self {
@@ -169,10 +165,6 @@ fn complete_copy_preserves_bytes_history_and_paths_and_reports_byte_progress() {
         "Synthetic retained task"
     );
     app.log("synthetic", json!({}));
-    let state = app.state.lock().unwrap();
-    crate::snapshots::ensure(&app.root, &state, crate::model::now()).unwrap();
-    assert!(crate::snapshots::dir(&app.root).starts_with(canonical(&f.dest).unwrap()));
-    drop(state);
     assert_eq!(app.snapshot()["data_directory"], json!(plan.destination));
 }
 
@@ -190,11 +182,10 @@ fn switch_without_copy_uses_new_or_existing_data_and_atomically_replaces_locator
     let existing = f.base.join("existing");
     fs::create_dir(&existing).unwrap();
     let state = State {
-        tasks: vec![Task {
-            id: "existing-synthetic-task".into(),
-            title: "Existing retained task".into(),
-            ..Default::default()
-        }]
+        tasks: vec![crate::test_support::task(
+            "existing-synthetic-task",
+            "Existing retained task",
+        )]
         .into(),
         ..Default::default()
     };

@@ -234,7 +234,7 @@ pub fn begin(app: &App, params: &Value, parent_rect: [i32; 4]) -> Result<(), Str
             copy,
             parent_pid: std::process::id(),
             parent_rect,
-            restart_args: std::env::args().skip(1).collect(),
+            restart_args: app.local_runtime.restart_args(),
             expected_locator: read_locator(&app.root)?,
         };
         // Not inside data: it must survive both the copy and cache exclusion.
@@ -305,8 +305,14 @@ fn inventory(
         let entry = entry.map_err(|e| e.to_string())?;
         let path = relative.join(entry.file_name());
         if relative.as_os_str().is_empty()
-            && ["app.lock", "webview", "tmp"]
-                .contains(&entry.file_name().to_string_lossy().as_ref())
+            && [
+                "app.lock",
+                "webview",
+                "tmp",
+                "local-service.json",
+                "local-service.tmp",
+            ]
+            .contains(&entry.file_name().to_string_lossy().as_ref())
         {
             continue;
         }

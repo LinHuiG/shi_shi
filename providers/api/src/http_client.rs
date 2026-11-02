@@ -1,64 +1,20 @@
-//! Narrow HTTP transport built on asynchronous WinHTTP.
+//! Bounded HTTPS transport with system TLS and the Windows WinHTTP proxy policy.
 //!
-//! Production callers can only use absolute `https://` URLs. Plain `http://`
-//! is accepted solely for loopback hosts through the crate-private
-//! `send_localhost_for_tests` helper compiled under `cfg(test)`; it is not part
-//! of the production API. URLs may not contain userinfo, a query, or a
-//! fragment. The transport uses the system WinHTTP proxy configuration and
-//! validates TLS with the system defaults.
-//!
-//! Every call has one monotonic overall deadline. It is enforced while waiting
-//! for DNS/proxy resolution, connect, request send, response headers, and every
-//! body read, and it is shared by all redirects. Cancellation is observed at
-//! most one poll interval after the flag is set, then the pending request handle
-//! is closed to abort WinHTTP. The callback state, request body, and read buffer
-//! are owned by the request-handle context: its final `HANDLE_CLOSING` callback
-//! releases them exactly once, even if that callback arrives after the call has
-//! returned. Session and connection handles carry no context. This avoids both
-//! long native-timeout overshoot and use-after-free without an unbounded
-//! permanent leak.
-//!
-//! A request is executed once unless it is a `GET` with an HTTP redirect to the
-//! same origin. Cross-origin redirects and any downgrade are rejected. `POST`
-//! redirects are returned to the caller as a normal `3xx` response so that a
-//! request body is never replayed automatically. Requests are never retried.
-//!
-//! Errors expose only a safe class and an optional WinHTTP error code. They
-//! never contain URLs, headers, bearer tokens, or response bodies. The
-//! response itself is returned to the internal caller together with its status
-//! code and optional bounded `ETag`/`Last-Modified` cache validators so
-//! provider-specific status mapping remains outside this module.
+//! A shared connection pool owns network resources. Each call retains one overall
+//! deadline and cancellation flag through headers, body reads and GET redirects.
+//! POST is never replayed; redirects must stay on the original origin. Errors
+//! expose only a safe class, never request or response data.
 
-use std::ffi::c_void;
+use crate::endpoint::{ParsedUrl, Scheme, MAX_URL_BYTES};
 use std::fmt;
-use std::net::IpAddr;
-use std::ptr::{null, null_mut};
-#[cfg(test)]
-use std::sync::atomic::AtomicUsize;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER};
+use windows_sys::Win32::Foundation::GlobalFree;
 use windows_sys::Win32::Networking::WinHttp::{
-    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetOption, WinHttpSetStatusCallback, WinHttpSetTimeouts,
-    ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED, ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED_PROXY,
-    ERROR_WINHTTP_CLIENT_CERT_NO_ACCESS_PRIVATE_KEY, ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY,
-    ERROR_WINHTTP_HEADER_NOT_FOUND, ERROR_WINHTTP_OPERATION_CANCELLED,
-    ERROR_WINHTTP_SECURE_CERT_CN_INVALID, ERROR_WINHTTP_SECURE_FAILURE,
-    ERROR_WINHTTP_SECURE_FAILURE_PROXY, ERROR_WINHTTP_SECURE_INVALID_CA,
-    ERROR_WINHTTP_SECURE_INVALID_CERT, ERROR_WINHTTP_TIMEOUT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-    WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_ASYNC_RESULT, WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS,
-    WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE, WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING,
-    WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE, WINHTTP_CALLBACK_STATUS_READ_COMPLETE,
-    WINHTTP_CALLBACK_STATUS_REQUEST_ERROR, WINHTTP_CALLBACK_STATUS_SECURE_FAILURE,
-    WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE, WINHTTP_DISABLE_COOKIES,
-    WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_ASYNC, WINHTTP_FLAG_SECURE,
-    WINHTTP_OPTION_CONTEXT_VALUE, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_OPTION_REDIRECT_POLICY,
-    WINHTTP_OPTION_REDIRECT_POLICY_NEVER, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_CUSTOM,
-    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpGetDefaultProxyConfiguration, WINHTTP_ACCESS_TYPE_NAMED_PROXY, WINHTTP_PROXY_INFO,
 };
 
 /// Default maximum response body size: 2 MiB.
@@ -70,7 +26,6 @@ pub const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_CONFIGURED_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u128 = 1_800_000;
 const MAX_REDIRECTS: u8 = 10;
-const MAX_URL_BYTES: usize = 8 * 1024;
 const MAX_LOCATION_BYTES: usize = 4 * 1024;
 /// ETag is an opaque validator; holiday-cn publishes short quoted tags. This
 /// cap matches the calendar cache's text limit.
@@ -81,16 +36,23 @@ const MAX_HEADERS: usize = 32;
 const MAX_HEADER_NAME_BYTES: usize = 64;
 const MAX_HEADER_VALUE_BYTES: usize = 1024;
 const MAX_BEARER_BYTES: usize = 4096;
-const READ_CHUNK_BYTES: usize = 8 * 1024;
 const USER_AGENT: &str = "ShiShi/1.0";
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
-const CLOSE_CALLBACK_WAIT: Duration = Duration::from_secs(1);
 
 /// HTTP method supported by this narrow transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HttpMethod {
     Get,
     Post,
+}
+
+impl HttpMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+        }
+    }
 }
 
 /// A caller-supplied request header.
@@ -120,8 +82,6 @@ pub struct HttpRequest<'a> {
     bearer_token: Option<&'a str>,
     body: Option<&'a [u8]>,
     cancellation: Option<&'a AtomicBool>,
-    #[cfg(test)]
-    test_probe: Option<Arc<TestProbe>>,
 }
 
 impl<'a> HttpRequest<'a> {
@@ -135,8 +95,6 @@ impl<'a> HttpRequest<'a> {
             bearer_token: None,
             body: None,
             cancellation: None,
-            #[cfg(test)]
-            test_probe: None,
         }
     }
 
@@ -152,8 +110,6 @@ impl<'a> HttpRequest<'a> {
             bearer_token: None,
             body: Some(body),
             cancellation: None,
-            #[cfg(test)]
-            test_probe: None,
         }
     }
 
@@ -175,9 +131,9 @@ impl<'a> HttpRequest<'a> {
 
     /// Observe a caller-owned cancellation flag.
     ///
-    /// WinHTTP runs asynchronously. While waiting for the network, this
+    /// While waiting for the network, this
     /// transport wakes at least every 20 ms, checks the flag, and on
-    /// cancellation closes the pending request to abort the operation. A
+    /// cancellation drops the pending request to abort the operation. A
     /// successful response whose body was fully read is returned even if the
     /// flag is set afterwards; a cancellation observed before completion
     /// returns [`HttpErrorKind::Cancelled`]. [`send`] blocks the calling
@@ -187,35 +143,21 @@ impl<'a> HttpRequest<'a> {
         self.cancellation = Some(flag);
         self
     }
-
-    #[cfg(test)]
-    fn test_probe(mut self, probe: Arc<TestProbe>) -> Self {
-        self.test_probe = Some(probe);
-        self
-    }
 }
 
-/// Finite transport limits.
-///
-/// `total_timeout` is one monotonic deadline for the whole call: DNS/proxy
-/// resolution, connect, request send, response headers, all body reads, and
-/// every same-origin redirect. It is enforced by the transport, not by native
-/// blocking timeouts. Values are 1 ms–30 minutes. `max_redirects` applies to
-/// GET only and is at most 10.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HttpConfig {
-    pub total_timeout: Duration,
-    pub max_response_bytes: usize,
-    pub max_redirects: u8,
-}
-
-impl Default for HttpConfig {
-    fn default() -> Self {
-        Self {
-            total_timeout: DEFAULT_TOTAL_TIMEOUT,
-            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
-            max_redirects: 3,
-        }
+crate::default_struct! {
+    /// Finite transport limits.
+    ///
+    /// `total_timeout` is one monotonic deadline for the whole call: DNS/proxy
+    /// resolution, connect, request send, response headers, all body reads, and
+    /// every same-origin redirect. It is enforced by the transport, not by native
+    /// blocking timeouts. Values are 1 ms–30 minutes. `max_redirects` applies to
+    /// GET only and is at most 10.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct HttpConfig {
+        pub total_timeout: Duration = DEFAULT_TOTAL_TIMEOUT,
+        pub max_response_bytes: usize = DEFAULT_MAX_RESPONSE_BYTES,
+        pub max_redirects: u8 = 3,
     }
 }
 
@@ -237,8 +179,21 @@ pub struct HttpResponse {
 }
 
 impl HttpResponse {
-    pub fn is_success(&self) -> bool {
-        (200..300).contains(&self.status)
+    pub fn new(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body,
+            etag: None,
+            last_modified: None,
+        }
+    }
+
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn body(&self) -> &[u8] {
+        &self.body
     }
 }
 
@@ -295,76 +250,42 @@ impl HttpErrorKind {
     }
 }
 
-/// Public transport error containing only a safe class and WinHTTP code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Public transport error containing only a safe class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("HTTP transport error: {}", .kind.as_str())]
 pub struct HttpError {
     kind: HttpErrorKind,
-    winhttp_code: Option<u32>,
 }
 
 impl HttpError {
     fn new(kind: HttpErrorKind) -> Self {
-        Self {
-            kind,
-            winhttp_code: None,
-        }
-    }
-
-    fn from_winhttp(code: u32) -> Self {
-        let kind = match code {
-            ERROR_WINHTTP_TIMEOUT => HttpErrorKind::Timeout,
-            ERROR_WINHTTP_OPERATION_CANCELLED => HttpErrorKind::Cancelled,
-            ERROR_WINHTTP_SECURE_CERT_CN_INVALID
-            | ERROR_WINHTTP_SECURE_FAILURE
-            | ERROR_WINHTTP_SECURE_FAILURE_PROXY
-            | ERROR_WINHTTP_SECURE_INVALID_CA
-            | ERROR_WINHTTP_SECURE_INVALID_CERT
-            | ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED
-            | ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED_PROXY
-            | ERROR_WINHTTP_CLIENT_CERT_NO_ACCESS_PRIVATE_KEY
-            | ERROR_WINHTTP_CLIENT_CERT_NO_PRIVATE_KEY => HttpErrorKind::Tls,
-            _ => HttpErrorKind::Network,
-        };
-        Self {
-            kind,
-            winhttp_code: Some(code),
-        }
-    }
-
-    fn from_winhttp_with_cancel(code: u32, cancellation: Option<&AtomicBool>) -> Self {
-        if is_cancelled(cancellation) {
-            HttpError::new(HttpErrorKind::Cancelled)
-        } else {
-            HttpError::from_winhttp(code)
-        }
+        Self { kind }
     }
 
     pub fn kind(&self) -> HttpErrorKind {
         self.kind
     }
-
-    /// Optional native WinHTTP error code. This is a safe diagnostic; it
-    /// contains no request data.
-    pub fn winhttp_code(&self) -> Option<u32> {
-        self.winhttp_code
-    }
 }
 
-impl fmt::Display for HttpError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.winhttp_code {
-            Some(code) => write!(
-                f,
-                "HTTP transport error: {} (WinHTTP {})",
-                self.kind.as_str(),
-                code
-            ),
-            None => write!(f, "HTTP transport error: {}", self.kind.as_str()),
+impl From<reqwest::Error> for HttpError {
+    fn from(error: reqwest::Error) -> Self {
+        use std::error::Error;
+        let mut source = error.source();
+        while let Some(cause) = source {
+            if cause.is::<native_tls::Error>() {
+                return Self::new(HttpErrorKind::Tls);
+            }
+            source = cause.source();
         }
+        Self::new(if error.is_timeout() {
+            HttpErrorKind::Timeout
+        } else if error.is_body() || error.is_decode() {
+            HttpErrorKind::Protocol
+        } else {
+            HttpErrorKind::Network
+        })
     }
 }
-
-impl std::error::Error for HttpError {}
 
 /// Send a request with production HTTPS-only policy and default limits.
 pub fn send(request: &HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
@@ -373,31 +294,22 @@ pub fn send(request: &HttpRequest<'_>) -> Result<HttpResponse, HttpError> {
 
 /// Send a request with production HTTPS-only policy and explicit limits.
 ///
-/// This blocks while the asynchronous WinHTTP request runs and is bounded by
+/// This blocks while the asynchronous request runs and is bounded by
 /// `config.total_timeout`. Call it outside the UI thread.
 pub fn send_with_config(
     request: &HttpRequest<'_>,
     config: &HttpConfig,
 ) -> Result<HttpResponse, HttpError> {
-    send_inner(request, config, false, &mut |_, _| {})
+    send_inner(request, config, false, None)
 }
 
-/// Incremental body delivery on the caller thread. The same overall deadline,
-/// byte cap, cancellation and HTTPS rules apply; no automatic resubmission.
-pub fn send_stream_with_config(
-    request: &HttpRequest<'_>,
-    config: &HttpConfig,
-    chunk: &mut dyn FnMut(u16, &[u8]),
-) -> Result<HttpResponse, HttpError> {
-    send_inner(request, config, false, chunk)
-}
 #[cfg(test)]
 pub(crate) fn send_stream_localhost_for_tests(
     request: &HttpRequest<'_>,
     config: &HttpConfig,
-    chunk: &mut dyn FnMut(u16, &[u8]),
+    chunk: &mut dyn FnMut(u16, &[u8]) -> bool,
 ) -> Result<HttpResponse, HttpError> {
-    send_inner(request, config, true, chunk)
+    send_inner(request, config, true, Some(chunk))
 }
 
 /// Test-only loopback HTTP entry point.
@@ -410,225 +322,153 @@ pub(crate) fn send_localhost_for_tests(
     request: &HttpRequest<'_>,
     config: &HttpConfig,
 ) -> Result<HttpResponse, HttpError> {
-    send_inner(request, config, true, &mut |_, _| {})
+    send_inner(request, config, true, None)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Scheme {
-    Https,
-    Http,
-}
-
-impl Scheme {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Https => "https",
-            Self::Http => "http",
-        }
-    }
-
-    fn default_port(self) -> u16 {
-        match self {
-            Self::Https => 443,
-            Self::Http => 80,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-struct ParsedUrl {
-    scheme: Scheme,
-    host: String,
-    port: u16,
-    path: String,
-}
-
-impl ParsedUrl {
-    fn parse(input: &str, allow_localhost_http: bool) -> Result<Self, HttpError> {
-        if input.is_empty()
-            || input.len() > MAX_URL_BYTES
-            || !input.is_ascii()
-            || input
-                .bytes()
-                .any(|byte| byte <= b' ' || byte == 0x7f || byte == b'\\')
-        {
-            return Err(HttpError::new(HttpErrorKind::InvalidUrl));
-        }
-        if input.contains('?') {
-            return Err(HttpError::new(HttpErrorKind::QueryNotAllowed));
-        }
-        if input.contains('#') {
-            return Err(HttpError::new(HttpErrorKind::FragmentNotAllowed));
-        }
-
-        let scheme_end = input
-            .find("://")
-            .ok_or_else(|| HttpError::new(HttpErrorKind::InvalidUrl))?;
-        let scheme_text = &input[..scheme_end];
-        let rest = &input[scheme_end + 3..];
-        let scheme = if scheme_text.eq_ignore_ascii_case("https") {
-            Scheme::Https
-        } else if scheme_text.eq_ignore_ascii_case("http") {
-            Scheme::Http
-        } else {
-            return Err(HttpError::new(HttpErrorKind::UnsupportedScheme));
-        };
-
-        let authority_end = rest.find('/').unwrap_or(rest.len());
-        let authority = &rest[..authority_end];
-        let path = if authority_end == rest.len() {
-            "/"
-        } else {
-            &rest[authority_end..]
-        };
-        if authority.is_empty() {
-            return Err(HttpError::new(HttpErrorKind::InvalidUrl));
-        }
-        if authority.contains('@') {
-            return Err(HttpError::new(HttpErrorKind::UserInfoNotAllowed));
-        }
-
-        let (host, port_text, ipv6_literal) =
-            if let Some(after_bracket) = authority.strip_prefix('[') {
-                let close = after_bracket
-                    .find(']')
-                    .ok_or_else(|| HttpError::new(HttpErrorKind::InvalidUrl))?;
-                let inner = &after_bracket[..close];
-                let suffix = &after_bracket[close + 1..];
-                let address: std::net::Ipv6Addr = inner
-                    .parse()
-                    .map_err(|_| HttpError::new(HttpErrorKind::InvalidUrl))?;
-                let port_text = if suffix.is_empty() {
-                    None
-                } else {
-                    Some(
-                        suffix
-                            .strip_prefix(':')
-                            .ok_or_else(|| HttpError::new(HttpErrorKind::InvalidUrl))?,
-                    )
-                };
-                (address.to_string(), port_text, true)
-            } else {
-                if authority.matches(':').count() > 1 {
-                    // Unbracketed IPv6 literals are ambiguous and rejected.
-                    return Err(HttpError::new(HttpErrorKind::InvalidUrl));
-                }
-                let (host, port_text) = match authority.split_once(':') {
-                    Some((host, port)) => (host, Some(port)),
-                    None => (authority, None),
-                };
-                if host.is_empty()
-                    || !host.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
-                    })
-                {
-                    return Err(HttpError::new(HttpErrorKind::InvalidUrl));
-                }
-                (host.to_ascii_lowercase(), port_text, false)
-            };
-
-        let port = match port_text {
-            None => scheme.default_port(),
-            Some(text) => {
-                if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(HttpError::new(HttpErrorKind::InvalidUrl));
-                }
-                let port: u32 = text
-                    .parse()
-                    .map_err(|_| HttpError::new(HttpErrorKind::InvalidUrl))?;
-                if !(1..=u16::MAX as u32).contains(&port) {
-                    return Err(HttpError::new(HttpErrorKind::InvalidUrl));
-                }
-                port as u16
-            }
-        };
-
-        if !path.starts_with('/') {
-            return Err(HttpError::new(HttpErrorKind::InvalidUrl));
-        }
-
-        if scheme == Scheme::Http {
-            if !allow_localhost_http {
-                return Err(HttpError::new(HttpErrorKind::UnsupportedScheme));
-            }
-            if !is_loopback_host(&host, ipv6_literal) {
-                return Err(HttpError::new(HttpErrorKind::UnsupportedScheme));
-            }
-        }
-
-        Ok(Self {
-            scheme,
-            host,
-            port,
-            path: path.to_string(),
+fn parse_url(input: &str, allow_localhost_http: bool) -> Result<ParsedUrl, HttpError> {
+    ParsedUrl::parse(input, allow_localhost_http).map_err(|error| {
+        use crate::endpoint::EndpointErrorKind as E;
+        HttpError::new(match error.kind() {
+            E::UnsupportedScheme => HttpErrorKind::UnsupportedScheme,
+            E::UserInfo => HttpErrorKind::UserInfoNotAllowed,
+            E::Query => HttpErrorKind::QueryNotAllowed,
+            E::Fragment => HttpErrorKind::FragmentNotAllowed,
+            _ => HttpErrorKind::InvalidUrl,
         })
-    }
-
-    fn same_origin(&self, other: &Self) -> bool {
-        self.scheme == other.scheme
-            && self.host.eq_ignore_ascii_case(&other.host)
-            && self.port == other.port
-    }
+    })
 }
 
-fn is_loopback_host(host: &str, _ipv6_literal: bool) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false)
-}
-
-fn send_inner(
+pub(crate) fn send_inner(
     request: &HttpRequest<'_>,
     config: &HttpConfig,
     allow_localhost_http: bool,
-    chunk: &mut dyn FnMut(u16, &[u8]),
+    mut chunk: Option<&mut dyn FnMut(u16, &[u8]) -> bool>,
 ) -> Result<HttpResponse, HttpError> {
     validate_config(config)?;
     validate_request(request)?;
-
-    let mut url = ParsedUrl::parse(request.url, allow_localhost_http)?;
-    let header_block = build_header_block(request);
-    let header_wide = wide(&header_block);
+    let mut url = parse_url(request.url, allow_localhost_http)?;
     let deadline = Instant::now() + config.total_timeout;
-    let mut redirects = 0u8;
-
-    loop {
-        check_cancelled(request.cancellation)?;
-        if Instant::now() >= deadline {
-            return Err(HttpError::new(HttpErrorKind::Timeout));
-        }
-        let single = execute_once(
-            request,
-            &url,
-            &header_wide,
-            config,
-            allow_localhost_http,
-            deadline,
-            chunk,
-        )?;
-
-        if request.method == HttpMethod::Get && is_redirect_status(single.status) {
-            if redirects >= config.max_redirects {
-                return Err(HttpError::new(HttpErrorKind::RedirectRejected));
+    check_cancelled(request.cancellation)?;
+    let proxy = if allow_localhost_http {
+        None
+    } else {
+        system_proxy(&url)?
+    };
+    let runtime = runtime()?;
+    runtime.block_on(async {
+        let client = pooled_client(proxy)?;
+        for redirects in 0..=config.max_redirects {
+            let host = if url.host.contains(':') {
+                format!("[{}]", url.host)
+            } else {
+                url.host.clone()
+            };
+            let target = format!(
+                "{}://{}:{}{}",
+                url.scheme.as_str(),
+                host,
+                url.port,
+                url.path
+            );
+            let method = match request.method {
+                HttpMethod::Get => reqwest::Method::GET,
+                HttpMethod::Post => reqwest::Method::POST,
+            };
+            let mut pending = client.request(method, target);
+            for header in &request.headers {
+                pending = pending.header(header.name, header.value);
             }
-            let location = single
-                .location
-                .ok_or_else(|| HttpError::new(HttpErrorKind::RedirectRejected))?;
-            let next = resolve_redirect(&url, &location, allow_localhost_http)?;
-            url = next;
-            redirects += 1;
-            continue;
+            if let Some(token) = request.bearer_token {
+                pending = pending.bearer_auth(token);
+            }
+            if let Some(body) = request.body {
+                pending = pending.body(body.to_vec());
+            }
+            let mut response = guarded(pending.send(), deadline, request.cancellation).await?;
+            let status = response.status().as_u16();
+            if request.method == HttpMethod::Get && is_redirect_status(status) {
+                let location = response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| {
+                        value.len() <= MAX_LOCATION_BYTES && redirects < config.max_redirects
+                    })
+                    .ok_or_else(|| HttpError::new(HttpErrorKind::RedirectRejected))?;
+                url = resolve_redirect(&url, location, allow_localhost_http)?;
+                continue;
+            }
+            let etag = cache_header(response.headers(), "etag", MAX_ETAG_BYTES, is_valid_etag);
+            let last_modified = cache_header(
+                response.headers(),
+                "last-modified",
+                MAX_LAST_MODIFIED_BYTES,
+                is_valid_http_date,
+            );
+            let retain = chunk.is_none() || !(200..300).contains(&status);
+            if retain
+                && response
+                    .content_length()
+                    .is_some_and(|n| n > config.max_response_bytes as u64)
+            {
+                return Err(HttpError::new(HttpErrorKind::ResponseTooLarge));
+            }
+            let mut body = Vec::new();
+            while let Some(bytes) =
+                guarded(response.chunk(), deadline, request.cancellation).await?
+            {
+                if retain {
+                    if bytes.len() > config.max_response_bytes.saturating_sub(body.len()) {
+                        return Err(HttpError::new(HttpErrorKind::ResponseTooLarge));
+                    }
+                    body.extend_from_slice(&bytes);
+                }
+                if chunk
+                    .as_mut()
+                    .is_some_and(|consume| !consume(status, &bytes))
+                {
+                    return Err(HttpError::new(HttpErrorKind::Protocol));
+                }
+            }
+            return Ok(HttpResponse {
+                status,
+                body,
+                etag,
+                last_modified,
+            });
         }
+        Err(HttpError::new(HttpErrorKind::RedirectRejected))
+    })
+}
 
-        return Ok(HttpResponse {
-            status: single.status,
-            body: single.body,
-            etag: single.etag,
-            last_modified: single.last_modified,
-        });
+async fn guarded<T>(
+    future: impl Future<Output = Result<T, reqwest::Error>>,
+    deadline: Instant,
+    cancellation: Option<&AtomicBool>,
+) -> Result<T, HttpError> {
+    tokio::pin!(future);
+    loop {
+        check_cancelled(cancellation)?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| HttpError::new(HttpErrorKind::Timeout))?;
+        tokio::select! {
+            result = &mut future => return result.map_err(HttpError::from),
+            _ = tokio::time::sleep(remaining.min(CANCEL_POLL_INTERVAL)) => {}
+        }
     }
+}
+
+fn cache_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &str,
+    max_bytes: usize,
+    validate: fn(&str) -> bool,
+) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?.trim_matches([' ', '\t']);
+    (!value.is_empty() && value.len() <= max_bytes && value.is_ascii() && validate(value))
+        .then(|| value.to_owned())
 }
 
 fn validate_config(config: &HttpConfig) -> Result<(), HttpError> {
@@ -719,22 +559,6 @@ fn is_reserved_header_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case("expect")
 }
 
-fn build_header_block(request: &HttpRequest<'_>) -> String {
-    let mut headers = String::new();
-    for header in &request.headers {
-        headers.push_str(header.name);
-        headers.push_str(": ");
-        headers.push_str(header.value);
-        headers.push_str("\r\n");
-    }
-    if let Some(token) = request.bearer_token {
-        headers.push_str("Authorization: Bearer ");
-        headers.push_str(token);
-        headers.push_str("\r\n");
-    }
-    headers
-}
-
 fn is_redirect_status(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
@@ -763,13 +587,13 @@ fn resolve_redirect(
     let next = if starts_with_ascii_case(location, "https://")
         || starts_with_ascii_case(location, "http://")
     {
-        ParsedUrl::parse(location, allow_localhost_http)
+        parse_url(location, allow_localhost_http)
             .map_err(|_| HttpError::new(HttpErrorKind::RedirectRejected))?
     } else if has_unsupported_absolute_scheme(location) {
         return Err(HttpError::new(HttpErrorKind::RedirectRejected));
     } else if let Some(scheme_relative) = location.strip_prefix("//") {
         let absolute = format!("{}://{}", current.scheme.as_str(), scheme_relative);
-        ParsedUrl::parse(&absolute, allow_localhost_http)
+        parse_url(&absolute, allow_localhost_http)
             .map_err(|_| HttpError::new(HttpErrorKind::RedirectRejected))?
     } else if location.starts_with('/') {
         let mut next = current.clone();
@@ -844,860 +668,121 @@ fn is_cancelled(cancellation: Option<&AtomicBool>) -> bool {
         .unwrap_or(false)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AsyncEvent {
-    SendComplete,
-    HeadersAvailable,
-    DataAvailable(u32),
-    ReadComplete(u32),
-    RequestError(u32),
-    SecureFailure,
+fn runtime() -> Result<&'static tokio::runtime::Runtime, HttpError> {
+    static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, HttpError>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("shishi-http")
+                .build()
+                .map_err(|_| HttpError::new(HttpErrorKind::Network))
+        })
+        .as_ref()
+        .map_err(|error| *error)
 }
 
-struct AsyncInner {
-    event: Option<AsyncEvent>,
-    /// Handles that own the callback context. Only the request handle receives
-    /// the context, so this is 0 or 1; the counter keeps the final-callback
-    /// rule explicit.
-    attached_handles: usize,
-    closed_handles: usize,
-}
-
-/// Test-only accounting probe. It observes exactly when the callback-owned
-/// state (including request body and read buffer) is released.
-#[cfg(test)]
-#[derive(Default)]
-struct TestProbe {
-    released: AtomicUsize,
-    delay_closing: AtomicBool,
-}
-
-#[cfg(test)]
-impl TestProbe {
-    fn released(&self) -> usize {
-        self.released.load(Ordering::SeqCst)
+fn pooled_client(proxy: Option<String>) -> Result<reqwest::Client, HttpError> {
+    // Bound retained pools even when Windows proxy settings change repeatedly.
+    static CLIENTS: Mutex<Vec<(Option<String>, reqwest::Client)>> = Mutex::new(Vec::new());
+    let mut clients = CLIENTS.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some((_, client)) = clients.iter().find(|(key, _)| key == &proxy) {
+        return Ok(client.clone());
     }
-
-    fn set_delay_closing(&self) {
-        self.delay_closing.store(true, Ordering::SeqCst);
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .referer(false)
+        .http1_only()
+        .user_agent(USER_AGENT)
+        .pool_max_idle_per_host(2);
+    if let Some(address) = &proxy {
+        builder = builder.proxy(reqwest::Proxy::all(address).map_err(HttpError::from)?);
     }
-
-    fn maybe_delay_closing(&self) {
-        if self.delay_closing.load(Ordering::SeqCst) {
-            // Longer than CLOSE_CALLBACK_WAIT to model a late final callback.
-            std::thread::sleep(CLOSE_CALLBACK_WAIT + Duration::from_millis(200));
-        }
+    let client = builder.build().map_err(HttpError::from)?;
+    if clients.len() == 4 {
+        clients.remove(0);
     }
+    clients.push((proxy, client.clone()));
+    Ok(client)
 }
 
-/// Callback state and native buffers.
-///
-/// WinHTTP may deliver callbacks until the final `HANDLE_CLOSING` notification
-/// for the request handle. The request body and read buffer therefore live here
-/// rather than on the calling stack. Only the request handle carries this
-/// context value; session and connection handles keep a zero context so their
-/// later callbacks cannot reach this state.
-struct AsyncState {
-    inner: Mutex<AsyncInner>,
-    ready: Condvar,
-    request_body: Option<Box<[u8]>>,
-    read_buffer: Mutex<Box<[u8]>>,
-    #[cfg(test)]
-    test_probe: Option<Arc<TestProbe>>,
-}
-
-impl AsyncState {
-    fn new(request_body: Option<Box<[u8]>>) -> Self {
-        Self {
-            inner: Mutex::new(AsyncInner {
-                event: None,
-                attached_handles: 0,
-                closed_handles: 0,
-            }),
-            ready: Condvar::new(),
-            request_body,
-            read_buffer: Mutex::new(vec![0u8; READ_CHUNK_BYTES].into_boxed_slice()),
-            #[cfg(test)]
-            test_probe: None,
-        }
+fn system_proxy(url: &ParsedUrl) -> Result<Option<String>, HttpError> {
+    let mut info: WINHTTP_PROXY_INFO = unsafe { std::mem::zeroed() };
+    if unsafe { WinHttpGetDefaultProxyConfiguration(&mut info) } == 0 {
+        return Err(HttpError::new(HttpErrorKind::Network));
     }
-
-    #[cfg(test)]
-    fn new_with_probe(request_body: Option<Box<[u8]>>, probe: Option<Arc<TestProbe>>) -> Self {
-        let mut state = Self::new(request_body);
-        state.test_probe = probe;
-        state
+    // WinHTTP returns two independently allocated, null-terminated strings.
+    unsafe fn take_string(ptr: *mut u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut len = 0;
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let value = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+        GlobalFree(ptr.cast());
+        value
     }
-}
-
-impl Drop for AsyncState {
-    fn drop(&mut self) {
-        #[cfg(test)]
-        if let Some(probe) = &self.test_probe {
-            probe.released.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-}
-
-fn lock_state(state: &AsyncState) -> MutexGuard<'_, AsyncInner> {
-    state
-        .inner
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-unsafe extern "system" fn status_callback(
-    _handle: *mut c_void,
-    context: usize,
-    status: u32,
-    information: *mut c_void,
-    information_length: u32,
-) {
-    if context == 0 {
-        return;
-    }
-    let state = unsafe { &*(context as *const AsyncState) };
-    #[cfg(test)]
-    if status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING {
-        if let Some(probe) = &state.test_probe {
-            probe.maybe_delay_closing();
-        }
-    }
-    let mut release_native = false;
-    let mut inner = lock_state(state);
-    match status {
-        WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE => {
-            inner.event = Some(AsyncEvent::SendComplete);
-        }
-        WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE => {
-            inner.event = Some(AsyncEvent::HeadersAvailable);
-        }
-        WINHTTP_CALLBACK_STATUS_DATA_AVAILABLE => {
-            let available = if information.is_null() {
-                0
-            } else {
-                unsafe { *(information as *const u32) }
-            };
-            inner.event = Some(AsyncEvent::DataAvailable(available));
-        }
-        WINHTTP_CALLBACK_STATUS_READ_COMPLETE => {
-            inner.event = Some(AsyncEvent::ReadComplete(information_length));
-        }
-        WINHTTP_CALLBACK_STATUS_REQUEST_ERROR => {
-            let code = if information.is_null() {
-                0
-            } else {
-                unsafe { (*(information as *const WINHTTP_ASYNC_RESULT)).dwError }
-            };
-            inner.event = Some(AsyncEvent::RequestError(code));
-        }
-        WINHTTP_CALLBACK_STATUS_SECURE_FAILURE => {
-            inner.event = Some(AsyncEvent::SecureFailure);
-        }
-        WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING if inner.attached_handles != 0 => {
-            inner.closed_handles += 1;
-            if inner.closed_handles == inner.attached_handles {
-                // This is the last callback that can access the state.
-                release_native = true;
-            }
-        }
-        _ => {}
-    }
-    // Notify while still holding the mutex. The owner may free the state after
-    // observing the final closing callback; no access to `state` may happen
-    // after this guard is released.
-    state.ready.notify_all();
-    drop(inner);
-    if release_native {
-        // The raw strong reference created in execute_once is the native-side
-        // ownership of the state. Releasing it here keeps the body, read
-        // buffer, and state alive until WinHTTP's final request callback.
-        unsafe {
-            drop(Arc::from_raw(context as *const AsyncState));
-        }
-    }
-}
-
-fn wait_for_event(
-    state: &AsyncState,
-    deadline: Instant,
-    cancellation: Option<&AtomicBool>,
-) -> Result<AsyncEvent, HttpError> {
-    let mut inner = lock_state(state);
-    loop {
-        if let Some(event) = inner.event.take() {
-            return Ok(event);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(HttpError::new(HttpErrorKind::Timeout));
-        }
-        if is_cancelled(cancellation) {
-            return Err(HttpError::new(HttpErrorKind::Cancelled));
-        }
-        let wait = (deadline - now).min(CANCEL_POLL_INTERVAL);
-        let (next, _) = state
-            .ready
-            .wait_timeout(inner, wait)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner = next;
-    }
-}
-
-fn wait_for_close(state: &AsyncState, expected: usize) -> bool {
-    if expected == 0 {
-        return true;
-    }
-    let deadline = Instant::now() + CLOSE_CALLBACK_WAIT;
-    let mut inner = lock_state(state);
-    while inner.closed_handles < expected {
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let (next, _) = state
-            .ready
-            .wait_timeout(inner, deadline - now)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner = next;
-    }
-    true
-}
-
-fn close_handles(handles: &mut Vec<*mut c_void>) {
-    for raw in handles.drain(..).rev() {
-        unsafe {
-            WinHttpCloseHandle(raw);
-        }
-    }
-}
-
-/// Owns all created native handles until cleanup. Its `Drop` also closes
-/// handles if the operation unwinds, so a panic cannot leak open handles or
-/// release the callback state before the final `HANDLE_CLOSING` notification.
-struct HandleCleanup<'a> {
-    state: &'a Arc<AsyncState>,
-    native_state: *const AsyncState,
-    handles: Vec<*mut c_void>,
-    finished: bool,
-}
-
-impl HandleCleanup<'_> {
-    fn finish(&mut self) -> bool {
-        if self.finished {
-            return true;
-        }
-        self.finished = true;
-        let expected = lock_state(self.state).attached_handles;
-        close_handles(&mut self.handles);
-        let cleaned = wait_for_close(self.state, expected);
-        if expected == 0 {
-            // No handle stored the context value, so no callback can reference
-            // it. Reclaim the native-side strong reference immediately.
-            unsafe {
-                drop(Arc::from_raw(self.native_state));
-            }
-        }
-        cleaned
-    }
-}
-
-impl Drop for HandleCleanup<'_> {
-    fn drop(&mut self) {
-        let _ = self.finish();
-    }
-}
-
-struct SingleResponse {
-    status: u16,
-    body: Vec<u8>,
-    etag: Option<String>,
-    last_modified: Option<String>,
-    location: Option<String>,
-}
-
-fn execute_once(
-    request: &HttpRequest<'_>,
-    url: &ParsedUrl,
-    header_wide: &[u16],
-    config: &HttpConfig,
-    allow_localhost_http: bool,
-    deadline: Instant,
-    chunk: &mut dyn FnMut(u16, &[u8]),
-) -> Result<SingleResponse, HttpError> {
-    let cancellation = request.cancellation;
-    check_cancelled(cancellation)?;
-
-    let request_body = request.body.map(|bytes| bytes.to_vec().into_boxed_slice());
-    #[cfg(test)]
-    let state = Arc::new(AsyncState::new_with_probe(
-        request_body,
-        request.test_probe.clone(),
-    ));
-    #[cfg(not(test))]
-    let state = Arc::new(AsyncState::new(request_body));
-    // One native-side strong reference. It is released exactly once by the
-    // final request-handle HANDLE_CLOSING callback, or reclaimed here if no
-    // handle ever stored the context value.
-    let native_state = Arc::into_raw(Arc::clone(&state));
-    let mut cleanup = HandleCleanup {
-        state: &state,
-        native_state,
-        handles: Vec::new(),
-        finished: false,
-    };
-    let result = run_async(
-        request.method,
-        url,
-        header_wide,
-        cancellation,
-        config,
-        allow_localhost_http,
-        deadline,
-        &state,
-        native_state as usize,
-        &mut cleanup.handles,
-        chunk,
-    );
-    // On a late final callback this returns false after closing the handles;
-    // the callback still owns the state and releases it when it arrives. There
-    // is no explicit leak and no detached cleanup thread.
-    let _ = cleanup.finish();
-    result
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_async(
-    method: HttpMethod,
-    url: &ParsedUrl,
-    header_wide: &[u16],
-    cancellation: Option<&AtomicBool>,
-    config: &HttpConfig,
-    allow_localhost_http: bool,
-    deadline: Instant,
-    state: &Arc<AsyncState>,
-    context: usize,
-    handles: &mut Vec<*mut c_void>,
-    chunk: &mut dyn FnMut(u16, &[u8]),
-) -> Result<SingleResponse, HttpError> {
-    let agent = wide(USER_AGENT);
-    let access_type = if allow_localhost_http && url.scheme == Scheme::Http {
-        WINHTTP_ACCESS_TYPE_NO_PROXY
+    let proxy = unsafe { take_string(info.lpszProxy) };
+    let bypass = unsafe { take_string(info.lpszProxyBypass) };
+    Ok(if info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY {
+        proxy_for(url, &proxy, &bypass)
     } else {
-        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
-    };
-    let session = unsafe {
-        WinHttpOpen(
-            agent.as_ptr(),
-            access_type,
-            null(),
-            null(),
-            WINHTTP_FLAG_ASYNC,
-        )
-    };
-    if session.is_null() {
-        return Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ));
-    }
-    handles.push(session);
-    // WinHTTP otherwise retains its shorter default receive timeout, cutting
-    // off non-streaming reasoning before our monotonic request deadline.
-    let native_timeout = deadline
-        .saturating_duration_since(Instant::now())
-        .as_millis()
-        .clamp(1, i32::MAX as u128) as i32;
-    if unsafe {
-        WinHttpSetTimeouts(
-            session,
-            native_timeout,
-            native_timeout,
-            native_timeout,
-            native_timeout,
-        )
-    } == 0
-    {
-        return Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ));
-    }
-    install_status_callback(session, cancellation)?;
-
-    let host_wide = wide(&url.host);
-    let connection = unsafe { WinHttpConnect(session, host_wide.as_ptr(), url.port, 0) };
-    if connection.is_null() {
-        return Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ));
-    }
-    handles.push(connection);
-
-    let verb = wide(match method {
-        HttpMethod::Get => "GET",
-        HttpMethod::Post => "POST",
-    });
-    let path_wide = wide(&url.path);
-    let flags = if url.scheme == Scheme::Https {
-        WINHTTP_FLAG_SECURE
-    } else {
-        0
-    };
-    let request = unsafe {
-        WinHttpOpenRequest(
-            connection,
-            verb.as_ptr(),
-            path_wide.as_ptr(),
-            null(),
-            null(),
-            null(),
-            flags,
-        )
-    };
-    if request.is_null() {
-        return Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ));
-    }
-    handles.push(request);
-    attach_context(request, context, cancellation, state)?;
-
-    // WINHTTP_OPTION_DISABLE_FEATURE is valid only on request handles. Both
-    // redirect controls are set before sending; a failure aborts the request
-    // rather than risking an automatic cross-origin or downgrade redirect.
-    let disabled_features = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES;
-    set_u32_option(
-        request,
-        WINHTTP_OPTION_DISABLE_FEATURE,
-        disabled_features,
-        cancellation,
-    )?;
-    set_u32_option(
-        request,
-        WINHTTP_OPTION_REDIRECT_POLICY,
-        WINHTTP_OPTION_REDIRECT_POLICY_NEVER,
-        cancellation,
-    )?;
-
-    check_cancelled(cancellation)?;
-    if Instant::now() >= deadline {
-        return Err(HttpError::new(HttpErrorKind::Timeout));
-    }
-
-    let headers_len = if header_wide.len() > 1 {
-        (header_wide.len() - 1) as u32
-    } else {
-        0
-    };
-    let headers_ptr = if headers_len == 0 {
-        null()
-    } else {
-        header_wide.as_ptr()
-    };
-    let (body_ptr, body_len) = match state.request_body.as_deref() {
-        Some(body) => (body.as_ptr() as *const c_void, body.len() as u32),
-        None => (null(), 0),
-    };
-    let sent = unsafe {
-        WinHttpSendRequest(
-            request,
-            headers_ptr,
-            headers_len,
-            body_ptr,
-            body_len,
-            body_len,
-            context,
-        )
-    };
-    if sent == 0 {
-        return Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ));
-    }
-    match wait_for_event(state, deadline, cancellation)? {
-        AsyncEvent::SendComplete => {}
-        AsyncEvent::RequestError(code) => {
-            return Err(HttpError::from_winhttp_with_cancel(code, cancellation));
-        }
-        AsyncEvent::SecureFailure => return Err(HttpError::new(HttpErrorKind::Tls)),
-        _ => return Err(HttpError::new(HttpErrorKind::Protocol)),
-    }
-
-    check_cancelled(cancellation)?;
-    if unsafe { WinHttpReceiveResponse(request, null_mut()) } == 0 {
-        return Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ));
-    }
-    match wait_for_event(state, deadline, cancellation)? {
-        AsyncEvent::HeadersAvailable => {}
-        AsyncEvent::RequestError(code) => {
-            return Err(HttpError::from_winhttp_with_cancel(code, cancellation));
-        }
-        AsyncEvent::SecureFailure => return Err(HttpError::new(HttpErrorKind::Tls)),
-        _ => return Err(HttpError::new(HttpErrorKind::Protocol)),
-    }
-
-    let status = query_status(request)?;
-
-    if method == HttpMethod::Get && is_redirect_status(status) {
-        let location = query_location(request)?
-            .ok_or_else(|| HttpError::new(HttpErrorKind::RedirectRejected))?;
-        return Ok(SingleResponse {
-            status,
-            body: Vec::new(),
-            etag: None,
-            last_modified: None,
-            location: Some(location),
-        });
-    }
-
-    if let Some(length) = query_content_length(request) {
-        if length as usize > config.max_response_bytes {
-            return Err(HttpError::new(HttpErrorKind::ResponseTooLarge));
-        }
-    }
-
-    // Optional cache validators are deliberately non-fatal: an absent,
-    // oversized, or malformed value becomes `None` so it cannot break an
-    // otherwise valid response.
-    let etag = query_cache_header(request, "ETag", MAX_ETAG_BYTES, is_valid_etag);
-    let last_modified = query_cache_header(
-        request,
-        "Last-Modified",
-        MAX_LAST_MODIFIED_BYTES,
-        is_valid_http_date,
-    );
-
-    let mut read_buffer = state
-        .read_buffer
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut response_body = Vec::new();
-    loop {
-        check_cancelled(cancellation)?;
-        if Instant::now() >= deadline {
-            return Err(HttpError::new(HttpErrorKind::Timeout));
-        }
-        // In asynchronous mode the out parameter must be NULL; the callback
-        // reports how many bytes are available.
-        if unsafe { WinHttpQueryDataAvailable(request, null_mut()) } == 0 {
-            return Err(HttpError::from_winhttp_with_cancel(
-                unsafe { GetLastError() },
-                cancellation,
-            ));
-        }
-        let available = match wait_for_event(state, deadline, cancellation)? {
-            AsyncEvent::DataAvailable(available) => available,
-            AsyncEvent::RequestError(code) => {
-                return Err(HttpError::from_winhttp_with_cancel(code, cancellation));
-            }
-            AsyncEvent::SecureFailure => return Err(HttpError::new(HttpErrorKind::Tls)),
-            _ => return Err(HttpError::new(HttpErrorKind::Protocol)),
-        };
-        if available == 0 {
-            break;
-        }
-
-        let to_read = available.min(read_buffer.len() as u32);
-        // In asynchronous mode the bytes-read out parameter must be NULL; the
-        // callback reports the actual count.
-        if unsafe {
-            WinHttpReadData(
-                request,
-                read_buffer.as_mut_ptr() as *mut c_void,
-                to_read,
-                null_mut(),
-            )
-        } == 0
-        {
-            return Err(HttpError::from_winhttp_with_cancel(
-                unsafe { GetLastError() },
-                cancellation,
-            ));
-        }
-        let read = match wait_for_event(state, deadline, cancellation)? {
-            AsyncEvent::ReadComplete(read) => read,
-            AsyncEvent::RequestError(code) => {
-                return Err(HttpError::from_winhttp_with_cancel(code, cancellation));
-            }
-            AsyncEvent::SecureFailure => return Err(HttpError::new(HttpErrorKind::Tls)),
-            _ => return Err(HttpError::new(HttpErrorKind::Protocol)),
-        };
-        if read == 0 {
-            break;
-        }
-        if read as usize > read_buffer.len() {
-            return Err(HttpError::new(HttpErrorKind::Protocol));
-        }
-        match response_body.len().checked_add(read as usize) {
-            Some(length) if length <= config.max_response_bytes => {}
-            _ => return Err(HttpError::new(HttpErrorKind::ResponseTooLarge)),
-        }
-        chunk(status, &read_buffer[..read as usize]);
-        response_body.extend_from_slice(&read_buffer[..read as usize]);
-    }
-
-    // No cancellation check here by design: EOF means the response is already
-    // complete. A flag set after this point must not turn a completed response
-    // into a cancellation error.
-    Ok(SingleResponse {
-        status,
-        body: response_body,
-        etag,
-        last_modified,
-        location: None,
+        None
     })
 }
 
-fn install_status_callback(
-    session: *mut c_void,
-    cancellation: Option<&AtomicBool>,
-) -> Result<(), HttpError> {
-    let previous = unsafe {
-        WinHttpSetStatusCallback(
-            session,
-            Some(status_callback),
-            WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS,
-            0,
-        )
-    };
-    if previous.map(|callback| callback as usize) == Some(usize::MAX) {
-        return Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ));
+fn proxy_for(url: &ParsedUrl, proxy: &str, bypass: &str) -> Option<String> {
+    fn entries(text: &str) -> impl Iterator<Item = &str> {
+        text.split(|c: char| c == ';' || c.is_ascii_whitespace())
+            .filter(|s| !s.is_empty())
     }
-    Ok(())
-}
-
-/// Publish `context` on the request handle and count it as an owner.
-///
-/// Only the request handle receives the context. Session and connection
-/// callbacks therefore carry a zero context and cannot outlive the request
-/// state. The count is incremented before the option is published so a final
-/// callback cannot race the accounting; it is rolled back if publishing fails.
-fn attach_context(
-    handle: *mut c_void,
-    context: usize,
-    cancellation: Option<&AtomicBool>,
-    state: &AsyncState,
-) -> Result<(), HttpError> {
-    {
-        let mut inner = lock_state(state);
-        inner.attached_handles += 1;
-    }
-    let ok = unsafe {
-        WinHttpSetOption(
-            handle,
-            WINHTTP_OPTION_CONTEXT_VALUE,
-            &context as *const usize as *const c_void,
-            std::mem::size_of::<usize>() as u32,
-        )
-    };
-    if ok == 0 {
-        let mut inner = lock_state(state);
-        inner.attached_handles = inner.attached_handles.saturating_sub(1);
-        Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn set_u32_option(
-    handle: *mut c_void,
-    option: u32,
-    value: u32,
-    cancellation: Option<&AtomicBool>,
-) -> Result<(), HttpError> {
-    let ok = unsafe {
-        WinHttpSetOption(
-            handle,
-            option,
-            &value as *const u32 as *const c_void,
-            std::mem::size_of::<u32>() as u32,
-        )
-    };
-    if ok == 0 {
-        Err(HttpError::from_winhttp_with_cancel(
-            unsafe { GetLastError() },
-            cancellation,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn query_status(handle: *mut c_void) -> Result<u16, HttpError> {
-    let mut status: u32 = 0;
-    let mut length = std::mem::size_of::<u32>() as u32;
-    let ok = unsafe {
-        WinHttpQueryHeaders(
-            handle,
-            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            null(),
-            &mut status as *mut u32 as *mut c_void,
-            &mut length,
-            null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(HttpError::from_winhttp(unsafe { GetLastError() }));
-    }
-    if !(100..=599).contains(&status) {
-        return Err(HttpError::new(HttpErrorKind::Protocol));
-    }
-    Ok(status as u16)
-}
-
-fn query_content_length(handle: *mut c_void) -> Option<u32> {
-    let mut length: u32 = 0;
-    let mut size = std::mem::size_of::<u32>() as u32;
-    let ok = unsafe {
-        WinHttpQueryHeaders(
-            handle,
-            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER,
-            null(),
-            &mut length as *mut u32 as *mut c_void,
-            &mut size,
-            null_mut(),
-        )
-    };
-    if ok == 0 {
-        None
-    } else {
-        Some(length)
-    }
-}
-
-fn query_location(handle: *mut c_void) -> Result<Option<String>, HttpError> {
-    let mut required_bytes: u32 = 0;
-    let ok = unsafe {
-        WinHttpQueryHeaders(
-            handle,
-            WINHTTP_QUERY_LOCATION,
-            null(),
-            null_mut(),
-            &mut required_bytes,
-            null_mut(),
-        )
-    };
-    if ok == 0 {
-        let code = unsafe { GetLastError() };
-        if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
-            return Ok(None);
-        }
-        if code != ERROR_INSUFFICIENT_BUFFER {
-            return Err(HttpError::from_winhttp(code));
-        }
-    }
-    if required_bytes as usize > MAX_LOCATION_BYTES + 2 {
-        return Err(HttpError::new(HttpErrorKind::RedirectRejected));
-    }
-    if required_bytes == 0 {
-        return Ok(Some(String::new()));
-    }
-
-    let units = (required_bytes as usize).div_ceil(2) + 1;
-    let mut buffer = vec![0u16; units];
-    let mut buffer_bytes = (buffer.len() * 2) as u32;
-    let ok = unsafe {
-        WinHttpQueryHeaders(
-            handle,
-            WINHTTP_QUERY_LOCATION,
-            null(),
-            buffer.as_mut_ptr() as *mut c_void,
-            &mut buffer_bytes,
-            null_mut(),
-        )
-    };
-    if ok == 0 {
-        let code = unsafe { GetLastError() };
-        if code == ERROR_INSUFFICIENT_BUFFER {
-            return Err(HttpError::new(HttpErrorKind::RedirectRejected));
-        }
-        return Err(HttpError::from_winhttp(code));
-    }
-
-    let used_units = ((buffer_bytes as usize).min(buffer.len() * 2) / 2).min(buffer.len());
-    let value = String::from_utf16_lossy(&buffer[..used_units]);
-    let value = value.trim_end_matches('\0').to_string();
-    if value.len() > MAX_LOCATION_BYTES {
-        return Err(HttpError::new(HttpErrorKind::RedirectRejected));
-    }
-    Ok(Some(value))
-}
-
-/// Query a named response header and return a validated, bounded value.
-///
-/// Missing headers, native query failures, oversized values, and malformed
-/// values all return `None`: these validators are optional hints, so a server
-/// cannot turn a bad cache header into a failed body fetch. No header value is
-/// ever placed in an error or log message.
-fn query_cache_header(
-    handle: *mut c_void,
-    name: &str,
-    max_bytes: usize,
-    validate: fn(&str) -> bool,
-) -> Option<String> {
-    let name_wide = wide(name);
-    let mut required_bytes: u32 = 0;
-    let ok = unsafe {
-        WinHttpQueryHeaders(
-            handle,
-            WINHTTP_QUERY_CUSTOM,
-            name_wide.as_ptr(),
-            null_mut(),
-            &mut required_bytes,
-            null_mut(),
-        )
-    };
-    if ok == 0 {
-        let code = unsafe { GetLastError() };
-        if code == ERROR_WINHTTP_HEADER_NOT_FOUND {
-            return None;
-        }
-        if code != ERROR_INSUFFICIENT_BUFFER {
-            return None;
-        }
-    }
-    if required_bytes == 0 || required_bytes as usize > max_bytes * 2 + 2 {
+    if entries(bypass).any(|pattern| {
+        (pattern.eq_ignore_ascii_case("<local>") && !url.host.contains('.'))
+            || wildcard_matches(&pattern.to_ascii_lowercase(), &url.host)
+    }) {
         return None;
     }
+    // Like WinHTTP, select the first applicable entry; never replay a request
+    // against alternate proxies or fall back to direct access after a failure.
+    entries(proxy).find_map(|entry| {
+        let address = match entry.split_once('=') {
+            Some((scheme, address)) if scheme.eq_ignore_ascii_case(url.scheme.as_str()) => address,
+            Some(_) => return None,
+            None => entry,
+        };
+        Some(if address.contains("://") {
+            address.to_owned()
+        } else {
+            format!("http://{address}")
+        })
+    })
+}
 
-    let units = ((required_bytes as usize).div_ceil(2) + 1).min(max_bytes + 2);
-    let mut buffer = vec![0u16; units];
-    let mut buffer_bytes = (buffer.len() * 2) as u32;
-    let ok = unsafe {
-        WinHttpQueryHeaders(
-            handle,
-            WINHTTP_QUERY_CUSTOM,
-            name_wide.as_ptr(),
-            buffer.as_mut_ptr() as *mut c_void,
-            &mut buffer_bytes,
-            null_mut(),
-        )
-    };
-    if ok == 0 {
-        return None;
+fn wildcard_matches(pattern: &str, host: &str) -> bool {
+    let (mut pattern, mut host) = (pattern.as_bytes(), host.as_bytes());
+    let (mut star, mut retry) = (None, host);
+    while !host.is_empty() {
+        if pattern.first() == Some(&b'*') {
+            pattern = &pattern[1..];
+            star = Some(pattern);
+            retry = host;
+        } else if pattern.first() == host.first() {
+            pattern = &pattern[1..];
+            host = &host[1..];
+        } else if let Some(after_star) = star {
+            retry = &retry[1..];
+            host = retry;
+            pattern = after_star;
+        } else {
+            return false;
+        }
     }
-
-    // On success WinHTTP reports string bytes minus the terminating null.
-    let used_units = ((buffer_bytes as usize) / 2).min(buffer.len());
-    let value = String::from_utf16_lossy(&buffer[..used_units]);
-    let value = value.trim_matches(|c| c == ' ' || c == '\t');
-    if value.is_empty() || value.len() > max_bytes || !value.is_ascii() || !validate(value) {
-        return None;
-    }
-    Some(value.to_string())
+    pattern.iter().all(|byte| *byte == b'*')
 }
 
 /// RFC 7232 entity-tag: optional `W/` and a quoted string of `etagc` bytes.
@@ -1767,151 +852,20 @@ fn decimal(bytes: &[u8]) -> Option<u32> {
     Some(value)
 }
 
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        read_test_request, write_test_response, TestResponse, TestServer, TEST_ACCEPT_TIMEOUT,
+    };
     use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::{TcpListener, TcpStream};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
     const SYNTHETIC_BEARER: &str = "synthetic-bearer-value-9f4a2c";
-    const TEST_ACCEPT_TIMEOUT: Duration = Duration::from_secs(5);
-
-    struct TestRequest {
-        method: String,
-        path: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    }
-
-    impl TestRequest {
-        fn header(&self, name: &str) -> Option<&str> {
-            self.headers
-                .iter()
-                .find(|(header, _)| header.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-        }
-    }
-
-    struct TestResponse {
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-        include_content_length: bool,
-    }
-
-    impl TestResponse {
-        fn ok(body: &[u8]) -> Self {
-            Self {
-                status: 200,
-                headers: Vec::new(),
-                body: body.to_vec(),
-                include_content_length: true,
-            }
-        }
-
-        fn status(status: u16, body: &[u8]) -> Self {
-            Self {
-                status,
-                headers: Vec::new(),
-                body: body.to_vec(),
-                include_content_length: true,
-            }
-        }
-
-        fn redirect(location: &str) -> Self {
-            Self {
-                status: 302,
-                headers: vec![("Location".to_string(), location.to_string())],
-                body: Vec::new(),
-                include_content_length: true,
-            }
-        }
-
-        fn without_content_length(mut self) -> Self {
-            self.include_content_length = false;
-            self
-        }
-    }
-
-    struct TestServer {
-        addr: SocketAddr,
-        requests: Arc<Mutex<Vec<TestRequest>>>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestServer {
-        fn start<F>(expected_requests: usize, handler: F) -> Self
-        where
-            F: Fn(&TestRequest, usize) -> TestResponse + Send + 'static,
-        {
-            Self::start_with(expected_requests, move |stream, request, index| {
-                let response = handler(request, index);
-                write_test_response(stream, &response);
-            })
-        }
-
-        fn start_with<F>(expected_requests: usize, handler: F) -> Self
-        where
-            F: Fn(&mut TcpStream, &TestRequest, usize) + Send + 'static,
-        {
-            let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind test server");
-            let addr = listener.local_addr().expect("test server address");
-            listener
-                .set_nonblocking(true)
-                .expect("nonblocking test listener");
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            let captured = Arc::clone(&requests);
-            let handle = thread::spawn(move || {
-                let deadline = Instant::now() + TEST_ACCEPT_TIMEOUT;
-                let mut served = 0;
-                while served < expected_requests && Instant::now() < deadline {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            stream.set_nonblocking(false).expect("blocking test stream");
-                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                            let request = read_test_request(&mut stream);
-                            handler(&mut stream, &request, served);
-                            captured.lock().expect("requests mutex").push(request);
-                            served += 1;
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-            Self {
-                addr,
-                requests,
-                handle: Some(handle),
-            }
-        }
-
-        fn url(&self, path: &str) -> String {
-            format!("http://{}{}", self.addr, path)
-        }
-
-        fn join(mut self) -> Vec<TestRequest> {
-            if let Some(handle) = self.handle.take() {
-                handle.join().expect("join test server");
-            }
-            let requests = match Arc::try_unwrap(self.requests) {
-                Ok(requests) => requests,
-                Err(_) => panic!("test server requests still shared"),
-            };
-            requests.into_inner().expect("requests mutex")
-        }
-    }
 
     fn test_config() -> HttpConfig {
         HttpConfig {
@@ -1921,89 +875,43 @@ mod tests {
         }
     }
 
-    fn wait_for_release(probe: &TestProbe, timeout: Duration) -> usize {
-        let deadline = Instant::now() + timeout;
-        loop {
-            let released = probe.released();
-            if released != 0 || Instant::now() >= deadline {
-                return released;
+    #[test]
+    fn untrusted_tls_certificate_is_rejected_without_sending_http() {
+        let identity = native_tls::Identity::from_pkcs12(
+            include_bytes!("../tests/fixtures/untrusted-localhost.pfx"),
+            "synthetic-test-only",
+        )
+        .unwrap();
+        let acceptor = native_tls::TlsAcceptor::new(identity).unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + TEST_ACCEPT_TIMEOUT;
+            while Instant::now() < deadline {
+                if let Ok((stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    // TLS 1.3 may finish on the server before seeing the client's
+                    // rejection; in either case no HTTP bytes may arrive.
+                    if let Ok(mut tls) = acceptor.accept(stream) {
+                        assert!(!matches!(tls.read(&mut [0; 1]), Ok(n) if n > 0));
+                    }
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
             }
-            thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-        haystack
-            .windows(needle.len())
-            .position(|window| window == needle)
-    }
-
-    fn read_test_request(stream: &mut TcpStream) -> TestRequest {
-        let mut data = Vec::new();
-        let mut chunk = [0u8; 1024];
-        let header_end = loop {
-            let read = stream.read(&mut chunk).expect("read test request");
-            if read == 0 {
-                panic!("connection closed before request headers");
-            }
-            data.extend_from_slice(&chunk[..read]);
-            if let Some(position) = find_bytes(&data, b"\r\n\r\n") {
-                break position + 4;
-            }
-            if data.len() > 64 * 1024 {
-                panic!("request headers too large");
-            }
-        };
-
-        let head = std::str::from_utf8(&data[..header_end - 4]).expect("ASCII request headers");
-        let mut lines = head.split("\r\n");
-        let request_line = lines.next().expect("request line");
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().expect("method").to_string();
-        let path = parts.next().expect("path").to_string();
-        let mut headers = Vec::new();
-        for line in lines {
-            if let Some((name, value)) = line.split_once(':') {
-                headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-            }
-        }
-        let content_length = headers
-            .iter()
-            .find(|(name, _)| name == "content-length")
-            .and_then(|(_, value)| value.parse::<usize>().ok())
-            .unwrap_or(0);
-        let mut body = data[header_end..].to_vec();
-        while body.len() < content_length {
-            let read = stream.read(&mut chunk).expect("read test body");
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read]);
-        }
-        body.truncate(content_length);
-        TestRequest {
-            method,
-            path,
-            headers,
-            body,
-        }
-    }
-
-    fn write_test_response(stream: &mut TcpStream, response: &TestResponse) {
-        let mut head = format!("HTTP/1.1 {} Test\r\nConnection: close\r\n", response.status);
-        if response.include_content_length {
-            head.push_str(&format!("Content-Length: {}\r\n", response.body.len()));
-        }
-        for (name, value) in &response.headers {
-            head.push_str(name);
-            head.push_str(": ");
-            head.push_str(value);
-            head.push_str("\r\n");
-        }
-        head.push_str("\r\n");
-        let _ = stream.write_all(head.as_bytes());
-        let _ = stream.write_all(&response.body);
-        let _ = stream.flush();
+            panic!("TLS client never connected");
+        });
+        let error = send_localhost_for_tests(&HttpRequest::get(&url), &test_config()).unwrap_err();
+        server.join().unwrap();
+        assert_eq!(error.kind(), HttpErrorKind::Tls);
+        assert!(!format!("{error} {error:?}").contains("localhost"));
     }
 
     fn write_test_headers(stream: &mut TcpStream, status: u16, content_length: usize) {
@@ -2025,10 +933,80 @@ mod tests {
         let response = send_localhost_for_tests(&HttpRequest::get(&url), &test_config())
             .expect("GET should succeed");
         assert_eq!(response.status, 200);
-        assert!(response.is_success());
         assert_eq!(response.body, br#"{"status":"ok"}"#);
         let requests = server.join();
         assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn completed_requests_reuse_the_same_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!("http://{}/pooled", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            for _ in 0..2 {
+                let request = read_test_request(&mut stream);
+                assert_eq!(request.path, "/pooled");
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .unwrap();
+            }
+        });
+        for _ in 0..2 {
+            let response =
+                send_localhost_for_tests(&HttpRequest::get(&url), &test_config()).unwrap();
+            assert_eq!(response.body, b"ok");
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn windows_proxy_routes_and_bypass_are_preserved() {
+        for (target, proxies, bypass, expected) in [
+            (
+                "https://example.test/",
+                "http=plain:80;https=secure:81",
+                "",
+                Some("http://secure:81"),
+            ),
+            (
+                "https://example.test/",
+                "first:80 second:81",
+                "",
+                Some("http://first:80"),
+            ),
+            ("https://example.test/", "http=plain:80", "", None),
+            (
+                "https://example.test/",
+                "proxy:80",
+                "*.example.test",
+                Some("http://proxy:80"),
+            ),
+            (
+                "https://a.example.test/",
+                "proxy:80",
+                "*.EXAMPLE.test",
+                None,
+            ),
+            ("https://intranet/", "proxy:80", "<local>", None),
+            (
+                "https://a.example.test/",
+                "proxy:80",
+                "other.test;*.example.test",
+                None,
+            ),
+            ("https://example.test/", "http://proxy:80", "e*e.test", None),
+        ] {
+            let url = parse_url(target, false).unwrap();
+            assert_eq!(
+                proxy_for(&url, proxies, bypass).as_deref(),
+                expected,
+                "{target} {bypass}"
+            );
+        }
     }
 
     #[test]
@@ -2055,64 +1033,71 @@ mod tests {
     }
 
     #[test]
-    fn cache_validators_are_returned_when_valid() {
+    fn cache_headers_preserve_valid_values_and_ignore_unusable_values() {
         const ETAG: &str = "\"synthetic-etag-42\"";
         const LAST_MODIFIED: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
-        let server = TestServer::start(1, |_, _| {
-            let mut response = TestResponse::ok(b"cached");
-            response.headers = vec![
-                ("ETag".to_string(), ETAG.to_string()),
-                ("Last-Modified".to_string(), LAST_MODIFIED.to_string()),
-            ];
-            response
+        let cases = [
+            (
+                "cached",
+                Some((ETAG.to_string(), LAST_MODIFIED.to_string())),
+                true,
+            ),
+            ("plain", None, false),
+            (
+                "bounded",
+                Some((
+                    format!("\"{}\"", "e".repeat(MAX_ETAG_BYTES + 2)),
+                    format!(
+                        "Sun, 06 Nov 1994 08:49:37 GMT{}",
+                        "X".repeat(MAX_LAST_MODIFIED_BYTES)
+                    ),
+                )),
+                false,
+            ),
+            (
+                "still-ok",
+                Some(("not-a-quoted-tag".into(), "yesterday".into())),
+                false,
+            ),
+        ];
+        let replies = cases.clone();
+        let server = TestServer::start(cases.len(), move |_, index| {
+            let (body, headers, _) = &replies[index];
+            TestResponse {
+                headers: headers
+                    .as_ref()
+                    .map(|(etag, modified)| {
+                        vec![
+                            ("ETag".into(), etag.clone()),
+                            ("Last-Modified".into(), modified.clone()),
+                        ]
+                    })
+                    .unwrap_or_default(),
+                ..TestResponse::ok(body.as_bytes())
+            }
         });
-        let url = server.url("/cache");
-        let response =
-            send_localhost_for_tests(&HttpRequest::get(&url), &test_config()).expect("GET");
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"cached");
-        assert_eq!(response.etag.as_deref(), Some(ETAG));
-        assert_eq!(response.last_modified.as_deref(), Some(LAST_MODIFIED));
-        let rendered = format!("{:?}", response);
-        assert!(!rendered.contains(ETAG));
-        assert!(!rendered.contains("2015"));
-        assert_eq!(server.join().len(), 1);
-    }
-
-    #[test]
-    fn missing_cache_validators_are_none() {
-        let server = TestServer::start(1, |_, _| TestResponse::ok(b"plain"));
-        let url = server.url("/plain");
-        let response =
-            send_localhost_for_tests(&HttpRequest::get(&url), &test_config()).expect("GET");
-        assert_eq!(response.body, b"plain");
-        assert_eq!(response.etag, None);
-        assert_eq!(response.last_modified, None);
-        let _ = server.join();
-    }
-
-    #[test]
-    fn oversized_cache_validators_are_ignored() {
-        let oversized_etag = format!("\"{}\"", "e".repeat(MAX_ETAG_BYTES + 2));
-        let oversized_last_modified = format!(
-            "Sun, 06 Nov 1994 08:49:37 GMT{}",
-            "X".repeat(MAX_LAST_MODIFIED_BYTES)
-        );
-        let server = TestServer::start(1, move |_, _| {
-            let mut response = TestResponse::ok(b"bounded");
-            response.headers = vec![
-                ("ETag".to_string(), oversized_etag.clone()),
-                ("Last-Modified".to_string(), oversized_last_modified.clone()),
-            ];
-            response
-        });
-        let url = server.url("/oversized-cache");
-        let response =
-            send_localhost_for_tests(&HttpRequest::get(&url), &test_config()).expect("GET");
-        assert_eq!(response.body, b"bounded");
-        assert_eq!(response.etag, None);
-        assert_eq!(response.last_modified, None);
-        let _ = server.join();
+        for (body, headers, valid) in &cases {
+            let url = server.url(&format!("/{body}"));
+            let response = send_localhost_for_tests(&HttpRequest::get(&url), &test_config())
+                .unwrap_or_else(|error| panic!("{body}: {error}"));
+            assert_eq!(response.status, 200, "{body}");
+            assert_eq!(response.body, body.as_bytes(), "{body}");
+            let expected = headers.as_ref().filter(|_| *valid);
+            assert_eq!(
+                response.etag.as_deref(),
+                expected.map(|h| h.0.as_str()),
+                "{body}"
+            );
+            assert_eq!(
+                response.last_modified.as_deref(),
+                expected.map(|h| h.1.as_str()),
+                "{body}"
+            );
+            let rendered = format!("{response:?}");
+            assert!(!rendered.contains(ETAG), "{body}");
+            assert!(!rendered.contains("2015"), "{body}");
+        }
+        assert_eq!(server.join().len(), cases.len());
     }
 
     #[test]
@@ -2131,26 +1116,6 @@ mod tests {
         assert!(!is_valid_http_date("Sun, 06 Nov 1994 08:49:60 GMT"));
         assert!(!is_valid_http_date("Sun, 06 Nov 1994 08:49:37 UTC"));
         assert!(!is_valid_http_date("Sunday, 06 Nov 1994 08:49:37 GMT"));
-    }
-
-    #[test]
-    fn malformed_cache_validators_are_ignored() {
-        let server = TestServer::start(1, |_, _| {
-            let mut response = TestResponse::ok(b"still-ok");
-            response.headers = vec![
-                ("ETag".to_string(), "not-a-quoted-tag".to_string()),
-                ("Last-Modified".to_string(), "yesterday".to_string()),
-            ];
-            response
-        });
-        let url = server.url("/malformed-cache");
-        let response =
-            send_localhost_for_tests(&HttpRequest::get(&url), &test_config()).expect("GET");
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, b"still-ok");
-        assert_eq!(response.etag, None);
-        assert_eq!(response.last_modified, None);
-        let _ = server.join();
     }
 
     #[test]
@@ -2256,23 +1221,6 @@ mod tests {
     }
 
     #[test]
-    fn non_streaming_response_can_wait_beyond_winhttp_default_receive_timeout() {
-        let server = TestServer::start(1, |_, _| {
-            thread::sleep(Duration::from_secs(32));
-            TestResponse::ok(b"slow synthetic response")
-        });
-        let config = HttpConfig {
-            total_timeout: Duration::from_secs(40),
-            ..test_config()
-        };
-        let response =
-            send_localhost_for_tests(&HttpRequest::get(&server.url("/slow-reasoning")), &config)
-                .expect("configured deadline must permit a slow non-streaming response");
-        assert_eq!(response.body, b"slow synthetic response");
-        let _ = server.join();
-    }
-
-    #[test]
     fn cancellation_while_waiting_for_headers_is_prompt() {
         let (accepted_tx, accepted_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
@@ -2374,12 +1322,9 @@ mod tests {
             let client_cancellation = Arc::clone(&cancellation);
             let client_url = url.clone();
             let config = test_config();
-            let probe = Arc::new(TestProbe::default());
-            let client_probe = Arc::clone(&probe);
             let client = thread::spawn(move || {
-                let request = HttpRequest::get(&client_url)
-                    .cancellation(client_cancellation.as_ref())
-                    .test_probe(client_probe);
+                let request =
+                    HttpRequest::get(&client_url).cancellation(client_cancellation.as_ref());
                 send_localhost_for_tests(&request, &config)
             });
             sent_rx
@@ -2393,137 +1338,8 @@ mod tests {
                 }
                 Err(error) => assert_eq!(error.kind(), HttpErrorKind::Cancelled),
             }
-            assert_eq!(
-                wait_for_release(&probe, Duration::from_secs(2)),
-                1,
-                "each raced call must release its callback state exactly once"
-            );
         }
         assert_eq!(server.join().len(), ITERATIONS);
-    }
-
-    #[test]
-    fn completed_request_releases_callback_state_once() {
-        let server = TestServer::start(1, |_, _| TestResponse::ok(b"released"));
-        let url = server.url("/release");
-        let probe = Arc::new(TestProbe::default());
-        let request = HttpRequest::get(&url).test_probe(Arc::clone(&probe));
-        let response =
-            send_localhost_for_tests(&request, &test_config()).expect("GET should succeed");
-        assert_eq!(response.body, b"released");
-        assert_eq!(
-            wait_for_release(&probe, Duration::from_secs(2)),
-            1,
-            "final request close must release the state exactly once"
-        );
-        let _ = server.join();
-    }
-
-    #[test]
-    fn unattached_callback_state_is_reclaimed_once() {
-        let probe = Arc::new(TestProbe::default());
-        let state = Arc::new(AsyncState::new_with_probe(
-            Some(b"synthetic-body".to_vec().into_boxed_slice()),
-            Some(Arc::clone(&probe)),
-        ));
-        let native_state = Arc::into_raw(Arc::clone(&state));
-        let mut cleanup = HandleCleanup {
-            state: &state,
-            native_state,
-            handles: Vec::new(),
-            finished: false,
-        };
-        assert!(
-            cleanup.finish(),
-            "no attached context means no close callback is owed"
-        );
-        assert_eq!(
-            Arc::strong_count(&state),
-            1,
-            "the native-side reference must be reclaimed exactly once"
-        );
-        drop(cleanup);
-        assert_eq!(probe.released(), 0);
-        drop(state);
-        assert_eq!(probe.released(), 1);
-    }
-
-    #[test]
-    fn final_close_callback_releases_native_reference_once() {
-        let probe = Arc::new(TestProbe::default());
-        let state = Arc::new(AsyncState::new_with_probe(
-            Some(b"synthetic-body".to_vec().into_boxed_slice()),
-            Some(Arc::clone(&probe)),
-        ));
-        let native_state = Arc::into_raw(Arc::clone(&state));
-        lock_state(&state).attached_handles = 1;
-
-        unsafe {
-            status_callback(
-                null_mut(),
-                native_state as usize,
-                WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING,
-                null_mut(),
-                0,
-            );
-        }
-        assert_eq!(
-            Arc::strong_count(&state),
-            1,
-            "the final close callback must drop only the native reference"
-        );
-        drop(state);
-        assert_eq!(probe.released(), 1);
-    }
-
-    #[test]
-    fn delayed_close_releases_state_after_call_returns() {
-        let (accepted_tx, accepted_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let release_rx = Arc::new(Mutex::new(release_rx));
-        let server = TestServer::start_with(1, move |stream, _, _| {
-            accepted_tx.send(()).expect("signal accepted request");
-            let _ = release_rx
-                .lock()
-                .expect("release mutex")
-                .recv_timeout(Duration::from_secs(5));
-            write_test_response(stream, &TestResponse::ok(b"late"));
-        });
-        let url = server.url("/delayed-close");
-        let cancellation = Arc::new(AtomicBool::new(false));
-        let client_cancellation = Arc::clone(&cancellation);
-        let probe = Arc::new(TestProbe::default());
-        probe.set_delay_closing();
-        let client_probe = Arc::clone(&probe);
-        let client = thread::spawn(move || {
-            let request = HttpRequest::post_json(&url, br#"{"synthetic":true}"#)
-                .cancellation(client_cancellation.as_ref())
-                .test_probe(client_probe);
-            send_localhost_for_tests(&request, &test_config())
-        });
-
-        accepted_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("request reaches server");
-        thread::sleep(Duration::from_millis(100));
-        cancellation.store(true, Ordering::SeqCst);
-        let error = client
-            .join()
-            .expect("join client")
-            .expect_err("stalled request must be cancelled");
-        assert_eq!(error.kind(), HttpErrorKind::Cancelled);
-        assert_eq!(
-            probe.released(),
-            0,
-            "a delayed final close must keep the callback-owned state alive"
-        );
-        assert_eq!(
-            wait_for_release(&probe, Duration::from_secs(3)),
-            1,
-            "the late final callback must release the state exactly once"
-        );
-        release_tx.send(()).expect("release server");
-        let _ = server.join();
     }
 
     #[test]
@@ -2636,8 +1452,8 @@ mod tests {
 
     #[test]
     fn downgrade_redirect_is_rejected() {
-        let current = ParsedUrl::parse("https://api.example.test/v1/start", false)
-            .expect("valid HTTPS origin");
+        let current =
+            parse_url("https://api.example.test/v1/start", false).expect("valid HTTPS origin");
         let error = resolve_redirect(&current, "http://api.example.test/final", false)
             .expect_err("downgrade must be rejected");
         assert_eq!(error.kind(), HttpErrorKind::RedirectRejected);
@@ -2699,19 +1515,23 @@ mod tests {
 
     #[test]
     fn ipv6_localhost_url_parsing_is_explicit() {
-        let parsed = ParsedUrl::parse("http://[::1]:8080/v1/holidays/2026", true)
-            .expect("IPv6 loopback URL");
+        let parsed =
+            parse_url("http://[::1]:8080/v1/holidays/2026", true).expect("IPv6 loopback URL");
         assert_eq!(parsed.scheme, Scheme::Http);
         assert_eq!(parsed.host, "::1");
         assert_eq!(parsed.port, 8080);
         assert_eq!(parsed.path, "/v1/holidays/2026");
-        assert!(is_loopback_host(&parsed.host, true));
+        assert!(parsed
+            .host
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .is_loopback());
 
-        let error = ParsedUrl::parse("http://[::1]:8080/v1?year=2026", true)
+        let error = parse_url("http://[::1]:8080/v1?year=2026", true)
             .expect_err("query must still be rejected");
         assert_eq!(error.kind(), HttpErrorKind::QueryNotAllowed);
 
-        let error = ParsedUrl::parse("http://example.test:8080/", true)
+        let error = parse_url("http://example.test:8080/", true)
             .expect_err("test HTTP is limited to loopback");
         assert_eq!(error.kind(), HttpErrorKind::UnsupportedScheme);
     }
@@ -2779,10 +1599,72 @@ mod tests {
                 assert_eq!(status, 200);
                 received.extend_from_slice(bytes);
                 let _ = tx.send(());
+                true
             },
         )
         .unwrap();
         assert_eq!(received, b"first!");
-        assert_eq!(response.body, b"first!");
+        assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn successful_streams_do_not_buffer_or_cap_total_wire_bytes() {
+        for declared_length in [false, true] {
+            let server = TestServer::start(1, move |_, _| {
+                let mut response = TestResponse::ok(&vec![b'x'; 32_000]);
+                response.include_content_length = declared_length;
+                response
+            });
+            let url = server.url("/stream");
+            let mut received = 0;
+            let response = send_stream_localhost_for_tests(
+                &HttpRequest::get(&url),
+                &HttpConfig {
+                    max_response_bytes: 64,
+                    ..test_config()
+                },
+                &mut |status, bytes| {
+                    assert_eq!(status, 200);
+                    received += bytes.len();
+                    true
+                },
+            )
+            .unwrap();
+            assert_eq!(received, 32_000);
+            assert!(response.body.is_empty());
+        }
+    }
+
+    #[test]
+    fn streaming_errors_keep_bounded_bodies_and_rejected_consumers_stop() {
+        for bytes in [16, 128] {
+            let server = TestServer::start(1, move |_, _| {
+                let mut response = TestResponse::ok(&vec![b'e'; bytes]);
+                response.status = 400;
+                response.without_content_length()
+            });
+            let url = server.url("/error");
+            let result = send_stream_localhost_for_tests(
+                &HttpRequest::get(&url),
+                &HttpConfig {
+                    max_response_bytes: 64,
+                    ..test_config()
+                },
+                &mut |_, _| true,
+            );
+            if bytes <= 64 {
+                assert_eq!(result.unwrap().body, vec![b'e'; bytes]);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), HttpErrorKind::ResponseTooLarge);
+            }
+        }
+        let server = TestServer::start(1, |_, _| TestResponse::ok(b"rejected frame"));
+        let url = server.url("/reject");
+        let result = send_stream_localhost_for_tests(
+            &HttpRequest::get(&url),
+            &test_config(),
+            &mut |_, _| false,
+        );
+        assert_eq!(result.unwrap_err().kind(), HttpErrorKind::Protocol);
     }
 }

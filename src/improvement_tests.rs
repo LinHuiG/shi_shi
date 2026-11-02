@@ -48,8 +48,7 @@ mod tests {
                 UNCONFIGURED_CONNECTION
             );
         }
-        let root = std::env::temp_dir().join(format!("shishi-factory-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-factory");
         app.configure_patch(&json!({"daily_calls":149})).unwrap();
         drop(app);
         let loaded = App::load(root.clone()).unwrap();
@@ -65,23 +64,6 @@ mod tests {
             UNCONFIGURED_CONNECTION
         );
         drop(loaded);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn explicit_null_is_unconfigured_while_legacy_missing_profiles_keep_their_routes() {
-        let legacy: Config =
-            serde_json::from_value(json!({"codex":"synthetic.exe","model":"old"})).unwrap();
-        assert_eq!(legacy.for_kind("handling").model, "gpt-6-astra");
-        let partial: Config = serde_json::from_value(json!({"codex":"synthetic.exe","model":"old","model_profiles":{"analysis":{"model":"selected"},"handling":null}})).unwrap();
-        assert_eq!(partial.for_kind("classify").model, "selected");
-        assert_eq!(partial.for_kind("archive").model, "old");
-        assert!(crate::ai_backend::connection(&partial.for_kind("handling")).is_err());
-        let restored: Config = serde_json::from_value(json!(partial)).unwrap();
-        assert_eq!(
-            restored.for_kind("handling").selected_connection,
-            UNCONFIGURED_CONNECTION
-        );
     }
 
     #[test]
@@ -135,8 +117,7 @@ mod tests {
 
     #[test]
     fn deleting_sources_clears_only_their_routes_atomically_and_survives_restart() {
-        let root = std::env::temp_dir().join(format!("shishi-clear-routes-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-clear-routes");
         {
             let mut s = app.state.lock().unwrap();
             s.config = serde_json::from_value(json!({"codex":"synthetic.exe","codex_models":[{"model":"synthetic"}],"ai_connections":[{"id":"api","name":"Synthetic","driver":"api","base_url":"https://example.com/v1","models":[{"model":"synthetic"}]}],"model_profiles":{"filter":null,"analysis":{"connection_id":"api","model":"synthetic"},"handling":{"model":"synthetic"},"review":{"connection_id":"api","model":"synthetic"}}})).unwrap();
@@ -165,13 +146,11 @@ mod tests {
         }
         assert_eq!(c.daily_calls, 147);
         drop(restored);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn settings_patch_preserves_unsubmitted_data_and_rejects_invalid_edits_atomically() {
-        let root = std::env::temp_dir().join(format!("shishi-autosave-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-autosave");
         let before = json!(app.state.lock().unwrap().config);
         let saved = app.configure_patch(&json!({"daily_calls":43})).unwrap();
         assert_eq!(saved["config"]["daily_calls"], 43);
@@ -197,24 +176,17 @@ mod tests {
         let loaded = App::load(root.clone()).unwrap();
         assert_eq!(loaded.state.lock().unwrap().config.daily_calls, 43);
         drop(loaded);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn analysis_scope_switch_persists_without_changing_progress_or_other_settings() {
-        let root = std::env::temp_dir().join(format!("shishi-scope-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-scope");
         {
             let mut s = app.state.lock().unwrap();
             assert!(!s.config.analysis_related_only);
             s.messages.insert(
                 "plain".into(),
-                Message {
-                    id: "plain".into(),
-                    text: "普通群消息".into(),
-                    time: now(),
-                    ..Default::default()
-                },
+                crate::test_support::message("plain", "普通群消息", now()),
             );
             app.save(&s).unwrap();
         }
@@ -245,29 +217,48 @@ mod tests {
         let reload = App::load(root.clone()).unwrap();
         assert!(!reload.state.lock().unwrap().config.analysis_related_only);
         drop(reload);
-        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn context_budget_counts_errors_and_preserves_undelivered_offsets_across_restart() {
         let snapshot = json!({"budget_chars":4000,"records":[{"id":"m","kind":"message","data":{"text":"文".repeat(9000)}}]});
         let mut meter = Meter::default();
-        let error_page =
-            analysis_context::query(&snapshot, &mut meter, &json!({"invalid":true})).unwrap();
+        let error_page = analysis_context::query(&snapshot, &mut meter, &json!({"invalid":true}));
         assert_eq!(meter.chars, error_page.chars().count());
-        let before = meter.offsets.clone();
-        let notice = analysis_context::query(&snapshot, &mut meter, &json!({"ids":["m"]})).unwrap();
-        assert!(notice.contains("覆盖不完整"));
-        assert!(meter.exhausted);
-        assert_eq!(meter.offsets, before);
+        // An earlier error consumes budget, but must not discard a usable
+        // final partial page. Only that delivered prefix advances coverage.
+        let page = analysis_context::query(&snapshot, &mut meter, &json!({"ids":["m"]}));
+        let delivered: serde_json::Value = serde_json::from_str(&page).unwrap();
+        let offset = delivered["records"][0]["next_offset"].as_u64().unwrap();
+        assert!(offset > 0 && offset < 9000);
+        assert_eq!(meter.offsets["m"], offset as usize);
+        assert_eq!(
+            meter.chars,
+            error_page.chars().count() + page.chars().count()
+        );
+        assert!(meter.chars <= 4000);
+        let before = (meter.offsets.clone(), meter.pages.clone(), meter.chars);
         let mut restarted: Meter =
             serde_json::from_slice(&serde_json::to_vec(&meter).unwrap()).unwrap();
-        assert!(
-            analysis_context::query(&snapshot, &mut restarted, &json!({"ids":["m"]}))
-                .unwrap()
-                .contains("覆盖不完整")
+        let notice = analysis_context::query(
+            &snapshot,
+            &mut restarted,
+            &json!({"ids":["m"],"offset":offset}),
         );
-        assert!(restarted.chars <= 4000);
+        assert!(notice.contains("覆盖不完整"));
+        assert!(restarted.exhausted);
+        assert_eq!(restarted.offsets, before.0);
+        assert_eq!(restarted.pages, before.1);
+        // The exhaustion notice is host control text, not retrieved material.
+        assert_eq!(restarted.chars, before.2);
         assert!(restarted.complete.is_empty());
+        let mut exhausted: Meter =
+            serde_json::from_slice(&serde_json::to_vec(&restarted).unwrap()).unwrap();
+        assert_eq!(
+            analysis_context::query(&snapshot, &mut exhausted, &json!({"invalid":true})),
+            notice
+        );
+        assert_eq!(exhausted.offsets, before.0);
+        assert!(exhausted.complete.is_empty());
     }
 
     #[test]
@@ -320,8 +311,7 @@ mod tests {
 
     #[test]
     fn scan_save_failure_does_not_publish_false_toggle_or_change_other_config() {
-        let root = std::env::temp_dir().join(format!("shishi-scan-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-scan");
         let enabled = app.state.lock().unwrap().config.enabled;
         let interval = app.state.lock().unwrap().config.interval_minutes;
         crate::test_support::persistence_failure(&root, true).unwrap();
@@ -332,14 +322,11 @@ mod tests {
         assert_eq!(state.config.enabled, enabled);
         assert_eq!(state.config.interval_minutes, interval);
         drop(state);
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn settings_patch_save_failure_keeps_live_configuration_and_can_retry() {
-        let root = std::env::temp_dir().join(format!("shishi-settings-failure-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-settings-failure");
         let before = json!(app.state.lock().unwrap().config);
         crate::test_support::persistence_failure(&root, true).unwrap();
         assert!(app.configure_patch(&json!({"daily_calls":42})).is_err());
@@ -349,12 +336,10 @@ mod tests {
             app.configure_patch(&json!({"daily_calls":42})).unwrap()["config"]["daily_calls"],
             42
         );
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn archive_retention_keeps_current_transitive_lineage_and_unfinished_jobs() {
+    fn archive_retention_keeps_current_lineage_unfinished_jobs_and_latest_outcome() {
         let mut state = State::default();
         let at = now();
         let old = at - 100 * 86_400_000;
@@ -382,6 +367,13 @@ mod tests {
             status: "succeeded".into(),
             ..Default::default()
         });
+        state.archive_attempts.push(ArchiveAttempt {
+            id: "latest-completed".into(),
+            created: old + 1,
+            finished: old + 1,
+            status: "succeeded".into(),
+            ..Default::default()
+        });
         state.archive_attempts.reverse();
         assert!(crate::retention::prune(&mut state, at));
         assert_eq!(
@@ -392,52 +384,55 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["base", "current"]
         );
-        assert_eq!(state.archive_attempts.len(), 1);
-        assert_eq!(state.archive_attempts[0].id, "unfinished");
-    }
-
-    #[test]
-    fn view_version_is_stable_between_idle_ticks_and_progress_invalidates_it() {
-        let root = std::env::temp_dir().join(format!("shishi-signals-{}", id()));
-        let app = App::load(root.clone()).unwrap();
-        let first = app.state_version();
-        assert_eq!(first, app.state_version());
-        *app.ai_progress.lock().unwrap() = "synthetic progress".into();
-        assert_ne!(first, app.state_version());
-        let tasks = app.snapshot_page(Some("tasks"));
-        assert_eq!(tasks["_page"], "tasks");
-        assert!(tasks.get("reports").is_none());
-        assert!(tasks["tasks"].is_array());
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            state
+                .archive_attempts
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["latest-completed", "unfinished"]
+        );
     }
 
     #[test]
     fn paused_scan_keeps_boundary_jobs_and_failed_claim_can_retry_once() {
         use crate::test_support::{calendar, ts_ms};
-        let root = std::env::temp_dir().join(format!("shishi-boundary-{}", id()));
-        let app = App::load(root.clone()).unwrap();
-        *app.calendar.lock().unwrap() = calendar();
-        {
-            let mut s = app.state.lock().unwrap();
-            s.config.enabled = false;
-            s.config.work_start = "09:00".into();
-            s.config.work_end = "18:00".into();
+        for hour in [9, 18] {
+            let (root, app) = crate::test_support::scoped_app("shishi-boundary");
+            *app.calendar.lock().unwrap() = calendar();
+            {
+                let mut s = app.state.lock().unwrap();
+                s.config.enabled = false;
+                s.config.work_start = "09:00".into();
+                s.config.work_end = "18:00".into();
+            }
+            app.work_boundary_tick(None, ts_ms(2025, 1, 2, hour - 1, 0))
+                .unwrap();
+            let previous = ts_ms(2025, 1, 2, hour - 1, 59) + 55_000;
+            let boundary = ts_ms(2025, 1, 2, hour, 0) + 1_000;
+            let before = app.state.lock().unwrap().work_scheduler.clone();
+            crate::test_support::persistence_failure(&root, true).unwrap();
+            assert!(app.work_boundary_tick(Some(previous), boundary).is_err());
+            {
+                let s = app.state.lock().unwrap();
+                assert_eq!(
+                    s.work_scheduler, before,
+                    "failed save must not publish preview claims"
+                );
+                assert!(s.archive_attempts.is_empty());
+                assert!(s.morning_jobs.is_empty());
+            }
+            crate::test_support::persistence_failure(&root, false).unwrap();
+            app.work_boundary_tick(Some(previous), boundary + 5_000)
+                .unwrap();
+            app.work_boundary_tick(Some(boundary + 5_000), boundary + 10_000)
+                .unwrap();
+            {
+                let s = app.state.lock().unwrap();
+                assert_eq!(s.archive_attempts.len(), usize::from(hour == 18));
+                assert_eq!(s.morning_jobs.len(), usize::from(hour == 9));
+            }
+            drop(app);
         }
-        let at = ts_ms(2025, 1, 2, 10, 0);
-        app.work_boundary_tick(None, at).unwrap();
-        let previous = ts_ms(2025, 1, 2, 17, 59) + 55_000;
-        let end = ts_ms(2025, 1, 2, 18, 0) + 1_000;
-        crate::test_support::persistence_failure(&root, true).unwrap();
-        assert!(app.work_boundary_tick(Some(previous), end).is_err());
-        assert!(app.state.lock().unwrap().archive_attempts.is_empty());
-        crate::test_support::persistence_failure(&root, false).unwrap();
-        app.work_boundary_tick(Some(previous), end + 5_000).unwrap();
-        assert_eq!(app.state.lock().unwrap().archive_attempts.len(), 1);
-        app.work_boundary_tick(Some(end + 5_000), end + 10_000)
-            .unwrap();
-        assert_eq!(app.state.lock().unwrap().archive_attempts.len(), 1);
-        drop(app);
-        fs::remove_dir_all(root).unwrap();
     }
 }

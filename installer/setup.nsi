@@ -174,6 +174,13 @@ Section "拾事" SEC_MAIN
   Abort
  ${EndIf}
  System::Call 'kernel32::CloseHandle(p r0)'
+ IfFileExists "$INSTDIR\ss.exe" 0 migrate_data
+ System::Call 'kernel32::CreateFileW(w "$INSTDIR\ss.exe", i 0x40000000, i 0, p 0, i 3, i 0, p 0) p.r0'
+ ${If} $0 == -1
+  MessageBox MB_ICONEXCLAMATION "命令行程序仍被占用或不可写。请结束正在执行的 ss 命令后重试。" /SD IDOK
+  Abort
+ ${EndIf}
+ System::Call 'kernel32::CloseHandle(p r0)'
  migrate_data:
  nsExec::ExecToStack '"$PLUGINSDIR\shishi-prompt.exe" --migrate-state "$INSTDIR"'
  Pop $0
@@ -183,13 +190,26 @@ Section "拾事" SEC_MAIN
   SetErrorLevel 1
   Abort
  ${EndIf}
+ ; A skipped extraction must not publish a successful upgrade. This also
+ ; catches files becoming unavailable after the earlier process/handle checks.
+ ClearErrors
  File "${SOURCE}\target\release\shishi.exe"
+ File "${SOURCE}\target\release\ss.exe"
  File "${LOADER}"
  File "${SOURCE}\README.txt"
+ File /oname=CLI.md "${SOURCE}\docs\CLI.md"
+ SetOutPath "$INSTDIR\skills\shishi-cli"
+ File "${SOURCE}\docs\skills\shishi-cli\SKILL.md"
+ SetOutPath "$INSTDIR"
  File "${SOURCE}\LICENSE"
  File "${SOURCE}\THIRD_PARTY_NOTICES.md"
  File /oname=LICENSE-WRY-MIT "${SOURCE}\vendor\wry\LICENSE-MIT"
  File /oname=LICENSE-WRY-APACHE "${SOURCE}\vendor\wry\LICENSE-APACHE"
+ ${If} ${Errors}
+  MessageBox MB_ICONEXCLAMATION "程序文件未完整写入，安装未完成。请关闭占用安装目录文件的程序后重新安装；现有数据已保留。" /SD IDOK
+  SetErrorLevel 1
+  Abort
+ ${EndIf}
  CreateDirectory "$INSTDIR\data"
  WriteUninstaller "$INSTDIR\Uninstall.exe"
  FileOpen $0 "$INSTDIR\install-info.txt" w
@@ -226,17 +246,30 @@ FunctionEnd
 Section "Uninstall"
  SetShellVarContext current
  IfFileExists "$INSTDIR\install-info.txt" 0 uninstall_abort
- IfFileExists "$INSTDIR\shishi.exe" 0 delete_app
+ IfFileExists "$INSTDIR\shishi.exe" 0 uninstall_check_cli
  System::Call 'kernel32::CreateFileW(w "$INSTDIR\shishi.exe", i 0x40000000, i 0, p 0, i 3, i 0, p 0) p.r0'
  ${If} $0 == -1
-  MessageBox MB_ICONEXCLAMATION "请右键拾事托盘图标选择“退出”后重新卸载；叉掉窗口仅隐藏。" /SD IDOK
+  MessageBox MB_ICONEXCLAMATION "请退出拾事图形端，并用 ss backend stop 关闭 CLI 后台后重新卸载；叉掉窗口仅隐藏。" /SD IDOK
+  Abort
+ ${EndIf}
+ System::Call 'kernel32::CloseHandle(p r0)'
+ uninstall_check_cli:
+ IfFileExists "$INSTDIR\ss.exe" 0 delete_app
+ System::Call 'kernel32::CreateFileW(w "$INSTDIR\ss.exe", i 0x40000000, i 0, p 0, i 3, i 0, p 0) p.r0'
+ ${If} $0 == -1
+  MessageBox MB_ICONEXCLAMATION "请结束正在执行的 ss 命令后重新卸载。" /SD IDOK
   Abort
  ${EndIf}
  System::Call 'kernel32::CloseHandle(p r0)'
  delete_app:
  Delete "$INSTDIR\shishi.exe"
+ Delete "$INSTDIR\ss.exe"
  Delete "$INSTDIR\WebView2Loader.dll"
  Delete "$INSTDIR\README.txt"
+ Delete "$INSTDIR\CLI.md"
+ Delete "$INSTDIR\skills\shishi-cli\SKILL.md"
+ RMDir "$INSTDIR\skills\shishi-cli"
+ RMDir "$INSTDIR\skills"
  Delete "$INSTDIR\LICENSE"
  Delete "$INSTDIR\THIRD_PARTY_NOTICES.md"
  Delete "$INSTDIR\LICENSE-WRY-MIT"

@@ -19,6 +19,8 @@
 *.pem
 *.key
 *.pfx
+# Deliberately public, untrusted localhost certificate for the TLS regression.
+!providers/api/tests/fixtures/untrusted-localhost.pfx
 *.local.json
 
 __pycache__/

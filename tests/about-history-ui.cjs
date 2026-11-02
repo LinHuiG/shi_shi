@@ -1,5 +1,5 @@
 // Offline UI contracts for about/update state and scoped searchable task history.
-const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-about-history-')),now=Date.now();
 const fixture={version:'1.1.17',build_time:1700000000000,updates:{status:'idle',updated_at:1600000000000,installed_at:1500000000000},config:{auto_update:true,codex:'',codex_models:[],ai_connections:[],leaders:[],enabled:false,auto_ai:false,interval_minutes:5,analysis_interval_minutes:30,analysis_lookback_hours:24,daily_calls:40,max_input_chars:60000,message_retention_days:90,work_start:'09:00',work_end:'18:00'},tasks:[{id:'first',number:42,title:'合成核对事项',description:'合成事项描述',status:'待处理',today:true,created:now,updated:now},{id:'second',number:7,title:'另一个事项',description:'其他内容',status:'待处理',today:true,created:now,updated:now}],schedules:[],messages:[],audit:[],activity:[],reports:[],handling:[],chat_sources:[],suggestions:[],usage:{calls:0,input_tokens:0,output_tokens:0,cached_reports:0,unreported_calls:0},pending:0};
 const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.failUpdate=false;window.evidenceRows=Array.from({length:80},(_,i)=>({id:'m'+i,text:'合成消息依据 '+i+'：需要核对的说明。'.repeat(12),sender:'合成发送人',time:${now}+i}));
@@ -12,9 +12,9 @@ if(method==='settings_patch'){Object.assign(fixture.config,p);data={config:fixtu
 if(method==='update_check'){if(failUpdate)error='合成网络失败';else{fixture.updates={status:'checking'};data=fixture.updates;setTimeout(()=>{fixture.updates.status='ready';fixture.updates.version='9.0.0';fixture.updates.progress=100;window.stateChanged('update-ready-'+Date.now());},250);}}
 if(method==='update_install'){fixture.updates.status='installing';}
 if(method==='activity_query')data={rows:[],day:p.day,page:1,pages:1,total:0};
-if(method==='memory_read')data={temporary:{revision:1,max_chars:2000,text:'合成临时笔记'},archived:{revision:1,max_chars:4000,entries:[{id:'m',key:'核对',text:'合成长期经验'}]}};
+if(method==='memory_read')data={temporary:{revision:1,max_chars:2000,text:'合成临时笔记'},archived:{revision:1,max_chars:4000,text:'合成长期经验'}};
 window.receive({id,ok:!error,data,error});},method==='update_check'?80:5);}};`;
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{
+withBrowser(async(browser)=>{
  const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));
  await page.locator('#task-detail h2').waitFor();assert((await page.locator('#task-detail h2').innerText()).startsWith('#42'));
@@ -52,4 +52,4 @@ window.receive({id,ok:!error,data,error});},method==='update_check'?80:5);}};`;
  assert((await page.locator('.memory-heading').last().innerText()).includes('操作记录'));await page.evaluate(()=>Promise.allSettled(document.getAnimations().map(a=>a.finished)));await page.screenshot({path:path.join(out,'memory-subtitles.png')});
  await page.setViewportSize({width:760,height:700});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));assert.deepEqual(errors,[]);
  console.log('PASS stable task identifiers; searchable/sortable scoped history; about links; update switch/manual loading/dedup/ready confirmation/immutable build time; fuzzy log request; inline memory subtitles. '+out);
- }finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1});
+ }).catch(e=>{console.error(e);process.exitCode=1});

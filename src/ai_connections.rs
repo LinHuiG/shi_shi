@@ -11,7 +11,7 @@ fn validate_catalog(models: &[Value]) -> Result<(), String> {
     if models.is_empty() || models.len() > 1000 {
         return Err("请先检测模型，或填写至少一个模型编号（最多 1000 个）".into());
     }
-    if serde_json::to_vec(models).map_err(|e| e.to_string())?.len() > 512_000 {
+    if !shishi_api::json::fits_bytes(models, 512_000) {
         return Err("模型目录过大".into());
     }
     let mut ids = BTreeSet::new();
@@ -20,7 +20,7 @@ fn validate_catalog(models: &[Value]) -> Result<(), String> {
         if id.trim().is_empty() || id.chars().count() > 300 || !ids.insert(id) {
             return Err("模型编号为空、过长或重复".into());
         }
-        if m.to_string().len() > 8192 {
+        if !shishi_api::json::fits_bytes(m, 8192) {
             return Err("模型信息过长".into());
         }
     }
@@ -29,12 +29,11 @@ fn validate_catalog(models: &[Value]) -> Result<(), String> {
 fn referenced(c: &Config, id: &str) -> bool {
     PURPOSES
         .iter()
-        .any(|kind| c.for_kind(kind).selected_connection == id)
+        .any(|kind| c.model_choice(kind).connection_id == id)
 }
 impl App {
     pub fn connection_models(&self, p: &Value) -> Result<Value, String> {
-        let mut c: Connection =
-            serde_json::from_value(p["connection"].clone()).map_err(|e| e.to_string())?;
+        let mut c: Connection = from_json(&p["connection"])?;
         if c.driver != "api" {
             return crate::ai_backend::backend(&c)?.models(&c, &self.root);
         }
@@ -60,8 +59,7 @@ impl App {
         crate::ai_backend::api::models_with_key(&c, &self.root, key)
     }
     pub fn save_connection(&self, p: &Value) -> Result<Value, String> {
-        let mut c: Connection =
-            serde_json::from_value(p["connection"].clone()).map_err(|e| e.to_string())?;
+        let mut c: Connection = from_json(&p["connection"])?;
         validate_catalog(&c.models)?;
         if c.name.trim().is_empty() || c.name.chars().count() > 80 || c.id.len() > 100 {
             return Err("请填写连接名称（最多 80 字）".into());
@@ -87,8 +85,8 @@ impl App {
                 .cloned()
         };
         if let Some(expected) = p.get("expected") {
-            let expected: Option<Connection> = serde_json::from_value(expected.clone())
-                .map_err(|_| "连接编辑快照无效，请重新打开编辑")?;
+            let expected: Option<Connection> =
+                from_json(expected).map_err(|_| "连接编辑快照无效，请重新打开编辑")?;
             if previous != expected {
                 return Err("连接已被修改，请重新打开编辑".into());
             }
@@ -192,18 +190,16 @@ impl App {
         if text.chars().count() > 20000 {
             return Err("每套提示词最多 20000 字".into());
         }
-        let mut locked = self.state.lock().unwrap();
-        if prompts::current(&locked, target).map(|v| v.id.as_str()) != p["expected"].as_str() {
-            return Err("提示词已更新，请重新打开编辑".into());
-        }
-        let mut next = locked.clone();
-        let mut config = next.config.clone();
-        prompts::set_content(&mut config, target, text.into())?;
-        prompts::record_config_changes(&mut next, &config);
-        next.config = config;
-        self.save(&next)?;
-        *locked = next;
-        Ok(json!(true))
+        self.commit_state(|next| {
+            if prompts::current(next, target).map(|v| v.id.as_str()) != p["expected"].as_str() {
+                return Err("提示词已更新，请重新打开编辑".into());
+            }
+            let mut config = next.config.clone();
+            prompts::set_content(&mut config, target, text.into())?;
+            prompts::record_config_changes(next, &config);
+            next.config = config;
+            Ok(json!(true))
+        })
     }
 }
 
@@ -324,8 +320,7 @@ mod tests {
     use super::*;
     #[test]
     fn default_codex_edit_uses_its_own_snapshot_and_normalizes_default_fields() {
-        let root = std::env::temp_dir().join(format!("shishi-default-edit-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-default-edit");
         {
             let mut state = app.state.lock().unwrap();
             state.config.codex = "synthetic-original.exe".into();
@@ -356,8 +351,6 @@ mod tests {
             app.state.lock().unwrap().config.ai_connections[0].name,
             "Synthetic API"
         );
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn desktop_detection_excludes_legacy_and_deduplicates() {
@@ -373,8 +366,7 @@ mod tests {
     }
     #[test]
     fn connection_save_requires_models_and_deletion_allows_empty_routes() {
-        let root = std::env::temp_dir().join(format!("shishi-connections-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-connections");
         let mut c = json!({"id":"fixture","name":"Fixture","driver":"api","base_url":"https://example.com/v1"});
         assert!(app.save_connection(&json!({"connection":c})).is_err());
         c["models"] = json!([{"model":"fixture-model"}]);
@@ -393,14 +385,11 @@ mod tests {
             .config
             .ai_connections
             .is_empty());
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn credential_replacement_is_not_committed_when_state_save_fails() {
-        let root = std::env::temp_dir().join(format!("shishi-secret-save-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-secret-save");
         let connection = json!({"id":"fixture","name":"Fixture","driver":"api","base_url":"https://example.com/v1","models":[{"model":"fixture"}]});
         let saved = app
             .save_connection(
@@ -440,14 +429,11 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(store.get(reference).unwrap().is_none());
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn prompt_edit_requires_current_version_and_preserves_other_settings() {
-        let root = std::env::temp_dir().join(format!("shishi-prompt-edit-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-prompt-edit");
         let version = prompts::current(&app.state.lock().unwrap(), "classify")
             .unwrap()
             .id
@@ -466,14 +452,11 @@ mod tests {
             Config::default().max_input_chars
         );
         drop(state);
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn changed_api_address_never_reuses_saved_key_for_discovery() {
-        let root = std::env::temp_dir().join(format!("shishi-api-edit-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-api-edit");
         let c = json!({"id":"fixture","name":"Fixture","driver":"api","base_url":"https://example.com/v1","models":[{"model":"fixture"}]});
         let saved = app
             .save_connection(&json!({"connection":c,"expected":null,"key":"synthetic-fixture"}))
@@ -488,7 +471,5 @@ mod tests {
         assert!(app
             .save_connection(&json!({"connection":edited,"expected":saved["connection"]}))
             .is_err());
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 }

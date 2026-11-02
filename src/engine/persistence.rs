@@ -38,6 +38,7 @@ impl App {
         }
         store.as_mut().unwrap().save(s)?;
         self.saves.fetch_add(1, Ordering::SeqCst);
+        self.background.wake();
         Ok(())
     }
     /// Publish a business edit only after its complete candidate is durable.

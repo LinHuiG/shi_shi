@@ -1,5 +1,5 @@
 const fs = require('fs'), path = require('path'), os = require('os'), assert = require('assert');
-const {chromium} = require('playwright');
+const {withBrowser} = require('./ui-driver.cjs');
 const out = fs.mkdtempSync(path.join(os.tmpdir(),'shishi-tool-calling-ui-'));
 const now=Date.now(), model={model:'synthetic',supportedReasoningEfforts:[]};
 const fixture={tasks:[{id:'t1',title:'Synthetic task',description:'Synthetic context',status:'待处理',updated:now,created:now,today:true,tags:[],enabled_tool_ids:[],evidence:{direct:[],background:[],completion:[]}}, {id:'t2',title:'Other synthetic task',description:'',status:'待处理',updated:now,created:now,today:true,tags:[],enabled_tool_ids:[]}],schedules:[],messages:[],handling:[],activity:[],audit:[],reports:[],suggestions:[],chat_sources:[],usage:{},evolution:{prompts:[],handling:[]},config:{tools:[],codex:'synthetic.exe',codex_models:[model],ai_connections:[{id:'api',name:'Synthetic API',driver:'api',base_url:'https://example.com/v1',models:[model]}],model:'synthetic',model_profiles:{filter:null,analysis:null,handling:null,review:null,tool_call:null},enabled:false,auto_ai:false,leaders:[],interval_minutes:3,daily_calls:100,max_input_chars:80000,retrieval_budget_chars:80000,analysis_interval_minutes:30,analysis_lookback_hours:24,work_start:'08:00',work_end:'20:00'}};
@@ -22,9 +22,7 @@ const pages=Math.max(1,Math.ceil(rows.length/20)),page=Math.max(1,Math.min(p.pag
 case 'tool_run_get':{const run=[...(lastRun?[lastRun]:[]),...historyRuns].find(run=>run.id===p.run_id);const calls=run?(p.call_index===undefined?run.calls:[run.calls[p.call_index]]).filter(call=>call&&(!p.task_id||run.task_id===p.task_id||call.task_ids?.includes(p.task_id))):[];data=run&&calls.length?{...run,calls,page:1,pages:1}:null;break;}case 'settings_patch':fixture.config.model_profiles={...fixture.config.model_profiles,...p.model_profiles};data={config:structuredClone(fixture.config)};break;
 case 'edit':{const t=fixture.tasks.find(t=>t.id===p.task.id);Object.assign(t,p.task);t.updated++;data=t;break;}
 }receive(error?{id:r.id,ok:false,error}:{id:r.id,ok:true,data});},r.method==='tool_run_history'&&p.query==='slow'?150:5)}};`;
-(async()=>{
-const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});
-try{
+withBrowser(async(browser)=>{
  const page=await browser.newPage({viewport:{width:1280,height:960}}),errors=[];page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));await page.locator('.task-row').first().waitFor();
  await page.locator('[data-page="prompts"]').first().click();await page.locator('#prompt-target').waitFor();assert.equal(await page.locator('#prompt-target option').count(),8);assert.equal(await page.locator('[data-tool-library]').count(),0);
  await page.locator('#prompt-target').selectOption('tool_call');assert.equal(await page.locator('[data-tool-library]').count(),1);assert.equal(await page.evaluate(()=>requests.filter(r=>['tool_run_start','tool_test'].includes(r.method)).length),0);
@@ -114,5 +112,4 @@ try{
  await page.locator('[data-tool-back]').click();await page.locator('#overlay [data-action="close"]').click();await page.locator('#overlay').waitFor({state:'hidden'});
  assert(await page.evaluate(()=>!requests.some(r=>['tool_run_start','tool_bindings_save'].includes(r.method))));assert.deepEqual(errors,[]);
  console.log('PASS shared global tools, compact editor, tests/cancel, all clipboard fallbacks, list outside dismissal, protected editors/history, per-call rows, scoped search/pagination, exact details and layered return. '+out);
-}finally{await browser.close();}
-})().catch(e=>{console.error(e);process.exitCode=1;});
+}).catch(e=>{console.error(e);process.exitCode=1;});

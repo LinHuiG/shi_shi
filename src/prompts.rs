@@ -1,7 +1,5 @@
 use crate::{ai, engine::App, model::*, work_hours::AiMode};
 use serde_json::{json, Value};
-#[cfg(test)]
-use std::fs;
 use std::sync::atomic::Ordering;
 
 pub const TARGETS: [&str; 8] = [
@@ -36,9 +34,6 @@ pub(crate) fn set_content(config: &mut Config, target: &str, text: String) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> App {
-        App::load(std::env::temp_dir().join(format!("shishi-prompts-{}", id()))).unwrap()
-    }
     fn archive(app: &App) -> PromptReview {
         let task = app
             .task_edit(&json!({"task":{"title":"验证归档","status":"待处理"}}))
@@ -58,7 +53,7 @@ mod tests {
     }
     #[test]
     fn archive_policy_is_manually_configurable_and_fixed_permissions_survive_edit_and_restart() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-prompts");
         let initial = current(&app.state.lock().unwrap(), "archive")
             .unwrap()
             .id
@@ -84,14 +79,10 @@ mod tests {
             content(&app.state.lock().unwrap().config, "archive"),
             ai::default_policy("archive")
         );
-        drop(reloaded);
-        let path = app.root.clone();
-        drop(app);
-        fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn archive_preview_adoption_rollback_and_restart_preserve_every_version() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-prompts");
         let initial = app.state.lock().unwrap().prompt_versions.clone();
         assert_eq!(initial.len(), TARGETS.len());
         let review = archive(&app);
@@ -118,7 +109,7 @@ mod tests {
     }
     #[test]
     fn stale_suggestions_invalid_evidence_and_failed_save_cannot_change_active_prompt() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-prompts");
         let review = archive(&app);
         assert!(app.finish_prompt_review(&review.id,json!({"improved":true,"reason":"无依据","proposed_prompt":"错误","evidence_ids":["invented"]})).is_err());
         ready(&app, &review, "建议规则");
@@ -144,7 +135,7 @@ mod tests {
 
     #[test]
     fn retry_publishes_only_a_validated_result_and_failure_leaves_no_placeholder() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-prompts");
         let old = archive(&app);
         app.persist().unwrap();
         let before = json!(*app.state.lock().unwrap());
@@ -192,7 +183,7 @@ mod tests {
 
     #[test]
     fn retry_preserves_original_on_save_failure_and_rejects_a_changed_baseline() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-prompts");
         let old = archive(&app);
         app.persist().unwrap();
         let before = json!(*app.state.lock().unwrap());
@@ -290,91 +281,76 @@ pub fn queue(s: &mut State, _logs: &[Value]) {
 impl App {
     pub fn prompt_history(&self) -> Value {
         let s = self.state.lock().unwrap();
-        json!({"versions":s.prompt_versions,"reviews":s.prompt_reviews.iter().rev().map(|r|{let mut v=json!(r);v.as_object_mut().unwrap().remove("evidence");v}).collect::<Vec<_>>(),"current":TARGETS.iter().map(|k|((*k).to_owned(),current(&s,k).map(|v|v.id.clone()).unwrap_or_default())).collect::<std::collections::BTreeMap<_,_>>()})
+        json!({"versions":s.prompt_versions,"reviews":s.prompt_reviews.iter().rev().map(|r|{let mut v=json!(r);v.as_object_mut().unwrap().remove("evidence");v}).collect::<Vec<_>>(),"current":TARGETS.iter().map(|k|(*k,current(&s,k).map(|v| v.id.as_str()).unwrap_or_default())).collect::<std::collections::BTreeMap<_,_>>()})
     }
     #[cfg(test)]
     pub(crate) fn finish_prompt_review(&self, id: &str, result: Value) -> Result<Value, String> {
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        let value = apply_review(&mut s, id, result)?;
-        self.save(&s)?;
-        *lock = s;
-        Ok(value)
+        self.commit_state(|s| apply_review(s, id, result))
     }
     pub fn adopt_prompt(&self, review_id: &str) -> Result<Value, String> {
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        let index = s
-            .prompt_reviews
-            .iter()
-            .position(|r| r.id == review_id)
-            .ok_or("建议不存在")?;
-        let r = s.prompt_reviews[index].clone();
-        if r.status != "ready" {
-            return Err("该建议尚不能采用".into());
-        }
-        if current(&s, "classify").map(|v| v.id.as_str()) != Some(r.base_version.as_str())
-            || content(&s.config, "classify") != r.base_prompt
-        {
-            return Err("当前提示词已变化，请重新生成建议，避免覆盖新版本".into());
-        }
-        set_content(&mut s.config, "classify", r.proposed_prompt.clone())?;
-        let version = record(
-            &mut s,
-            "classify",
-            r.proposed_prompt.clone(),
-            "adopt",
-            &r.reason,
-        );
-        s.prompt_reviews[index].status = "adopted".into();
-        s.rule_version += 1;
-        App::audit(
-            &mut s,
-            "prompt_adopt",
-            "",
-            &r.reason,
-            json!({"version":r.base_version}),
-            json!({"version":version}),
-        );
-        self.save(&s)?;
-        *lock = s;
-        Ok(json!({"version":version}))
+        self.commit_state(|s| {
+            let index = s
+                .prompt_reviews
+                .iter()
+                .position(|r| r.id == review_id)
+                .ok_or("建议不存在")?;
+            let r = s.prompt_reviews[index].clone();
+            if r.status != "ready" {
+                return Err("该建议尚不能采用".into());
+            }
+            if current(s, "classify").map(|v| v.id.as_str()) != Some(r.base_version.as_str())
+                || content(&s.config, "classify") != r.base_prompt
+            {
+                return Err("当前提示词已变化，请重新生成建议，避免覆盖新版本".into());
+            }
+            set_content(&mut s.config, "classify", r.proposed_prompt.clone())?;
+            let version = record(s, "classify", r.proposed_prompt.clone(), "adopt", &r.reason);
+            s.prompt_reviews[index].status = "adopted".into();
+            s.rule_version += 1;
+            App::audit(
+                s,
+                "prompt_adopt",
+                "",
+                &r.reason,
+                json!({"version":r.base_version}),
+                json!({"version":version}),
+            );
+            Ok(json!({"version":version}))
+        })
     }
     pub fn rollback_prompt(&self, id: &str, expected: &str) -> Result<Value, String> {
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        let old = s
-            .prompt_versions
-            .iter()
-            .find(|v| v.id == id)
-            .cloned()
-            .ok_or("版本不存在")?;
-        if current(&s, &old.target).map(|v| v.id.as_str()) != Some(expected) {
-            return Err("提示词已更新，请刷新版本列表".into());
-        }
-        if old.id == expected {
-            return Err("当前已是此版本".into());
-        }
-        set_content(&mut s.config, &old.target, old.content.clone())?;
-        let version = record(
-            &mut s,
-            &old.target,
-            old.content,
-            "rollback",
-            &format!("回滚到 {}", old.id),
-        );
-        s.rule_version += 1;
-        App::audit(
-            &mut s,
-            "prompt_rollback",
-            "",
-            "回滚系统提示词",
-            json!({"version":expected}),
-            json!({"version":version,"restored_from":id}),
-        );
-        self.save(&s)?;
-        *lock = s;
-        Ok(json!({"version":version}))
+        self.commit_state(|s| {
+            let old = s
+                .prompt_versions
+                .iter()
+                .find(|v| v.id == id)
+                .cloned()
+                .ok_or("版本不存在")?;
+            if current(s, &old.target).map(|v| v.id.as_str()) != Some(expected) {
+                return Err("提示词已更新，请刷新版本列表".into());
+            }
+            if old.id == expected {
+                return Err("当前已是此版本".into());
+            }
+            set_content(&mut s.config, &old.target, old.content.clone())?;
+            let version = record(
+                s,
+                &old.target,
+                old.content,
+                "rollback",
+                &format!("回滚到 {}", old.id),
+            );
+            s.rule_version += 1;
+            App::audit(
+                s,
+                "prompt_rollback",
+                "",
+                "回滚系统提示词",
+                json!({"version":expected}),
+                json!({"version":version,"restored_from":id}),
+            );
+            Ok(json!({"version":version}))
+        })
     }
     pub fn retry_prompt_review(&self, id: &str) -> Result<Value, String> {
         self.retry_prompt_review_with(id, |payload| {
@@ -425,30 +401,28 @@ impl App {
         let result = invoke(
             &json!({"day":next.day,"current_prompt":next.base_prompt,"daily_evidence":next.evidence}),
         )?;
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        if s.prompt_reviews
-            .iter()
-            .find(|r| r.id == old.id)
-            .map(|r| json!(r))
-            != Some(json!(old))
-            || current(&s, "classify").map(|v| v.id.as_str()) != Some(next.base_version.as_str())
-            || content(&s.config, "classify") != next.base_prompt
-        {
-            return Err("建议或提示词版本已变化，本次结果未保存".into());
-        }
-        next.archived_at = 0;
-        let next_id = next.id.clone();
-        s.prompt_reviews.push(next);
-        let value = apply_review(&mut s, &next_id, result)?;
-        s.prompt_reviews
-            .iter_mut()
-            .find(|r| r.id == old.id)
-            .unwrap()
-            .archived_at = now();
-        self.save(&s)?;
-        *lock = s;
-        Ok(value)
+        self.commit_state(|s| {
+            if s.prompt_reviews
+                .iter()
+                .find(|r| r.id == old.id)
+                .map(|r| json!(r))
+                != Some(json!(old))
+                || current(s, "classify").map(|v| v.id.as_str()) != Some(next.base_version.as_str())
+                || content(&s.config, "classify") != next.base_prompt
+            {
+                return Err("建议或提示词版本已变化，本次结果未保存".into());
+            }
+            next.archived_at = 0;
+            let next_id = next.id.clone();
+            s.prompt_reviews.push(next);
+            let value = apply_review(s, &next_id, result)?;
+            s.prompt_reviews
+                .iter_mut()
+                .find(|r| r.id == old.id)
+                .unwrap()
+                .archived_at = now();
+            Ok(value)
+        })
     }
 }
 

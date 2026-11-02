@@ -16,7 +16,33 @@ use std::{
 
 #[derive(Deserialize)]
 struct SettingsOnly {
+    schema_version: u32,
     config: Config,
+}
+fn saved_config(root: &Path) -> Result<Config, String> {
+    let directory = crate::storage::data_dir(root);
+    if directory.join(crate::state_store::FILE).exists() {
+        let db = crate::state_store::read_connection(&directory)?;
+        let name: String = db.query_row(
+            "SELECT config FROM metadata WHERE id=1 AND json_extract(payload,'$.schema_version')=?1",
+            [crate::model::STATE_SCHEMA_VERSION], |r| r.get(0),
+        ).map_err(|e| format!("读取当前版本配置失败：{e}"))?;
+        let path = crate::state_store::config_path(&directory, &name)?;
+        return serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string());
+    }
+    let path = directory.join("state.json");
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    let saved: SettingsOnly = serde_json::from_reader(std::io::BufReader::new(
+        fs::File::open(path).map_err(|e| e.to_string())?,
+    ))
+    .map_err(|e| e.to_string())?;
+    if saved.schema_version != crate::model::STATE_SCHEMA_VERSION {
+        return Err("状态版本不匹配".into());
+    }
+    Ok(saved.config)
 }
 struct CredentialCleanup(PathBuf);
 impl Drop for CredentialCleanup {
@@ -146,7 +172,11 @@ fn analysis_route(config: &Config) -> Result<(ai_backend::Connection, String, St
             "The configured analysis API/model is unavailable; no alternative was selected".into(),
         );
     }
-    Ok((connection, configured.model, configured.reasoning_effort))
+    Ok((
+        connection.into_owned(),
+        configured.model,
+        configured.reasoning_effort,
+    ))
 }
 pub fn run(args: &[String]) -> Result<(), String> {
     if !args.iter().any(|a| a == "--allow-live-ai") {
@@ -185,18 +215,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
             .replace('\\', "/"),
     );
     crate::storage::initialize(&source)?;
-    let saved = SettingsOnly {
-        config: crate::managed_data::load_state(&source)?.config,
-    };
+    let saved = saved_config(&source)?;
     let _credential_cleanup =
         CredentialCleanup(crate::storage::data_dir(&root).join("credentials"));
-    let mut connections = saved.config.ai_connections.clone();
+    let mut connections = saved.ai_connections.clone();
     connections.insert(
         0,
         ai_backend::Connection {
             name: "Codex".into(),
-            executable: saved.config.codex.clone(),
-            models: saved.config.codex_models.clone(),
+            executable: saved.codex.clone(),
+            models: saved.codex_models.clone(),
             ..Default::default()
         },
     );
@@ -229,7 +257,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             continue;
         }
         let selection = if use_analysis_route {
-            analysis_route(&saved.config).map(|route| route.0)
+            analysis_route(&saved).map(|route| route.0)
         } else {
             configured_connection(&connections, driver)
         };
@@ -252,9 +280,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 .clone();
         }
         let model_selection = if use_analysis_route {
-            analysis_route(&saved.config).map(|(_, model, effort)| (model, effort))
+            analysis_route(&saved).map(|(_, model, effort)| (model, effort))
         } else {
-            model(&saved.config, &c)
+            model(&saved, &c)
         };
         let (model, effort) = match model_selection {
             Ok(m) => m,
@@ -357,12 +385,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                         context_path: root.join("unused-synthetic-ticket.json"),
                     };
                     fs::create_dir_all(&context.cwd).map_err(|e| e.to_string())?;
-                    let session = agent.start(
-                        context.cwd.to_str().unwrap(),
-                        "local:synthetic",
-                        &context,
-                        &config,
-                    )?;
+                    let session = agent.start(&context, &config)?;
                     let thread = session["thread"]["id"].as_str().ok_or("No session id")?;
                     fs::write(trace.join("session.json"), session.to_string())
                         .map_err(|e| e.to_string())?;
@@ -544,7 +567,6 @@ fn tool_probe(
         "",
         vec![tool.clone()],
         &config,
-        0,
     );
     let tools = json!({"tools":[{"name":tool.name,"description":tool.description,"inputSchema":tool.schema()}]});
     let schema = json!({"type":"object","additionalProperties":false,"properties":{"answer":{"type":"string"}},"required":["answer"]});
@@ -674,7 +696,7 @@ mod tests {
         assert!(configured_connection(&[Default::default()], "codex").is_err());
     }
     #[test]
-    fn analysis_probe_uses_exact_saved_route_and_never_falls_back() {
+    fn analysis_probe_loads_only_settings_and_uses_exact_saved_route() {
         let mut config = Config::default();
         config.ai_connections = vec![
             ai_backend::Connection {
@@ -695,11 +717,54 @@ mod tests {
             model: "selected-flash".into(),
             reasoning_effort: "low".into(),
         });
-        let (connection, model, effort) = analysis_route(&config).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-probe-settings");
+        {
+            let mut state = app.state.lock().unwrap();
+            state.config = config.clone();
+            app.save(&state).unwrap();
+        }
+        let db =
+            rusqlite::Connection::open(root.join("data").join(crate::state_store::FILE)).unwrap();
+        db.execute("INSERT INTO reports VALUES('unrelated',0,'not-json')", [])
+            .unwrap();
+        let legacy = root.join("legacy");
+        fs::create_dir_all(legacy.join("data")).unwrap();
+        let path = legacy.join("data/state.json");
+        let mut saved = json!({"schema_version":crate::model::STATE_SCHEMA_VERSION,"config":config,"messages":"not-a-message-map","tasks":"not-a-task-list"});
+        fs::write(&path, saved.to_string()).unwrap();
+        for source in [root.as_path(), legacy.as_path()] {
+            let loaded = saved_config(source).unwrap();
+            assert_eq!(json!(loaded), json!(config));
+            let (connection, model, effort) = analysis_route(&loaded).unwrap();
+            assert_eq!(
+                (connection.id, model, effort),
+                ("selected".into(), "selected-flash".into(), "low".into())
+            );
+        }
         assert_eq!(
-            (connection.id, model, effort),
-            ("selected".into(), "selected-flash".into(), "low".into())
+            json!(saved_config(&root.join("absent")).unwrap()),
+            json!(Config::default())
         );
+        for version in [
+            Value::Null,
+            json!(0),
+            json!(crate::model::STATE_SCHEMA_VERSION + 1),
+        ] {
+            if version.is_null() {
+                saved.as_object_mut().unwrap().remove("schema_version");
+            } else {
+                saved["schema_version"] = version.clone();
+            }
+            fs::write(&path, saved.to_string()).unwrap();
+            db.execute(
+                "UPDATE metadata SET payload=json_set(payload,'$.schema_version',json(?1))",
+                [version.to_string()],
+            )
+            .unwrap();
+            for source in [root.as_path(), legacy.as_path()] {
+                assert!(saved_config(source).is_err());
+            }
+        }
         config.ai_connections.pop();
         assert!(analysis_route(&config).is_err());
         config.model_profiles.as_mut().unwrap().analysis = None;

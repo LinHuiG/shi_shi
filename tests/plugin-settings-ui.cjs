@@ -1,13 +1,9 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { chromium } = require('playwright');
+const { withBrowser } = require('./ui-driver.cjs');
 
-(async () => {
-  const browser = await chromium.launch({ headless: true,
-    executablePath: ['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe', 'C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),
-    args: ['--disable-background-networking'] });
-  try {
+withBrowser(async(browser)=>{
     const page = await browser.newPage();
     await page.setContent('<div id="overlay" hidden><div id="dialog"></div></div>');
     await page.evaluate(() => {
@@ -162,5 +158,4 @@ const { chromium } = require('playwright');
     await page.waitForFunction(before => calls.filter(c => c.value.action === 'cancel').length === before + 1, cancelledBeforeDelay);
     assert.equal(await page.locator('iframe').count(), 0, 'late discovery must not reopen a closing editor');
     console.log('PASS source editor, isolated RPC, name suggestions/custom-name protection, one-step save, failure retry and cancellation');
-  } finally { await browser.close(); }
-})().catch(error => { console.error(error); process.exitCode = 1; });
+  }).catch(error => { console.error(error); process.exitCode = 1; });

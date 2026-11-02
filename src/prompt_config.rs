@@ -28,6 +28,7 @@ fn merge(base: &mut Catalog, text: &str) -> Result<(), String> {
             "policy_boundary",
             "memory_io",
             "notification_summary",
+            "task_status_protocol",
             "archive_permissions",
             "images",
             "concise",

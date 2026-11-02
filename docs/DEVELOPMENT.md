@@ -1,5 +1,13 @@
 # 开发与验证
 
+## 测试分层
+
+开发时先完成同批修改和代码审查，再执行相关验证。默认入口按 Git 改动选择：叶子界面模块跑相关套件；已登记 Rust 业务域跑本域及消费者，provider 跑自身及关联业务。公共状态、布局、测试驱动、内嵌说明和未知路径扩大到应用包或完整回归。显式 `rust <filter>` 用于局部修复，不代替交付前的 `full`。工作树干净时不重复跑测试；提交后可用 `--base HEAD~1` 选择上一提交。
+
+UI 统一使用 `tests/ui-driver.cjs` 选择本机 Edge，也可设置 `SHISHI_UI_BROWSER`。批量入口只启动一次浏览器，每套测试仍使用独立 Node 进程和浏览器上下文，顺序执行，避免动画测试争抢资源。单套脚本可直接运行。输出和耗时写入 `build/ui-results.json`，失败保留原断言；超时明确失败。`handling-window-ui.cjs` 合并布局、逐帧动效、草稿／弹窗三个场景，每个场景独立上下文。
+
+不要为降低测试计数合并不同故障边界。重复启动、重复夹具和退役组件检查可以收敛；保存失败、版本竞争、取消、权限、重启恢复、历史兼容及原生集成仍须保留。安装升级、真实进程和 Mica 验证集中在交付或相关边界改动时执行，实际模型回归继续单独显式授权。
+
 ## 环境
 
 - Windows x64、Rust stable 2021 edition、Cargo。
@@ -17,6 +25,11 @@ cargo test --workspace --locked --offline
 cargo build --package shishi --release --locked --offline
 ```
 
+CLI 原生回归：`python tests/cli-native.py --cli target/release/ss.exe --output build/cli-native`。
+
+插件隔离原生回归：`python tests/plugin-worker-native.py --help` 查看参数。测试编译合成 DLL 并在独立数据目录运行，覆盖共享进程、1200 次 DLL 复用、业务错误、panic、原生崩溃、取消、90 秒超时、连续失败退避、扫描游标及插件更新；需预留数分钟，不使用实际消息来源。事项状态及延后时间由 `task_status_tests`、`schedule` 和 `task-status-menu-ui.cjs` 覆盖，明天／下周读取配置的上班时间，过点的下午／晚上选项不展示。
+仅创建合成隔离目录，关闭后台扫描与调度；覆盖单实例双端生命周期、并发旧版本、事项和记忆持久化、默认不强制、异常退出恢复、本机授权，以及迁移重启后 CLI／双端标识保留，不调用真实模型。捕获标准输出执行实际 CLI，验证常驻后台不会继承管道而阻塞调用方；安装路径和数据路径均包含空格。
+
 依赖已缓存时可加 `--offline`。若默认 Rust target 不是 GNU，请明确选择匹配的 GNU toolchain/target 并准备 linker 和 windres；不要把未经测试的 MSVC 组合视为已验证。
 
 ## 界面结构
@@ -32,50 +45,12 @@ cargo build --package shishi --release --locked --offline
 ```powershell
 npm install --prefix <dependency-directory> playwright
 $env:NODE_PATH='<dependency-directory>\node_modules'
-node tests/tool-calling-ui.cjs
-node tests/task-status-menu-ui.cjs
-node tests/task-experience-ui.cjs
-python tests/tool-bridge-native.py --binary target/release/shishi.exe --output build/tool-bridge-native
-node tests/ai-controls-ui.cjs
-node tests/ui-regression.cjs
-node tests/workflow-ui.cjs
-node tests/inbox-pagination-ui.cjs
-node tests/handling-ui.cjs
-node tests/approvals-ui.cjs
-node tests/tags-ui.cjs
-node tests/ai-connections-ui.cjs
-node tests/compact-ui.cjs
-node tests/work-state-ui.cjs
-node tests/state-sync-ui.cjs
-node tests/palette-ui.cjs
-node tests/logs-ui.cjs
-node tests/log-purpose-ui.cjs
-node tests/settings-autosave-ui.cjs
-node tests/unified-tags-ui.cjs
-node tests/backdrop-ui.cjs
-node tests/analysis-display-ui.cjs
-node tests/ai-stream-ui.cjs
-node tests/layout-stability-ui.cjs
-node tests/experience-ui.cjs
-node tests/motion-ui.cjs
-node tests/backlog-ui.cjs
-node tests/approval-desktop-ui.cjs
-node tests/handling-reading-ui.cjs
-node tests/reading-motion-ui.cjs
-node tests/handling-tool-groups-ui.cjs
-node tests/todo-refinements-ui.cjs
-node tests/connection-followup-ui.cjs
-node tests/storage-settings-ui.cjs
-node tests/about-history-ui.cjs
-node tests/desktop-handling-ui.cjs
-node tests/update-schedule-ui.cjs
-node tests/pending-fixes-ui.cjs
-node tests/supplement-fixes-ui.cjs
-node tests/reading-modal-fixes-ui.cjs
-node tests/trace-dialog-ui.cjs
-node tests/empty-purpose-ui.cjs
-node tests/ai-metrics-ui.cjs
-node tests/settings-automation-ui.cjs
+python scripts/test.py                 # working tree changes, including staged/new files
+python scripts/test.py --base HEAD~1   # changes since a named revision
+python scripts/test.py --list          # inspect selection without executing
+python scripts/test.py rust backlog::  # one explicit Rust module/filter
+python scripts/test.py ui handling-window-ui.cjs
+python scripts/test.py full            # delivery: workspace + all UI/bridge + release checks
 ```
 
 Codex 处置通过桌面消息管道创建、追加和读取，测试不得重新启用独立 app-server 持有目标会话。`desktop_bridge` 的离线用例使用合成 Windows 管道，`handling_desktop` 验证状态、双端输入、草稿、结束同步和迟到结果。`--desktop-bridge-check --root <隔离目录> --output <报告>` 仅检查已登录桌面和本程序的空接入记录，不发送模型提示词；首次会建立零模型登记。逐字流式另行验收，整条消息快照不能代替文本增量订阅。
@@ -83,6 +58,14 @@ Codex 处置通过桌面消息管道创建、追加和读取，测试不得重�
 `work-state-ui.cjs` 覆盖工作状态/加班、旧步骤不再展示且历史保留、统一消息依据的搜索/排序和归档版本比较；`state-sync-ui.cjs` 模拟只返回所请求分区的后端，覆盖按页拉取、空闲无轮询和推送刷新。它们和其余套件一样使用模拟 IPC 与合成数据。
 
 UI 测试使用合成数据和模拟 IPC，浏览器无头运行，输出写入系统临时目录；不会控制正在运行的拾事。某些测试明确标记 ignored，是进程模拟入口或需要显式数据的离线实验，不应以真实资料执行后把产物提交。
+
+1.1.48 性能回归：`scoped-runtime-ui.cjs` 覆盖 3,000 步处置历史的无变化 DOM、按轮次合并流式预览、正文恢复为已保存值、过期基线重取、窗口与当前事项双选择、通知切换及跨页快捷操作等待；日志按所选日期失效，今日统计独立刷新。Rust 合成用例覆盖大上下文名称还原、满页续查和超大记录、无变化集合复用、冻结快照的分段失效与文件损坏、准备期间的配置／权限变化、按授权范围读取 SQLite、原子审批和流式背压。DSH 模拟启动器验证续轮准备复用、取消、总期限及关闭会话失败回退，测试不调用真实 DSH 服务。来源测试同时覆盖旧接口去重和可选冻结分页的账号、检查点、重复令牌、重复消息、取消及临时目录清理。
+
+Windows 下可将 `TEMP` 和 `TMP` 指向工作区内的独立测试目录；运行时 DLL 所在目录应在 `PATH` 中。本地 HTTP／IPC 模拟需要回环监听权限。环境权限失败应先核对执行条件，不应放宽产品中的路径、取消或权限检查。
+
+`task-focus-ui.cjs` 覆盖四类关注视图的互斥与并集、侧栏和导航数量、状态切换，以及上海时间的相对日期、跨午夜／月年、隐藏恢复和时间菜单到点更新；使用非上海的浏览器时区验证显示不依赖系统时区。普通时钟检查不重绘列表或请求 IPC。Rust 查询测试另核对 `focus` 与底层 `status` 的区别，沿用现有到期和重启恢复用例。
+
+`engine/reply_context_tests.rs` 使用合成消息验证多轮引用跟进、来源／会话隔离、撤回和循环链、局部与全局预算、旧父消息分页补查、并发版本拒绝及重启后依据与收件箱一致。父消息只作上下文，不消费本轮增量消息的过滤或分析进度；被省略的父消息必须经本次补查读取后才能用于更新。测试通过零额度或不存在的测试程序阻断真实模型调用。
 
 `tool-calling-ui.cjs` 覆盖全局工具启用、兼容复制及手动复制兜底、受保护的编辑页、记录列表的多关键词搜索／分页、准确条目详情和逐层返回。`task-status-menu-ui.cjs` 覆盖完成按钮的悬停菜单、原状态请求、鼠标间隙、键盘、宽窄布局及减少动态效果。Codex 适配器的合成 CLI 用例只运行本机临时夹具，验证声明工具通过、未声明工具拒绝及工具运行环境错误中止，不调用真实 CLI 模型。
 
@@ -118,7 +101,7 @@ Mica 原生检查：`./tests/backdrop-native.ps1 -Binary <shishi.exe> -OutputDir
 
 `compact-ui.cjs` 覆盖紧凑布局、帮助浮窗、事项附加字段、提示词独立编辑、收件箱只刷新与窄屏；`ai-connections-ui.cjs` 覆盖接入草稿、检测竞态、模型目录与保存/取消。
 
-运行全部 UI 回归时也包含 `node tests/state-sync-ui.cjs`；`node scripts/frontend.cjs build/frontend-preview.html` 使用同一 manifest 生成预览。DSH 原始失败帧诊断仅在显式设置 `SHISHI_ACP_DIAGNOSTICS=1` 时输出前 240 字符，勿提交本地诊断正文。
+运行全部 UI 回归使用 `node tests/run-ui.cjs`，自动发现当前套件（包括 `state-sync-ui.cjs`）；`node scripts/frontend.cjs build/frontend-preview.html` 使用同一 manifest 生成预览。DSH 原始失败帧诊断仅在显式设置 `SHISHI_ACP_DIAGNOSTICS=1` 时输出前 240 字符，勿提交本地诊断正文。
 
 DSH 检测对缺失 ACP profile 提供当前启动器及 DSH_HOME 对应的 PowerShell 初始化命令；不会自动运行命令或重置已有 profile。不可读、损坏和受限补丁缺失分别报错。初始化语义参考 [官方 CLI 行为说明](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/reference/README.md)；初始化后必须重新通过版本和受限配置检查。回归使用合成文件及模拟 ACP，不修改真实 DSH 用户目录。
 
@@ -126,7 +109,7 @@ DSH 缺少 ACP profile 时可显式确认初始化：`dsh_initialize_acp` 要求
 
 日志页通过 activity_query 按上海日期和类型读取 JSONL（含轮转文件），筛选后分页，不依赖实时快照的最后 60 条。查询只读，按页返回并保留审计下标；损坏行单独计数，文件读取失败明确返回错误。
 
-`analysis-display-ui.cjs` 覆盖显示优先级与精简标签、成功分析时间、固定请求来源、DSH 内部供应商、可见模型全选／反选与结构化请求比较。`SHISHI_UI_BROWSER` 可为 `ai-connections-ui.cjs` 指定 Chrome 可执行文件，独立复核相同保存失败与焦点流程。HTTP 回归含约 32 秒的本地慢响应，验证 WinHTTP 不再沿用默认接收期限；不访问真实模型。
+`analysis-display-ui.cjs` 覆盖显示优先级与精简标签、成功分析时间、固定请求来源、DSH 内部供应商、可见模型全选／反选与结构化请求比较。`SHISHI_UI_BROWSER` 可为 `ai-connections-ui.cjs` 指定 Chrome 可执行文件，独立复核相同保存失败与焦点流程。HTTP 回归覆盖总期限、等待头／正文时取消、流输出、连接复用及不受信任证书拒绝；原 WinHTTP 默认接收期限的 32 秒测试随旧实现退役。全部使用本地合成服务，不访问真实模型。
 
 真实接入回归必须遵循 [固定矩阵与合成数据规范](LIVE_AI_REGRESSION.md)，仅在用户明确授权后运行。
 
@@ -151,13 +134,13 @@ DSH 缺少 ACP profile 时可显式确认初始化：`dsh_initialize_acp` 要求
 
 原生审批自检：`shishi.exe --ui-smoke-approval --root <new-isolated-directory>`。创建内存中的合成审批，仅检查独立 WebView、工作区位置、滚动/按钮、关闭/解决后的隐藏以及主窗口托盘生命周期；不执行命令或调用模型。自检要求显式指定全新隔离目录，详细结果写入该目录的 `data/ui-smoke.json`。
 
-1.1.10 离线回归补充：`handling-reading-ui.cjs` 验证实时进度和结论共用底部展开收起、展开正文与长代码块均无高度上限、主界面双向滚动、三种窗口尺寸、刷新及流式追加保留节点和阅读位置、轮次隔离、短内容隐藏按钮及后续增长重新显示。既有体验、动效和待办回归按新的整框阅读规则检查，审批弹框继续保持独立滚动边界。
+1.1.10 离线回归补充：`handling-window-ui.cjs` 验证实时进度和结论共用底部展开收起、展开正文与长代码块均无高度上限、主界面双向滚动、三种窗口尺寸、刷新及流式追加保留节点和阅读位置、轮次隔离、短内容隐藏按钮及后续增长重新显示。既有体验、动效和待办回归按新的整框阅读规则检查，审批弹框继续保持独立滚动边界。
 
 1.1.11 离线回归补充：阅读框收起时支持框内滚动，展开时将原内层偏移转入主界面，保留阅读位置与换行宽度，前后内容完整保留。检查展开底栏悬浮、末行不被遮挡、收起后的可达性及两框上下边界衔接；保留刷新、追加与轮次状态验证。
 
-1.1.12 离线回归补充：`reading-motion-ui.cjs` 按逐帧文字坐标验证中心锚点、真实高度过渡、无滚动往返位置、刷新与连续反向、不可取消的连续边界输入；`todo-refinements-ui.cjs` 覆盖已交接会话仅结束本地关联后新建、本地已完成会话结束、范围空选与全局清除、归档和搜索边界，以及三种窗口下日志列表独立滚动与错误操作保留。Rust 使用模拟执行端验证结束关联不停止远端、原子保存、重载保持和旧事件隔离。
+1.1.12 离线回归补充：`handling-window-ui.cjs` 按逐帧文字坐标验证中心锚点、真实高度过渡、无滚动往返位置、刷新与连续反向、不可取消的连续边界输入；`todo-refinements-ui.cjs` 覆盖已交接会话仅结束本地关联后新建、本地已完成会话结束、范围空选与全局清除、归档和搜索边界，以及三种窗口下日志列表独立滚动与错误操作保留。Rust 使用模拟执行端验证结束关联不停止远端、原子保存、重载保持和旧事件隔离。
 
-补充验收：`supplement-fixes-ui.cjs` 覆盖无多余外层标题、耗时行删除、键盘发送及整行删除。`reading-modal-fixes-ui.cjs` 覆盖记录标题在内外阅读区的吸顶位置、所属记录边界、文字宽度，以及原层弹窗退场的尺寸、模糊、滚动锁和快速开关。`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/update-download-metadata.ps1` 只加载下载脚本的纯分类函数，用合成 HTTP 响应离线验证限流与错误分类，不执行下载器。
+补充验收：`supplement-fixes-ui.cjs` 覆盖无多余外层标题、耗时行删除、键盘发送及整行删除。`handling-window-ui.cjs` 覆盖记录标题在内外阅读区的吸顶位置、所属记录边界、文字宽度，以及原层弹窗退场的尺寸、模糊、滚动锁和快速开关。`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File tests/update-download-metadata.ps1` 只加载下载脚本的纯分类函数，用合成 HTTP 响应离线验证限流与错误分类，不执行下载器。
 
 `trace-dialog-ui.cjs` 使用合成调用记录验证两个主阅读框的紧凑高度、四种窗口下默认无外层滚动、详情展开后滚动，以及软件外失焦保留和软件内遮罩关闭；不读取真实提示词。
 
@@ -188,4 +171,4 @@ SS-207—SS-212：`task-experience-ui.cjs` 验证连续处置对话、结论去�
 
 桌面桥接只对明确的返回大小超限缩小只读请求；合成单元测试验证四档上限、非大小错误不重试、旧页失败保留最新页和游标，以及精简响应不清空已保存内容。
 
-AI 处置使用 `handling-window.js` 的独立非模态页面，运行时查询跟随弹页所属事项，不随底层事项选择变化。整体阅读框的紧凑／展开模式已移除，相关用例改为完整对话几何边界与工具展开测试：`handling-reading-ui.cjs` 验证固定标题／输入、单一滚动区和窗口尺寸；`reading-motion-ui.cjs` 逐帧检查贴底、非贴底、连续开关及新增进展；`reading-modal-fixes-ui.cjs` 检查失焦、重开草稿／阅读位置、子弹窗和模型标记。`handling-window-fixture.cjs` 只提供合成资料。模型元数据每次回溯最多 4 MiB，并以 64 KiB 重叠避免漏掉跨页记录；严格核对指定会话和轮次，缺失时的“上次报告”仅来自已核实记录。
+AI 处置使用 `handling-window.js` 的独立非模态页面，运行时查询跟随弹页所属事项，不随底层事项选择变化。整体阅读框的紧凑／展开模式已移除，相关用例改为完整对话几何边界与工具展开测试：`handling-window-ui.cjs` 验证固定标题／输入、单一滚动区和窗口尺寸；`handling-window-ui.cjs` 逐帧检查贴底、非贴底、连续开关及新增进展；`handling-window-ui.cjs` 检查失焦、重开草稿／阅读位置、子弹窗和模型标记。`handling-window-fixture.cjs` 只提供合成资料。模型元数据每次回溯最多 4 MiB，并以 64 KiB 重叠避免漏掉跨页记录；严格核对指定会话和轮次，缺失时的“上次报告”仅来自已核实记录。

@@ -15,7 +15,6 @@ struct Agent {
     interrupted: AtomicUsize,
     observed: AtomicUsize,
     submitted: AtomicUsize,
-    steered: AtomicUsize,
     fail_read: AtomicBool,
     fail_send: AtomicBool,
     read_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
@@ -32,13 +31,12 @@ impl Agent {
             interrupted: AtomicUsize::new(0),
             observed: AtomicUsize::new(0),
             submitted: AtomicUsize::new(0),
-            steered: AtomicUsize::new(0),
             fail_read: AtomicBool::new(false),
             fail_send: AtomicBool::new(false),
             read_gate: Mutex::new(None),
             history: Mutex::new(json!({"data":[]})),
             pending: Mutex::new(vec![
-                json!({"id":"approval","method":"item/commandExecution/requestApproval","params":{"command":"synthetic-command"}}),
+                json!({"id":"approval","method":"dsh/tool/requestApproval","params":{"tool_call":{"title":"Synthetic tool"},"dsh_options":[{"id":"once","name":"Allow","kind":"allow_once"},{"id":"no","name":"Reject","kind":"reject_once"}]}}),
             ]),
         }
     }
@@ -57,11 +55,8 @@ impl AgentSession for Agent {
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
-    fn start(&self, _: &str, _: &str, _: &ContextTool, _: &Config) -> Result<Value, String> {
+    fn start(&self, _: &ContextTool, _: &Config) -> Result<Value, String> {
         Ok(json!({"thread":{"id":id()},"model":"synthetic"}))
-    }
-    fn rename(&self, _: &str, _: &str) -> Result<(), String> {
-        Ok(())
     }
     fn submit(&self, _: &str, _: &str, _: &Config, _: &str) -> Result<Value, String> {
         self.submitted.fetch_add(1, Ordering::SeqCst);
@@ -69,13 +64,6 @@ impl AgentSession for Agent {
             return Err("synthetic uncertain send".into());
         }
         Ok(json!({"turn":{"id":id()}}))
-    }
-    fn steer(&self, _: &str, _: &str, _: &str, _: &str) -> Result<(), String> {
-        self.steered.fetch_add(1, Ordering::SeqCst);
-        if self.fail_send.load(Ordering::SeqCst) {
-            return Err("synthetic uncertain steer".into());
-        }
-        Ok(())
     }
     fn read(&self, _: &str) -> Result<Value, String> {
         self.observed.fetch_add(1, Ordering::SeqCst);
@@ -98,41 +86,36 @@ impl AgentSession for Agent {
     fn resume(&self, _: &str, _: &ContextTool) -> Result<Value, String> {
         Ok(json!({"thread":{}}))
     }
-    fn unsubscribe(&self, _: &str) -> Result<(), String> {
-        Ok(())
-    }
-    fn interrupt(&self, _: &str, _: &str) -> Result<(), String> {
+    fn interrupt(&self, _: &str) -> Result<(), String> {
         self.interrupted.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    fn events(&self) -> Vec<ai_backend::UsageEvent> {
+    fn events(&self) -> Vec<AgentEvent> {
         vec![]
     }
     fn requests(&self, _: &str) -> Vec<Value> {
         self.pending.lock().unwrap().clone()
     }
-    fn respond(&self, _: &str, _: &str, _: &Value, _: &Value) -> Result<(), String> {
+    fn respond(&self, _: &str, _: &str, _: &Value) -> Result<(), String> {
         self.answered.fetch_add(1, Ordering::SeqCst);
         self.pending.lock().unwrap().clear();
         Ok(())
     }
 }
-fn fixture(driver: &str) -> (Arc<App>, Arc<Agent>, std::path::PathBuf) {
+fn fixture() -> (Arc<App>, Arc<Agent>, std::path::PathBuf) {
     let root = std::env::temp_dir().join(format!("shishi-stop-{}", id()));
     let app = Arc::new(App::load(root.clone()).unwrap());
     {
         let mut s = app.state.lock().unwrap();
         s.config.model_profiles = None;
-        if driver == "dsh" {
-            let connection = Connection {
-                id: "synthetic-dsh".into(),
-                driver: "dsh".into(),
-                executable: "synthetic".into(),
-                ..Default::default()
-            };
-            s.config.selected_connection = connection.id.clone();
-            s.config.ai_connections.push(connection);
-        }
+        let connection = Connection {
+            id: "synthetic-dsh".into(),
+            driver: "dsh".into(),
+            executable: "synthetic".into(),
+            ..Default::default()
+        };
+        s.config.selected_connection = connection.id.clone();
+        s.config.ai_connections.push(connection);
         s.tasks.push(Task {
             id: "task".into(),
             title: "Keep this task".into(),
@@ -156,7 +139,9 @@ fn fixture(driver: &str) -> (Arc<App>, Arc<Agent>, std::path::PathBuf) {
             status: "inProgress".into(),
             question: "preserve history".into(),
             ..Default::default()
-        }],
+        }
+        .into()]
+        .into(),
         ..Default::default()
     });
     app.handling_client
@@ -171,65 +156,65 @@ fn stop() -> Value {
 }
 
 #[test]
-fn terminate_is_independent_of_submission_lock_and_ignores_late_events_on_both_drivers() {
-    for driver in ["dsh"] {
-        let (app, agent, root) = fixture(driver);
-        let other = Arc::new(Agent::new());
-        app.handling_client
+fn terminate_is_independent_of_submission_lock_and_ignores_late_events() {
+    let (app, agent, root) = fixture();
+    let other = Arc::new(Agent::new());
+    app.handling_client
+        .lock()
+        .unwrap()
+        .insert("run:other".into(), other.clone());
+    let submission = app.handling_action.lock().unwrap();
+    app.handling_terminate(&stop()).unwrap();
+    drop(submission);
+    assert!(!agent.is_alive());
+    assert!(other.is_alive());
+    assert!(app.desktop_approvals().is_empty());
+    let mut run = app.run("task").unwrap();
+    assert!(can_restart(&run));
+    assert_eq!(run.rounds[0].question, "preserve history");
+    let before = json!(run);
+    let event = AgentEvent {
+        thread_id: run.thread_id.clone(),
+        turn_id: "late".into(),
+        update: AgentUpdate::Completed(json!({"id":"late","status":"completed"})),
+    };
+    apply_event(&mut run, &event);
+    apply_history(
+        &mut run,
+        &json!([{"id":"old-turn","status":"completed"}]),
+        &Value::Null,
+    );
+    assert_eq!(json!(run), before);
+    assert_eq!(
+        app.update_run("run", |r| r.status = "inProgress".into())
+            .unwrap_err(),
+        STOPPED
+    );
+    assert_eq!(app.state.lock().unwrap().tasks[0].title, "Keep this task");
+    assert!(app.handling_request(&json!({"task_id":"task","run_id":"run","thread_id":"old-thread","request_id":"\"approval\"","action":"dshOption","option_id":"once"})).is_err());
+    assert_eq!(agent.answered.load(Ordering::SeqCst), 0);
+    drop(app);
+    let loaded = App::load(root.clone()).unwrap();
+    assert_eq!(
+        loaded
+            .state
             .lock()
             .unwrap()
-            .insert("run:other".into(), other.clone());
-        let submission = app.handling_action.lock().unwrap();
-        app.handling_terminate(&stop()).unwrap();
-        drop(submission);
-        assert!(!agent.is_alive());
-        assert!(other.is_alive());
-        assert!(app.desktop_approvals().is_empty());
-        let mut run = app.run("task").unwrap();
-        assert!(can_restart(&run));
-        assert_eq!(run.rounds[0].question, "preserve history");
-        let before = json!(run);
-        apply_notification(
-            &mut run,
-            &json!({"method":"turn/started","params":{"turn":{"id":"late","status":"inProgress"}}}),
-        );
-        apply_history(
-            &mut run,
-            &json!([{"id":"old-turn","status":"completed"}]),
-            &Value::Null,
-        );
-        assert_eq!(json!(run), before);
-        assert_eq!(
-            app.update_run("run", |r| r.status = "inProgress".into())
-                .unwrap_err(),
-            STOPPED
-        );
-        assert_eq!(app.state.lock().unwrap().tasks[0].title, "Keep this task");
-        assert!(app.handling_request(&json!({"task_id":"task","run_id":"run","thread_id":"old-thread","request_id":"\"approval\"","action":"accept"})).is_err());
-        assert_eq!(agent.answered.load(Ordering::SeqCst), 0);
-        drop(app);
-        let loaded = App::load(root.clone()).unwrap();
-        assert_eq!(
-            loaded
-                .state
-                .lock()
-                .unwrap()
-                .handling
-                .runs
-                .iter()
-                .find(|r| r.id == "run")
-                .unwrap()
-                .status,
-            "terminated"
-        );
-        drop(loaded);
-        std::fs::remove_dir_all(root).unwrap();
-    }
+            .handling
+            .runs
+            .iter()
+            .find(|r| r.id == "run")
+            .unwrap()
+            .status,
+        "terminated"
+    );
+    drop(loaded);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn stop_marker_is_saved_before_waiting_for_a_client_and_blocks_other_updates() {
-    let (app, agent, root) = fixture("dsh");
+    let (app, agent, root) = fixture();
     let cache = app.handling_client.lock().unwrap();
     let worker = app.clone();
     let stop_thread = std::thread::spawn(move || worker.handling_terminate(&stop()));
@@ -252,7 +237,7 @@ fn stop_marker_is_saved_before_waiting_for_a_client_and_blocks_other_updates() {
 }
 #[test]
 fn failed_close_or_final_save_keeps_stop_marker_and_can_be_retried() {
-    let (app, agent, root) = fixture("dsh");
+    let (app, agent, root) = fixture();
     agent.fail_close.store(true, Ordering::SeqCst);
     assert!(app.handling_terminate(&stop()).is_err());
     let r = app.run("task").unwrap();
@@ -271,7 +256,7 @@ fn failed_close_or_final_save_keeps_stop_marker_and_can_be_retried() {
 }
 #[test]
 fn failed_initial_save_never_closes_a_backend_and_desktop_control_is_preserved() {
-    let (app, agent, root) = fixture("dsh");
+    let (app, agent, root) = fixture();
     crate::test_support::persistence_failure(&root, true).unwrap();
     assert!(app.handling_terminate(&stop()).is_err());
     assert!(agent.is_alive());
@@ -285,11 +270,16 @@ fn failed_initial_save_never_closes_a_backend_and_desktop_control_is_preserved()
 }
 #[test]
 fn approval_identifies_its_original_run_and_cannot_follow_a_reused_request_id() {
-    let (app, agent, root) = fixture("dsh");
-    let mut request = json!({"task_id":"task","run_id":"run","thread_id":"wrong-thread","request_id":"\"approval\"","action":"accept"});
+    let (app, agent, root) = fixture();
+    let mut request = json!({"task_id":"task","run_id":"run","thread_id":"wrong-thread","request_id":"\"approval\"","action":"dshOption","option_id":"once"});
     assert!(app.handling_request(&request).is_err());
     assert_eq!(agent.answered.load(Ordering::SeqCst), 0);
     request["thread_id"] = json!("old-thread");
+    let mut batch = request.clone();
+    batch["action"] = json!("acceptAll");
+    batch["request_ids"] = json!(["\"approval\""]);
+    assert!(app.handling_request(&batch).unwrap_err().contains("逐项"));
+    assert_eq!(agent.answered.load(Ordering::SeqCst), 0);
     app.handling_request(&request).unwrap();
     assert!(app.handling_request(&request).is_err());
     assert_eq!(agent.answered.load(Ordering::SeqCst), 1);
@@ -298,7 +288,7 @@ fn approval_identifies_its_original_run_and_cannot_follow_a_reused_request_id() 
 }
 #[test]
 fn a_terminated_run_allows_a_new_formal_session_and_preserves_the_old_one() {
-    let (app, _, root) = fixture("dsh");
+    let (app, _, root) = fixture();
     app.handling_terminate(&stop()).unwrap();
     let fresh = Arc::new(Agent::new());
     let key = app.handling_connection().unwrap().cache_key();
@@ -318,18 +308,22 @@ fn a_terminated_run_allows_a_new_formal_session_and_preserves_the_old_one() {
 }
 #[test]
 fn command_unicode_and_already_damaged_output_are_preserved_through_events_and_snapshots() {
-    let (app, _, root) = fixture("dsh");
+    let (app, _, root) = fixture();
     let healthy = "D:/合成资料/路径🚀/文件.txt";
     let damaged = "D:/\u{fffd}\u{fffd}/file.txt";
     for text in [healthy, damaged] {
-        let event = json!({"method":"item/completed","params":{"turnId":"old-turn","item":{"type":"commandExecution","id":"command","command":"synthetic","aggregatedOutput":text}}});
-        let decoded: Value = serde_json::from_slice(&serde_json::to_vec(&event).unwrap()).unwrap();
-        app.update_run("run", |r| apply_notification(r, &decoded))
-            .unwrap();
+        let item = json!({"type":"mcpToolCall","id":"command","tool":"synthetic","arguments":null,"result":text});
+        let decoded = serde_json::from_slice(&serde_json::to_vec(&item).unwrap()).unwrap();
+        let event = AgentEvent {
+            thread_id: "old-thread".into(),
+            turn_id: "old-turn".into(),
+            update: AgentUpdate::Item(decoded),
+        };
+        app.update_run("run", |r| apply_event(r, &event)).unwrap();
         let snapshot = app.snapshot();
         assert_eq!(
             snapshot["handling"][0]["rounds"][0]["steps"][0]["text"],
-            format!("synthetic\n{text}")
+            format!(" / synthetic\nnull\n{text}")
         );
     }
     drop(app);
@@ -338,7 +332,7 @@ fn command_unicode_and_already_damaged_output_are_preserved_through_events_and_s
 
 #[test]
 fn a_completed_local_run_can_be_closed_for_a_new_session() {
-    let (app, agent, root) = fixture("dsh");
+    let (app, agent, root) = fixture();
     {
         let mut s = app.state.lock().unwrap();
         s.handling.runs[0].status = "completed".into();

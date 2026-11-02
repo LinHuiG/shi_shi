@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     fs,
-    io::Read,
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
@@ -504,22 +503,14 @@ fn transfer(app: &App, dir: &Path, input: &Value, timeout: u64) -> Result<String
     let script = dir.join("download.ps1");
     fs::write(&script, include_str!("../assets/update-download.ps1")).map_err(|e| e.to_string())?;
     let system = std::env::var_os("SystemRoot").ok_or("系统目录不可用")?;
-    let mut command =
-        Command::new(PathBuf::from(system).join("System32/WindowsPowerShell/v1.0/powershell.exe"));
-    command
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
-        .arg(script);
-    crate::process::run_with_progress(
+    let mut command = crate::process::powershell(system);
+    command.arg("-File").arg(script);
+    crate::process::run_cancellable(
         command,
         Some(&input.to_string()),
         timeout,
         dir,
+        None,
         &mut |text| {
             for line in text.lines() {
                 if let Some(n) = line
@@ -596,51 +587,12 @@ fn plain_file(path: &Path) -> Result<fs::Metadata, String> {
     Ok(meta)
 }
 pub(crate) fn sha256(path: &Path) -> Result<String, String> {
-    use windows_sys::Win32::Security::Cryptography::*;
-    unsafe {
-        let mut algorithm = std::ptr::null_mut();
-        let mut hash = std::ptr::null_mut();
-        if BCryptOpenAlgorithmProvider(&mut algorithm, BCRYPT_SHA256_ALGORITHM, std::ptr::null(), 0)
-            < 0
-        {
-            return Err("SHA-256 不可用".into());
-        }
-        let result = (|| {
-            if BCryptCreateHash(
-                algorithm,
-                &mut hash,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-                0,
-                0,
-            ) < 0
-            {
-                return Err("SHA-256 初始化失败".into());
-            }
-            let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-            let mut buffer = vec![0u8; 65536];
-            loop {
-                let n = file.read(&mut buffer).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                if BCryptHashData(hash, buffer.as_ptr(), n as u32, 0) < 0 {
-                    return Err("SHA-256 读取失败".into());
-                }
-            }
-            let mut digest = [0u8; 32];
-            if BCryptFinishHash(hash, digest.as_mut_ptr(), 32, 0) < 0 {
-                return Err("SHA-256 校验失败".into());
-            }
-            Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
-        })();
-        if !hash.is_null() {
-            BCryptDestroyHash(hash);
-        }
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        result
-    }
+    use sha2::{Digest, Sha256};
+    let mut file =
+        std::io::BufReader::with_capacity(65536, fs::File::open(path).map_err(|e| e.to_string())?);
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file, &mut hash).map_err(|e| e.to_string())?;
+    Ok(format!("{:x}", hash.finalize()))
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -698,7 +650,7 @@ pub fn install(app: &Arc<App>, scheduled: Option<&str>) -> Result<Value, String>
             executable,
             package,
             installer,
-            args: std::env::args().skip(1).collect(),
+            args: app.local_runtime.restart_args(),
         };
         let plan_path = helper_dir.join("plan.json");
         atomic_json(&plan_path, &plan)?;
@@ -814,17 +766,9 @@ fn release_helpers(install_dir: &Path, work: &Path) -> Result<(), String> {
     let system = std::env::var_os("SystemRoot").ok_or("系统目录不可用")?;
     let script = work.join("release-helpers.ps1");
     fs::write(&script, include_str!("../installer/process.ps1")).map_err(|e| e.to_string())?;
-    let mut command =
-        Command::new(PathBuf::from(system).join("System32/WindowsPowerShell/v1.0/powershell.exe"));
+    let mut command = crate::process::powershell(system);
     command
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-        ])
+        .arg("-File")
         .arg(&script)
         .arg("-InstallDir")
         .arg(install_dir)

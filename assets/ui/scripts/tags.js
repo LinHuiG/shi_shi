@@ -1,8 +1,7 @@
 let selectedTags = null,
   selectedPriorities = null,
   tagExpanded = new Set(),
-  tagSave = Promise.resolve(),
-  tagSavePending = 0;
+  tagSave = Promise.resolve();
 const tagOrder = new Map();
 function rememberTagOrder(group) {
   const key = group?.dataset.filterGroup;
@@ -45,7 +44,7 @@ function legacyTaskTags(t) {
 function taskTags(t) {
   return [
     ...new Map(
-      (state.tag_state?.unified ? t.tags || [] : legacyTaskTags(t)).map((tag) => [
+      (t.tags || []).map((tag) => [
         JSON.stringify([tag.kind, tag.value]),
         tag,
       ]),
@@ -67,9 +66,7 @@ function orderedGroups(groups) {
 function shownTags(t) {
   const tags = t.effective_tags || taskTags(t),
     groups = orderedGroups(state.tag_state?.groups || []),
-    visible = state.tag_state?.unified
-      ? tags.filter((t) => groups.some((g) => g.name === t.kind && g.values.includes(t.value)))
-      : tags;
+    visible = tags.filter((t) => groups.some((g) => g.name === t.kind && g.values.includes(t.value)));
   return [...visible].sort((a, b) => {
     const rank = (k) => {
       const g = groups.find((g) => g.name === k);
@@ -79,7 +76,7 @@ function shownTags(t) {
   });
 }
 function priorityKind() {
-  return state.tag_state?.unified ? state.tag_state.priority_kind || '' : '事项等级';
+  return state.tag_state?.priority_kind || '';
 }
 function taskRank(t) {
   if (Number.isFinite(t.priority_rank)) return t.priority_rank;
@@ -120,23 +117,7 @@ function revealTaskTags(task) {
   return changed;
 }
 function filterGroups() {
-  const groups = structuredClone(state.tag_state?.groups || []);
-  if (!state.tag_state?.unified) {
-    if (!groups.some((g) => g.name === '事项等级'))
-      groups.unshift({ name: '事项等级', values: ['紧急', '高', '普通', '低'] });
-    for (const t of state.tasks) for (const tag of taskTags(t)) add(tag);
-    for (const [kind, values] of Object.entries(tagSelection()))
-      for (const value of values) add({ kind, value });
-  }
-  function add(t) {
-    let g = groups.find((g) => g.name === t.kind);
-    if (!g) {
-      g = { name: t.kind, values: [] };
-      groups.push(g);
-    }
-    if (!g.values.includes(t.value)) g.values.push(t.value);
-  }
-  return orderedGroups(groups);
+  return orderedGroups(state.tag_state?.groups || []);
 }
 function tagFilterBar() {
   const selection = tagSelection(),
@@ -150,7 +131,7 @@ function tagFilterBar() {
     {
       name: '事项范围',
       key: 'view',
-      values: ['待处理', '已完成', '归档'],
+      values: [...taskFocusLabels, '已完成', '归档'],
       selected: tab === '全部' ? [] : [tab],
     },
     ...filterGroups().map((g) => ({
@@ -159,7 +140,7 @@ function tagFilterBar() {
       selected: selection[g.name] || [],
     })),
   ];
-  return `<div class="tag-filters" aria-label="事项筛选" title="同类型任选其一，不同类型同时满足"><button class="tag-all ${active ? '' : 'selected'}" data-tag-clear aria-pressed="${!active}" title="清空范围、标签和等级筛选">全部</button><div class="tag-groups">${groups
+  return `<div class="tag-filters" data-ui-key="task-filters" aria-label="事项筛选" title="同类型任选其一，不同类型同时满足"><button class="tag-all ${active ? '' : 'selected'}" data-tag-clear aria-pressed="${!active}" title="清空范围、标签和等级筛选">全部</button><div class="tag-groups">${groups
     .map(
       (g) =>
         `<div class="tag-slot" data-filter-slot="${esc(g.key)}"><section class="tag-group" data-filter-group="${esc(g.key)}"><button class="tag-group-title" data-tag-expand="${esc(g.name)}" data-filter-key="${esc(g.key)}" aria-expanded="false"><span>${esc(g.name)}</span><small>${g.key === 'view' ? '' : g.selected.length || ''}</small><span class="tag-chevron">＋</span></button><div class="tag-options">${orderedTagValues(
@@ -248,7 +229,6 @@ function collapseTagGroups() {
 function saveTagFilters() {
   const filters = structuredClone(tagSelection()),
     priorities = [...prioritySelection()];
-  tagSavePending++;
   tagSave = tagSave
     .catch(() => {})
     .then(() => rpc('tag_filters', { filters, priorities }))
@@ -258,10 +238,7 @@ function saveTagFilters() {
         state.tag_state.priorities = priorities;
       }
     })
-    .catch((e) => toast('筛选保存失败：' + e.message))
-    .finally(() => {
-      tagSavePending--;
-    });
+    .catch((e) => toast('筛选保存失败：' + e.message));
 }
 function focusTagGroup(group) {
   if (!group) {

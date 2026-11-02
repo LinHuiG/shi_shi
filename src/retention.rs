@@ -1,31 +1,13 @@
 //! Retention shared by messages, audit history, archived tasks and trace files.
 //! Audit indices are stable inside a state file, so deletion rebases every cursor
 //! and evidence reference that points into the audit vector.
-use crate::model::{Audit, Message, State, Task};
+use crate::model::{json_chars, State, Task};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
-
-const ACTIVE_RUN: [&str; 7] = [
-    "starting",
-    "submitting",
-    "inProgress",
-    "waiting",
-    "uncertain",
-    "disconnected",
-    "stopping",
-];
 
 /// Expired records are replaced by a compact statistical digest. The cap keeps
 /// the digest itself bounded even after years of cleanup.
 pub const DIGEST_LIMIT: usize = 8_000;
-
-fn is_active(status: &str) -> bool {
-    ACTIVE_RUN.contains(&status)
-}
-
-fn digest_len(value: &Value) -> usize {
-    value.to_string().chars().count()
-}
 
 fn section<'a>(digest: &'a mut Value, key: &str) -> &'a mut Value {
     if !digest.is_object() {
@@ -54,7 +36,7 @@ fn touch(section: &mut Value, first: i64, last: i64, count: u64) {
     object.insert("last".into(), json!(last));
 }
 
-fn merge_counts(section: &mut Value, field: &str, incoming: BTreeMap<String, u64>, cap: usize) {
+fn merge_counts(section: &mut Value, field: &str, incoming: BTreeMap<&str, u64>, cap: usize) {
     if incoming.is_empty() {
         return;
     }
@@ -65,7 +47,7 @@ fn merge_counts(section: &mut Value, field: &str, incoming: BTreeMap<String, u64
         .filter_map(|row| Some((row["name"].as_str()?.to_string(), row["count"].as_u64()?)))
         .collect::<BTreeMap<_, _>>();
     for (name, count) in incoming {
-        *merged.entry(name).or_default() += count;
+        *merged.entry(name.into()).or_default() += count;
     }
     let mut rows = merged.into_iter().collect::<Vec<_>>();
     rows.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
@@ -76,110 +58,76 @@ fn merge_counts(section: &mut Value, field: &str, incoming: BTreeMap<String, u64
         .collect::<Vec<_>>());
 }
 
-pub fn add_messages(s: &mut State, messages: &[Message]) {
-    if messages.is_empty() {
-        return;
-    }
+/// Summarize only timestamps and categories; record bodies stay borrowed.
+pub fn record_pruned<'a>(
+    digest: &mut Value,
+    key: &str,
+    field: &str,
+    rows: impl Iterator<Item = (i64, &'a str)>,
+) -> bool {
     let mut first = i64::MAX;
     let mut last = i64::MIN;
-    let mut sources = BTreeMap::new();
-    for message in messages {
-        first = first.min(message.time);
-        last = last.max(message.time);
-        let name = if message.source_name.trim().is_empty() {
-            message.source_id.clone()
-        } else {
-            message.source_name.clone()
-        };
-        *sources.entry(name).or_insert(0) += 1;
-    }
-    let section = section(&mut s.retention_digest, "messages");
-    touch(section, first, last, messages.len() as u64);
-    merge_counts(section, "sources", sources, 8);
-}
-
-pub fn add_records(s: &mut State, audits: &[Audit]) {
-    if audits.is_empty() {
-        return;
-    }
-    let mut first = i64::MAX;
-    let mut last = i64::MIN;
-    let mut kinds = BTreeMap::new();
-    for audit in audits {
-        first = first.min(audit.time);
-        last = last.max(audit.time);
-        *kinds.entry(audit.kind.clone()).or_insert(0) += 1;
-    }
-    let section = section(&mut s.retention_digest, "records");
-    touch(section, first, last, audits.len() as u64);
-    merge_counts(section, "kinds", kinds, 8);
-}
-
-pub fn add_tasks(s: &mut State, tasks: &[Task]) {
-    if tasks.is_empty() {
-        return;
-    }
-    let mut first = i64::MAX;
-    let mut last = i64::MIN;
-    let mut statuses = BTreeMap::new();
-    for task in tasks {
-        let at = if task.archived_at > 0 {
-            task.archived_at
-        } else {
-            task.updated
-        };
+    let mut count = 0;
+    let mut groups = BTreeMap::new();
+    for (at, name) in rows {
         first = first.min(at);
         last = last.max(at);
-        *statuses.entry(task.status.clone()).or_insert(0) += 1;
+        count += 1;
+        *groups.entry(name).or_insert(0) += 1;
     }
-    let section = section(&mut s.retention_digest, "tasks");
-    touch(section, first, last, tasks.len() as u64);
-    merge_counts(section, "statuses", statuses, 8);
+    if count == 0 {
+        return false;
+    }
+    let section = section(digest, key);
+    touch(section, first, last, count);
+    merge_counts(section, field, groups, 8);
+    true
+}
+
+fn archived_at(task: &Task) -> i64 {
+    if task.archived_at > 0 {
+        task.archived_at
+    } else {
+        task.updated
+    }
+}
+
+fn audit_index(source: &str) -> Option<usize> {
+    source
+        .strip_prefix("audit:")
+        .and_then(|value| value.parse().ok())
 }
 
 /// Keep the digest bounded: first drop per-source/kind/status detail, then
 /// drop individual time ranges, and finally keep only the aggregate counts.
 pub fn compact_digest(s: &mut State) {
-    if s.retention_digest.is_null() || digest_len(&s.retention_digest) <= DIGEST_LIMIT {
+    if s.retention_digest.is_null() || json_chars(&s.retention_digest) <= DIGEST_LIMIT {
         return;
     }
-    if let Some(object) = s.retention_digest.as_object_mut() {
-        for key in ["messages", "records", "tasks"] {
-            if let Some(section) = object.get_mut(key).and_then(Value::as_object_mut) {
-                section.remove("sources");
-                section.remove("kinds");
-                section.remove("statuses");
+    for fields in [&["sources", "kinds", "statuses"][..], &["first", "last"]] {
+        if let Some(object) = s.retention_digest.as_object_mut() {
+            for key in ["messages", "records", "tasks"] {
+                if let Some(section) = object.get_mut(key).and_then(Value::as_object_mut) {
+                    for field in fields {
+                        section.remove(*field);
+                    }
+                }
             }
+            object.insert("compressed".into(), json!(true));
         }
-        object.insert("compressed".into(), json!(true));
-    }
-    if digest_len(&s.retention_digest) <= DIGEST_LIMIT {
-        return;
-    }
-    if let Some(object) = s.retention_digest.as_object_mut() {
-        for key in ["messages", "records", "tasks"] {
-            if let Some(section) = object.get_mut(key).and_then(Value::as_object_mut) {
-                section.remove("first");
-                section.remove("last");
-            }
+        if json_chars(&s.retention_digest) <= DIGEST_LIMIT {
+            return;
         }
     }
-    if digest_len(&s.retention_digest) <= DIGEST_LIMIT {
-        return;
-    }
-    let counts = ["messages", "records", "tasks"]
-        .iter()
+    let mut reduced = ["messages", "records", "tasks"]
+        .into_iter()
         .map(|key| {
             (
-                *key,
-                s.retention_digest[*key]["count"].as_u64().unwrap_or(0),
+                key.into(),
+                json!({"count":s.retention_digest[key]["count"].as_u64().unwrap_or(0)}),
             )
         })
-        .collect::<Vec<_>>();
-    let mut reduced = serde_json::Map::new();
-    for (key, count) in counts {
-        reduced.insert(key.into(), json!({"count":count}));
-    }
+        .collect::<serde_json::Map<_, _>>();
     reduced.insert("compressed".into(), json!(true));
     s.retention_digest = Value::Object(reduced);
 }
@@ -188,10 +136,7 @@ fn rebase_memory_entries(entries: &mut [crate::model::MemoryEntry], map: &[Optio
     for entry in entries {
         let had_audit = entry.source.iter().any(|item| item.starts_with("audit:"));
         entry.source.retain_mut(|item| {
-            let Some(old) = item
-                .strip_prefix("audit:")
-                .and_then(|value| value.parse::<usize>().ok())
-            else {
+            let Some(old) = audit_index(item) else {
                 return true;
             };
             match map.get(old).copied().flatten() {
@@ -219,9 +164,9 @@ fn compact_archive_prompts(s: &mut State) -> bool {
         if group.prompt.is_empty() {
             continue;
         }
-        let stored = crate::archive::stored_prompt(s, &group.prompt_version, group.prompt.clone());
-        if stored.is_empty() {
-            s.archive_versions[index].prompt = stored;
+        if crate::archive::stored_prompt(s, &group.prompt_version, group.prompt.as_str()).is_empty()
+        {
+            s.archive_versions[index].prompt = String::new();
             changed = true;
         }
     }
@@ -235,9 +180,13 @@ pub const HISTORY_DAYS: i64 = 90;
 /// Trim expired, finished history records. The protected set is computed
 /// first: the latest archive group, recent groups and every group they were
 /// restored from, groups referenced by retained reports, unfinished attempts
-/// and still-queued morning jobs (with their day-record claims). Runs before
+/// and still-queued morning jobs (with their day-record claims), plus the latest
+/// completed report outcome. Runs before
 /// audit pruning, so audit evidence held only by dropped groups is released.
 fn prune_history(s: &mut State, at: i64) -> bool {
+    let latest = s
+        .report_outcome()
+        .map(|outcome| (outcome.kind, outcome.id.to_owned()));
     let cutoff = at - HISTORY_DAYS * 86_400_000;
     let cutoff_day = crate::model::date_from(cutoff);
     let mut keep_groups = s
@@ -278,12 +227,19 @@ fn prune_history(s: &mut State, at: i64) -> bool {
             .map(|a| a.id.clone()),
     );
     keep_attempts.extend(s.archive_attempts.last().map(|a| a.id.clone()));
-    let queued_jobs = s
+    if let Some(("archive", id)) = &latest {
+        keep_attempts.insert(id.clone());
+    }
+    let mut keep_jobs = s
         .morning_jobs
         .iter()
         .filter(|j| ["queued", "running"].contains(&j.status.as_str()))
         .map(|j| j.id.clone())
         .collect::<BTreeSet<_>>();
+
+    if let Some(("morning", id)) = &latest {
+        keep_jobs.insert(id.clone());
+    }
 
     let before = (
         s.archive_versions.len(),
@@ -294,7 +250,7 @@ fn prune_history(s: &mut State, at: i64) -> bool {
     s.archive_versions.retain(|g| keep_groups.contains(&g.id));
     s.archive_attempts.retain(|a| keep_attempts.contains(&a.id));
     s.morning_jobs
-        .retain(|j| queued_jobs.contains(&j.id) || j.business_day >= cutoff_day);
+        .retain(|j| keep_jobs.contains(&j.id) || j.business_day >= cutoff_day);
     s.work_scheduler.runtime.day_records.retain(|day, record| {
         day.to_string() >= cutoff_day
             || s.work_scheduler
@@ -309,7 +265,7 @@ fn prune_history(s: &mut State, at: i64) -> bool {
             || record
                 .morning_claim
                 .as_ref()
-                .is_some_and(|c| queued_jobs.contains(&c.claim_id))
+                .is_some_and(|c| keep_jobs.contains(&c.claim_id))
     });
     before
         != (
@@ -328,7 +284,11 @@ pub fn prune(s: &mut State, at: i64) -> bool {
     // Evidence that can still be shown or acted on keeps its audit record even
     // after the retention period; everything else is removed and rebased.
     let mut protected = BTreeSet::new();
-    for suggestion in &s.suggestions {
+    for suggestion in s
+        .suggestions
+        .iter()
+        .chain(s.archive_versions.iter().flat_map(|g| &g.active_rules))
+    {
         protected.extend(suggestion.evidence.iter().copied());
     }
     for review in &s.prompt_reviews {
@@ -338,54 +298,39 @@ pub fn prune(s: &mut State, at: i64) -> bool {
             }
         }
     }
-    for proposal in &s.tag_state.proposals {
-        for evidence in &proposal.evidence {
-            if let Some(index) = evidence
-                .strip_prefix("audit:")
-                .and_then(|value| value.parse::<usize>().ok())
-            {
-                protected.insert(index);
-            }
-        }
-    }
-    for entry in &s.analysis_memory.archived_entries {
-        for evidence in &entry.source {
-            if let Some(index) = evidence
-                .strip_prefix("audit:")
-                .and_then(|value| value.parse::<usize>().ok())
-            {
-                protected.insert(index);
-            }
-        }
-    }
-    for group in &s.archive_versions {
-        for rule in &group.active_rules {
-            protected.extend(rule.evidence.iter().copied());
-        }
-        for entry in &group.archived_entries {
-            for evidence in &entry.source {
-                if let Some(index) = evidence
-                    .strip_prefix("audit:")
-                    .and_then(|value| value.parse::<usize>().ok())
-                {
-                    protected.insert(index);
-                }
-            }
-        }
-    }
+    let memory = s
+        .analysis_memory
+        .archived_entries
+        .iter()
+        .chain(s.archive_versions.iter().flat_map(|g| &g.archived_entries));
+    protected.extend(
+        s.tag_state
+            .proposals
+            .iter()
+            .flat_map(|p| &p.evidence)
+            .chain(memory.flat_map(|entry| &entry.source))
+            .filter_map(|source| audit_index(source)),
+    );
     // The shared archive cursor defines unarchived evidence. Everything at or
     // after it must survive the 24h message/snapshot window and normal audit
     // retention so the next archive can still process it.
     let archive_start = s.archive_ai_cursor.unwrap_or(0).min(s.audit.len());
-    protected.extend(archive_start..s.audit.len());
-
-    let keep = s
+    let mut retained = 0;
+    let map = s
         .audit
         .iter()
         .enumerate()
-        .map(|(index, audit)| audit.time >= cutoff || protected.contains(&index))
+        .map(|(index, audit)| {
+            (index >= archive_start || audit.time >= cutoff || protected.contains(&index)).then(
+                || {
+                    let new = retained;
+                    retained += 1;
+                    new
+                },
+            )
+        })
         .collect::<Vec<_>>();
-    let removed_audits = keep.iter().filter(|kept| !**kept).count();
+    let removed_audits = s.audit.len() - retained;
 
     let evidence_runs = s
         .handling
@@ -404,34 +349,26 @@ pub fn prune(s: &mut State, at: i64) -> bool {
                     .iter()
                     .any(|round| evidence_runs.contains(round.id.as_str()))
         })
-        .map(|run| run.id.clone())
+        .map(|run| run.id.as_str())
         .collect::<BTreeSet<_>>();
-    let active_tasks = s
+    let protected_tasks = s
         .handling
         .runs
         .iter()
-        .filter(|run| is_active(&run.status))
-        .map(|run| run.task_id.clone())
-        .collect::<BTreeSet<_>>();
-    let recent_tasks = s
-        .handling
-        .runs
-        .iter()
-        .filter(|run| run.updated >= cutoff || protected_runs.contains(&run.id))
-        .map(|run| run.task_id.clone())
+        .filter(|run| {
+            crate::handling::active(run)
+                || run.updated >= cutoff
+                || protected_runs.contains(run.id.as_str())
+        })
+        .map(|run| run.task_id.as_str())
         .collect::<BTreeSet<_>>();
     let removed_tasks = s
         .tasks
         .iter()
         .filter(|task| {
             task.archived
-                && (if task.archived_at > 0 {
-                    task.archived_at
-                } else {
-                    task.updated
-                }) < cutoff
-                && !active_tasks.contains(&task.id)
-                && !recent_tasks.contains(&task.id)
+                && archived_at(task) < cutoff
+                && !protected_tasks.contains(task.id.as_str())
         })
         .map(|task| task.id.clone())
         .collect::<BTreeSet<_>>();
@@ -440,38 +377,28 @@ pub fn prune(s: &mut State, at: i64) -> bool {
         return compacted;
     }
 
-    let removed_records = s
-        .audit
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| !keep[*index])
-        .map(|(_, audit)| audit.clone())
-        .collect::<Vec<_>>();
-    add_records(s, &removed_records);
-    let removed_task_rows = s
-        .tasks
-        .iter()
-        .filter(|task| removed_tasks.contains(&task.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    add_tasks(s, &removed_task_rows);
+    record_pruned(
+        &mut s.retention_digest,
+        "records",
+        "kinds",
+        s.audit
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| map[*index].is_none())
+            .map(|(_, audit)| (audit.time, audit.kind.as_str())),
+    );
+    record_pruned(
+        &mut s.retention_digest,
+        "tasks",
+        "statuses",
+        s.tasks
+            .iter()
+            .filter(|task| removed_tasks.contains(&task.id))
+            .map(|task| (archived_at(task), task.status.as_str())),
+    );
 
-    let mut map = Vec::with_capacity(s.audit.len());
-    let mut next = 0;
-    for kept in &keep {
-        if *kept {
-            map.push(Some(next));
-            next += 1;
-        } else {
-            map.push(None);
-        }
-    }
-    let old = std::mem::take(&mut s.audit);
-    s.audit = old
-        .into_iter()
-        .zip(keep)
-        .filter_map(|(audit, kept)| kept.then_some(audit))
-        .collect();
+    let mut positions = map.iter();
+    s.audit.retain(|_| positions.next().unwrap().is_some());
 
     let rebase = |cursor: usize| {
         map.iter()
@@ -484,7 +411,12 @@ pub fn prune(s: &mut State, at: i64) -> bool {
     s.archive_review_cursor = rebase(s.archive_review_cursor);
     s.archive_ai_cursor = s.archive_ai_cursor.map(rebase);
 
-    for suggestion in &mut s.suggestions {
+    // Live rules and rollback snapshots use the same audit index space.
+    for suggestion in s.suggestions.iter_mut().chain(
+        s.archive_versions
+            .iter_mut()
+            .flat_map(|g| &mut g.active_rules),
+    ) {
         suggestion.evidence = suggestion
             .evidence
             .iter()
@@ -514,27 +446,16 @@ pub fn prune(s: &mut State, at: i64) -> bool {
         }
     }
     for proposal in &mut s.tag_state.proposals {
-        let mut evidence = Vec::new();
-        let mut excerpts = Vec::new();
-        for (item, excerpt) in proposal.evidence.iter().zip(proposal.excerpts.iter()) {
-            match item
-                .strip_prefix("audit:")
-                .and_then(|value| value.parse::<usize>().ok())
-            {
-                Some(old) => {
-                    if let Some(new) = map.get(old).copied().flatten() {
-                        evidence.push(format!("audit:{new}"));
-                        excerpts.push(excerpt.clone());
-                    }
+        (proposal.evidence, proposal.excerpts) = std::mem::take(&mut proposal.evidence)
+            .into_iter()
+            .zip(std::mem::take(&mut proposal.excerpts))
+            .filter_map(|(mut item, excerpt)| {
+                if let Some(old) = audit_index(&item) {
+                    item = format!("audit:{}", map.get(old).copied().flatten()?);
                 }
-                None => {
-                    evidence.push(item.clone());
-                    excerpts.push(excerpt.clone());
-                }
-            }
-        }
-        proposal.evidence = evidence;
-        proposal.excerpts = excerpts;
+                Some((item, excerpt))
+            })
+            .unzip();
     }
     for report in &mut s.reports {
         if let Some(suggestions) = report["suggestions"].as_array_mut() {
@@ -556,16 +477,7 @@ pub fn prune(s: &mut State, at: i64) -> bool {
             }
         }
     }
-    // Archived group snapshots are rollback material. Keep their audit
-    // references aligned with the pruned source just like live suggestions.
     for group in &mut s.archive_versions {
-        for suggestion in &mut group.active_rules {
-            suggestion.evidence = suggestion
-                .evidence
-                .iter()
-                .filter_map(|index| map.get(*index).copied().flatten())
-                .collect();
-        }
         rebase_memory_entries(&mut group.archived_entries, &map);
     }
     // Live archived memory carries the same audit:N evidence references and is
@@ -758,11 +670,22 @@ mod tests {
         let old = at - 100 * 86_400_000;
         let mut s = State::default();
         s.config.message_retention_days = 90;
-        *s.tasks = vec![task("t-active", true, old), task("t-proposal", true, old)];
-        *s.handling.runs = vec![
-            run("r-active", "t-active", "inProgress", old),
-            run("r-proposal", "t-proposal", "completed", old),
-        ];
+        for status in [
+            "starting",
+            "submitting",
+            "inProgress",
+            "waiting",
+            "uncertain",
+            "disconnected",
+            "stopping",
+        ] {
+            s.tasks.push(task(status, true, old));
+            s.handling.runs.push(run(status, status, status, old));
+        }
+        s.tasks.push(task("t-proposal", true, old));
+        s.handling
+            .runs
+            .push(run("r-proposal", "t-proposal", "completed", old));
         s.handling.proposals.push(crate::handling::Proposal {
             id: "p".into(),
             base: "b".into(),
@@ -776,8 +699,8 @@ mod tests {
             rejected: false,
         });
         assert!(!prune(&mut s, at));
-        assert_eq!(s.tasks.len(), 2);
-        assert_eq!(s.handling.runs.len(), 2);
+        assert_eq!(s.tasks.len(), 8);
+        assert_eq!(s.handling.runs.len(), 8);
     }
 
     #[test]
@@ -802,24 +725,17 @@ mod tests {
         let old = at - 100 * 86_400_000;
         let mut s = State::default();
         s.config.message_retention_days = 90;
-        s.messages.insert(
-            "old".into(),
-            crate::model::Message {
-                id: "old".into(),
-                source_name: "示例来源".into(),
-                time: old,
-                ..Default::default()
-            },
-        );
-        s.messages.insert(
-            "new".into(),
-            crate::model::Message {
-                id: "new".into(),
-                source_name: "示例来源".into(),
-                time: at,
-                ..Default::default()
-            },
-        );
+        for (id, time) in [("old", old), ("new", at)] {
+            s.messages.insert(
+                id.into(),
+                Message {
+                    id: id.into(),
+                    source_name: "示例来源".into(),
+                    time,
+                    ..Default::default()
+                },
+            );
+        }
         crate::messages::prune(&mut s);
         assert!(!s.messages.contains_key("old"));
         assert_eq!(s.retention_digest["messages"]["count"], 1);
@@ -923,6 +839,7 @@ mod tests {
             business_day: day.into(),
             status: status.into(),
             error: String::new(),
+            finished: 0,
         };
         s.morning_jobs = vec![
             job("m-old", &crate::model::date_from(old), "done"),
@@ -933,8 +850,8 @@ mod tests {
             chrono::NaiveDate::parse_from_str(&crate::model::date_from(t), "%Y-%m-%d").unwrap()
         };
         let records = &mut s.work_scheduler.runtime.day_records;
-        records.insert(day(old), crate::work_state::WorkDayRecord::empty());
-        records.insert(day(at), crate::work_state::WorkDayRecord::empty());
+        records.insert(day(old), crate::work_state::WorkDayRecord::default());
+        records.insert(day(at), crate::work_state::WorkDayRecord::default());
 
         assert!(prune(&mut s, at));
         let ids = |v: Vec<&str>| v.into_iter().map(str::to_owned).collect::<Vec<_>>();

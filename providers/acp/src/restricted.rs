@@ -8,13 +8,14 @@
 //! servers supplied by the caller in `session/new`.
 
 use crate::client::AcpLaunch;
-use crate::process::{run_bounded_command, BoundedOutput};
+use crate::process::{run_bounded_command_until, BoundedOutput};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 pub const SUPPORTED_RUNTIME_VERSION: &str = "0.2.1-rc.2";
 pub const RESTRICTED_PATCH: &str = include_str!("../assets/restricted-analysis.patch.yml");
@@ -156,24 +157,15 @@ pub struct MaterializedProfile {
     pub agents_dir: PathBuf,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RestrictedError {
+    #[error("profile asset I/O failed: {0}")]
     Io(String),
+    #[error("invalid profile directory: {0}")]
     InvalidDirectory(String),
+    #[error("launch metadata failed: {0}")]
     LaunchJson(String),
 }
-
-impl std::fmt::Display for RestrictedError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(message) => write!(f, "profile asset I/O failed: {message}"),
-            Self::InvalidDirectory(message) => write!(f, "invalid profile directory: {message}"),
-            Self::LaunchJson(message) => write!(f, "launch metadata failed: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for RestrictedError {}
 
 impl MaterializedProfile {
     /// Build the restricted analysis launch with the empty agents home and the
@@ -321,57 +313,38 @@ pub struct Readiness {
     pub active_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ReadinessError {
+    #[error("DSH 就绪检查已取消")]
+    Cancelled,
+    #[error("DSH 就绪检查已超时")]
+    TimedOut,
+    #[error("ACP 环境尚未初始化，缺少配置：{}",
+                .0.display())]
     ProfileMissing(PathBuf),
+    #[error("ACP 配置不可读：{}；请检查目录权限。{message}", .path.display())]
     ProfileUnreadable { path: PathBuf, message: String },
+    #[error("应用受限补丁缺失：{}；请重试或修复应用安装。", .0.display())]
     PatchMissing(PathBuf),
+    #[error("ACP 配置内容无效，请检查配置后重试（不会自动覆盖）：{0}")]
     ProfileInvalid(String),
+    #[error("dsh runtime version {0:?} is not the verified {SUPPORTED_RUNTIME_VERSION}; refusing unverified tool isolation")]
     RuntimeVersion(String),
+    #[error("dsh --dump-config failed: {0}")]
     DumpFailed(String),
+    #[error("dsh --dump-config output is not parseable: {0}")]
     DumpUnparsable(String),
+    #[error("restricted profile did not disable `{0}`; refusing analysis")]
     RequiredNotDisabled(String),
+    #[error(
+        "restricted profile has an unverified active entry `{id}` (`{name}`); refusing analysis"
+    )]
     UnverifiedActive { id: String, name: String },
+    #[error("restricted profile has no active `acp` bridge; refusing analysis")]
     AcpBridgeMissing,
+    #[error("could not run dsh for readiness: {0}")]
     Spawn(String),
 }
-
-impl std::fmt::Display for ReadinessError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ProfileMissing(path) => write!(
-                f,
-                "ACP 环境尚未初始化，缺少配置：{}",
-                path.display()
-            ),
-            Self::ProfileUnreadable { path, message } => write!(f, "ACP 配置不可读：{}；请检查目录权限。{message}", path.display()),
-            Self::PatchMissing(path) => write!(f, "应用受限补丁缺失：{}；请重试或修复应用安装。", path.display()),
-            Self::ProfileInvalid(message) => write!(f, "ACP 配置内容无效，请检查配置后重试（不会自动覆盖）：{message}"),
-            Self::RuntimeVersion(version) => write!(
-                f,
-                "dsh runtime version {version:?} is not the verified {SUPPORTED_RUNTIME_VERSION}; refusing unverified tool isolation"
-            ),
-            Self::DumpFailed(message) => write!(f, "dsh --dump-config failed: {message}"),
-            Self::DumpUnparsable(message) => {
-                write!(f, "dsh --dump-config output is not parseable: {message}")
-            }
-            Self::RequiredNotDisabled(id) => write!(
-                f,
-                "restricted profile did not disable `{id}`; refusing analysis"
-            ),
-            Self::UnverifiedActive { id, name } => write!(
-                f,
-                "restricted profile has an unverified active entry `{id}` (`{name}`); refusing analysis"
-            ),
-            Self::AcpBridgeMissing => {
-                f.write_str("restricted profile has no active `acp` bridge; refusing analysis")
-            }
-            Self::Spawn(message) => write!(f, "could not run dsh for readiness: {message}"),
-        }
-    }
-}
-
-impl std::error::Error for ReadinessError {}
 
 impl ReadinessError {
     /// Guidance is data for display/copying, never an automatically executed repair.
@@ -435,6 +408,26 @@ pub fn initialize_acp(
 /// session is allowed. This is read-only: missing profile => error, never
 /// initialize or rewrite it.
 pub fn check_readiness(config: &ReadinessConfig) -> Result<Readiness, ReadinessError> {
+    check_readiness_until(
+        config,
+        Instant::now() + Duration::from_secs(40),
+        &AtomicBool::new(false),
+    )
+}
+
+/// One preflight shares the analysis deadline across both probes. Callers may
+/// reuse its result only with the same already-started, restricted ACP process.
+pub fn check_readiness_until(
+    config: &ReadinessConfig,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<Readiness, ReadinessError> {
+    if cancel.load(Ordering::SeqCst) {
+        return Err(ReadinessError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ReadinessError::TimedOut);
+    }
     let profile_manifest = config.dsh_home.join("profiles/acp/package.json");
     let manifest = fs::read(&profile_manifest).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -473,18 +466,19 @@ pub fn check_readiness(config: &ReadinessConfig) -> Result<Readiness, ReadinessE
         )));
     }
 
-    let version = run_dsh(
+    let version = run_dsh_until(
         &config.dsh_cmd,
         &["--version".to_string()],
         config,
-        Duration::from_secs(10),
+        deadline.min(Instant::now() + Duration::from_secs(10)),
+        cancel,
     )?;
     let runtime_version = String::from_utf8_lossy(&version.stdout).trim().to_string();
     if runtime_version != SUPPORTED_RUNTIME_VERSION {
         return Err(ReadinessError::RuntimeVersion(runtime_version));
     }
 
-    let dump = run_dsh(
+    let dump = run_dsh_until(
         &config.dsh_cmd,
         &[
             "--profile".to_string(),
@@ -494,7 +488,8 @@ pub fn check_readiness(config: &ReadinessConfig) -> Result<Readiness, ReadinessE
             "--dump-config".to_string(),
         ],
         config,
-        Duration::from_secs(30),
+        deadline.min(Instant::now() + Duration::from_secs(30)),
+        cancel,
     )?;
     let text = String::from_utf8_lossy(&dump.stdout);
     verify_dump(&runtime_version, &text)
@@ -505,6 +500,22 @@ fn run_dsh(
     args: &[String],
     config: &ReadinessConfig,
     timeout: Duration,
+) -> Result<BoundedOutput, ReadinessError> {
+    run_dsh_until(
+        dsh_cmd,
+        args,
+        config,
+        Instant::now() + timeout,
+        &AtomicBool::new(false),
+    )
+}
+
+fn run_dsh_until(
+    dsh_cmd: &Path,
+    args: &[String],
+    config: &ReadinessConfig,
+    deadline: Instant,
+    cancel: &AtomicBool,
 ) -> Result<BoundedOutput, ReadinessError> {
     let mut launch = AcpLaunch::new(dsh_cmd).args(args.iter().cloned());
     if let Some(workdir) = &config.workdir {
@@ -519,10 +530,13 @@ fn run_dsh(
     let command: Command = launch
         .command()
         .map_err(|error| ReadinessError::Spawn(error.to_string()))?;
-    let output = run_bounded_command(command, timeout, 4 * 1024 * 1024, 16 * 1024)
+    let output = run_bounded_command_until(command, deadline, 4 * 1024 * 1024, 16 * 1024, cancel)
         .map_err(ReadinessError::Spawn)?;
+    if output.cancelled || cancel.load(Ordering::SeqCst) {
+        return Err(ReadinessError::Cancelled);
+    }
     if output.timed_out {
-        return Err(ReadinessError::DumpFailed("timed out".into()));
+        return Err(ReadinessError::TimedOut);
     }
     if !output.status.is_some_and(|status| status.success()) {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -687,7 +701,7 @@ impl DshLaunch {
         self
     }
 
-    fn base_launch(&self) -> AcpLaunch {
+    pub fn acp_launch(&self) -> AcpLaunch {
         let mut launch = AcpLaunch::new(&self.dsh_cmd)
             .args(["--profile", self.profile.as_str()])
             .cwd(&self.workdir);
@@ -712,13 +726,9 @@ impl DshLaunch {
     }
 
     pub fn command(&self) -> Result<Command, ReadinessError> {
-        self.base_launch()
+        self.acp_launch()
             .command()
             .map_err(|error| ReadinessError::Spawn(error.to_string()))
-    }
-
-    pub fn acp_launch(&self) -> Result<AcpLaunch, ReadinessError> {
-        Ok(self.base_launch())
     }
 }
 
@@ -776,14 +786,7 @@ mod tests {
 
     #[test]
     fn materialize_writes_only_under_caller_directory() {
-        let base = std::env::temp_dir().join(format!(
-            "shishi-acp-profile-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let base = crate::test_path("acp-profile");
         let profile = materialize_profile(&base).unwrap();
         assert!(profile.patch.is_file());
         assert!(profile.launch_json.is_file());
@@ -805,8 +808,7 @@ mod tests {
         );
         let staged = profile
             .analysis_launch("dsh.cmd", &base, &base)
-            .acp_launch()
-            .unwrap();
+            .acp_launch();
         assert!(staged
             .args
             .iter()
@@ -820,20 +822,11 @@ mod tests {
 
     #[test]
     fn analysis_launch_applies_patch_but_handling_does_not() {
-        let base = std::env::temp_dir().join(format!(
-            "shishi-acp-launch-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let base = crate::test_path("acp-launch");
         std::fs::create_dir_all(&base).unwrap();
         let patch = base.join("patch.yml");
         std::fs::write(&patch, RESTRICTED_PATCH).unwrap();
-        let analysis = DshLaunch::new("dsh.cmd", &patch, &base)
-            .acp_launch()
-            .unwrap();
+        let analysis = DshLaunch::new("dsh.cmd", &patch, &base).acp_launch();
         assert!(analysis
             .args
             .iter()
@@ -843,8 +836,7 @@ mod tests {
         }));
         let handling = DshLaunch::new("dsh.cmd", &patch, &base)
             .handling()
-            .acp_launch()
-            .unwrap();
+            .acp_launch();
         assert!(!handling
             .args
             .iter()
@@ -862,14 +854,7 @@ mod tests {
 
     #[test]
     fn missing_profile_does_not_initialize_global_profile() {
-        let base = std::env::temp_dir().join(format!(
-            "shishi-acp-missing-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        let base = crate::test_path("acp-missing");
         let home = base.join("home");
         fs::create_dir_all(&home).unwrap();
         let patch = base.join("patch.yml");
@@ -932,14 +917,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn explicit_setup_initializes_once_without_prompt_or_overwriting_existing_profile() {
-        let base = std::env::temp_dir().join(format!(
-            "shishi-acp-setup-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let base = crate::test_path("acp-setup");
         fs::create_dir_all(&base).unwrap();
         let profile = materialize_profile(&base.join("assets")).unwrap();
         let home = base.join("fixture home");

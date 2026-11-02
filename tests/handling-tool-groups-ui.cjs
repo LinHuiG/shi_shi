@@ -1,5 +1,5 @@
-const fs=require('fs'),path=require('path'),assert=require('node:assert/strict'),{chromium}=require('playwright');
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{
+const fs=require('fs'),path=require('path'),assert=require('node:assert/strict'),{withBrowser}=require('./ui-driver.cjs');
+withBrowser(async(browser)=>{
  const page=await browser.newPage({viewport:{width:1100,height:800}}),errors=[];page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(8000);
  await page.setContent(require('./handling-window-fixture.cjs')());await page.locator('[data-handle="start"]').click();
  await page.evaluate(async()=>{
@@ -54,4 +54,4 @@ const fs=require('fs'),path=require('path'),assert=require('node:assert/strict')
  await page.evaluate(async()=>{fixture.handling[0].rounds=[{id:'preview',question:'先核对合成配置，保留检查记录。',steps:[{id:'intro',kind:'agentMessage',text:'正在核对配置与检查结果。'},...Array.from({length:4},(_,i)=>({id:'command-'+i,kind:'commandExecution',text:['python inspect.py --offline','git diff --check','node verify.cjs','git status --short'][i]+'\n合成命令输出，完整记录可在这里查看。'})),{id:'end',kind:'agentMessage',text:'检查已完成，等待确认后继续。'}]}];await refreshState(true);const g=document.querySelector('.handling-tool-group');g.open=true;document.querySelector('[data-handling-stream]').scrollTop=0;document.activeElement?.blur();});await settle();
  await page.locator('#handling-window').screenshot({path:path.join(out,'tool-groups.png')});
  assert.deepEqual(errors,[]);console.log('PASS two-level tool grouping: identity, independent disclosure state, refresh, incremental grouping, boundaries, both scroll anchors, reduced motion and overlapping animations; '+out);
-}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});
+}).catch(e=>{console.error(e);process.exitCode=1;});

@@ -1,32 +1,15 @@
 //! Narrow transport seam for the Chat Completions client.
 //!
-//! Production uses [`SystemTransport`], which forwards to the copied,
-//! deadline/cancel/limit/HTTPS-corrected WinHTTP module. Tests may inject a
+//! Production uses [`SystemTransport`], which forwards to the bounded HTTP pool. Tests may inject a
 //! deterministic fake transport through [`crate::openai::ChatCompletionsClient::with_transport`].
 //! The request type deliberately has no `Debug` implementation because its
 //! bearer field is a caller-resolved credential.
 
-use crate::http_client::{
-    send_with_config, HttpConfig, HttpError, HttpErrorKind, HttpRequest, HttpResponse,
-};
-use std::fmt;
+use crate::http_client::{HttpConfig, HttpErrorKind, HttpRequest};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HttpMethod {
-    Get,
-    Post,
-}
-
-impl HttpMethod {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-        }
-    }
-}
+pub use crate::http_client::{HttpMethod, HttpResponse as TransportResponse};
 
 /// A transport-level request. Getters are the only way to inspect it; no
 /// `Debug` output can accidentally print headers or the credential.
@@ -76,40 +59,6 @@ impl<'a> TransportRequest<'a> {
     }
 }
 
-/// A completed transport response. `Debug` reports only the status and body
-/// length; provider-controlled body text is never dumped by accident.
-pub struct TransportResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-impl TransportResponse {
-    pub fn new(status: u16, body: Vec<u8>) -> Self {
-        Self { status, body }
-    }
-
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-
-    pub fn body(&self) -> &[u8] {
-        &self.body
-    }
-
-    pub fn into_body(self) -> Vec<u8> {
-        self.body
-    }
-}
-
-impl fmt::Debug for TransportResponse {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TransportResponse")
-            .field("status", &self.status)
-            .field("body_len", &self.body.len())
-            .finish()
-    }
-}
-
 /// Safe transport error classes. No body, URL, header, or native diagnostic is
 /// retained.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,7 +86,8 @@ impl TransportErrorKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("transport error: {}", .kind.as_str())]
 pub struct TransportError {
     kind: TransportErrorKind,
 }
@@ -152,17 +102,10 @@ impl TransportError {
     }
 }
 
-impl fmt::Display for TransportError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "transport error: {}", self.kind.as_str())
-    }
-}
-
-impl std::error::Error for TransportError {}
-
 /// Synchronous transport with an explicit remaining deadline and cancellation
 /// flag. Implementations must not retry, log credentials, or exceed the
-/// response-byte limit.
+/// response-byte limit for buffered responses. Streaming consumers bound their
+/// individual frames and assembled content; wire framing is not a total cap.
 pub trait Transport: Sync {
     fn send(
         &self,
@@ -175,17 +118,17 @@ pub trait Transport: Sync {
         request: &TransportRequest<'_>,
         timeout: Duration,
         cancel: &AtomicBool,
-        chunk: &mut dyn FnMut(u16, &[u8]),
+        chunk: &mut dyn FnMut(u16, &[u8]) -> bool,
     ) -> Result<TransportResponse, TransportError> {
         let response = self.send(request, timeout, cancel)?;
-        chunk(response.status(), response.body());
+        if !chunk(response.status(), response.body()) {
+            return Err(TransportError::new(TransportErrorKind::Protocol));
+        }
         Ok(response)
     }
 }
 
-/// Production transport. The copied WinHTTP module enforces one overall
-/// deadline, cancellation polling, per-response byte limits, HTTPS, and
-/// redacted errors. The loopback HTTP branch exists only in test builds.
+/// Production HTTP transport with test-only loopback access.
 #[derive(Debug, Default)]
 pub struct SystemTransport;
 
@@ -196,77 +139,43 @@ impl Transport for SystemTransport {
         timeout: Duration,
         cancel: &AtomicBool,
     ) -> Result<TransportResponse, TransportError> {
-        let config = HttpConfig {
-            total_timeout: timeout,
-            max_response_bytes: request.max_response_bytes,
-            max_redirects: 3,
-        };
-        let http_request = match request.method {
-            HttpMethod::Post => {
-                let body = request
-                    .body
-                    .ok_or_else(|| TransportError::new(TransportErrorKind::InvalidRequest))?;
-                HttpRequest::post_json(request.url, body)
-            }
-            HttpMethod::Get => HttpRequest::get(request.url),
-        }
-        .bearer_token(request.bearer)
-        .cancellation(cancel);
-
-        #[cfg(test)]
-        if request.url.starts_with("http://") {
-            return map_response(crate::http_client::send_localhost_for_tests(
-                &http_request,
-                &config,
-            ));
-        }
-
-        map_response(send_with_config(&http_request, &config))
+        send(request, timeout, cancel, None)
     }
+
     fn send_stream(
         &self,
         request: &TransportRequest<'_>,
         timeout: Duration,
         cancel: &AtomicBool,
-        chunk: &mut dyn FnMut(u16, &[u8]),
+        chunk: &mut dyn FnMut(u16, &[u8]) -> bool,
     ) -> Result<TransportResponse, TransportError> {
-        let config = HttpConfig {
-            total_timeout: timeout,
-            max_response_bytes: request.max_response_bytes,
-            max_redirects: 0,
-        };
-        let http_request = match request.method {
-            HttpMethod::Post => HttpRequest::post_json(
-                request.url,
-                request
-                    .body
-                    .ok_or_else(|| TransportError::new(TransportErrorKind::InvalidRequest))?,
-            ),
-            HttpMethod::Get => HttpRequest::get(request.url),
-        }
-        .bearer_token(request.bearer)
-        .cancellation(cancel);
-        #[cfg(test)]
-        if request.url.starts_with("http://") {
-            return map_response(crate::http_client::send_stream_localhost_for_tests(
-                &http_request,
-                &config,
-                chunk,
-            ));
-        }
-        map_response(crate::http_client::send_stream_with_config(
-            &http_request,
-            &config,
-            chunk,
-        ))
+        send(request, timeout, cancel, Some(chunk))
     }
 }
 
-fn map_response(
-    result: Result<HttpResponse, HttpError>,
+fn send(
+    request: &TransportRequest<'_>,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    chunk: Option<&mut dyn FnMut(u16, &[u8]) -> bool>,
 ) -> Result<TransportResponse, TransportError> {
-    result
-        .map(|response| TransportResponse::new(response.status, response.body))
+    let config = HttpConfig {
+        total_timeout: timeout,
+        max_response_bytes: request.max_response_bytes,
+        max_redirects: if chunk.is_some() { 0 } else { 3 },
+    };
+    let http = match request.method {
+        HttpMethod::Post => HttpRequest::post_json(
+            request.url,
+            request
+                .body
+                .ok_or_else(|| TransportError::new(TransportErrorKind::InvalidRequest))?,
+        ),
+        HttpMethod::Get => HttpRequest::get(request.url),
+    }
+    .bearer_token(request.bearer)
+    .cancellation(cancel);
+    crate::http_client::send_inner(&http, &config, cfg!(test), chunk)
         .map_err(|error| TransportError::new(map_error(error.kind())))
 }
 
@@ -294,7 +203,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn copied_http_response_debug_stays_redacted() {
+    fn shared_http_response_debug_stays_redacted() {
         let response = crate::http_client::HttpResponse {
             status: 200,
             body: b"synthetic-secret-key-in-body".to_vec(),
@@ -304,14 +213,6 @@ mod tests {
         let rendered = format!("{response:?}");
         assert!(!rendered.contains("synthetic-secret-key-in-body"));
         assert!(!rendered.contains("synthetic-etag"));
-        assert!(rendered.contains("body_len"));
-    }
-
-    #[test]
-    fn transport_debug_never_prints_body_values() {
-        let response = TransportResponse::new(200, b"synthetic-secret-body".to_vec());
-        let rendered = format!("{response:?}");
-        assert!(!rendered.contains("synthetic-secret-body"));
         assert!(rendered.contains("body_len"));
     }
 

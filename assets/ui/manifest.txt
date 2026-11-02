@@ -8,7 +8,6 @@ style styles/motion.css
 style styles/task-experience.css
 script scripts/motion.js
 script scripts/core.js
-script scripts/detail-panels.js
 script scripts/tasks.js
 script scripts/task-history.js
 script scripts/settings.js

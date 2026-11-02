@@ -1,10 +1,10 @@
 // Compact trace readers and app-local dismissal, with synthetic records only.
-const fs=require('fs'),path=require('path'),os=require('os'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),os=require('os'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const out=fs.mkdtempSync(path.join(os.tmpdir(),'shishi-trace-dialog-')),now=Date.now();
 const text=Array.from({length:140},(_,i)=>`Synthetic line ${i}: input and output are test data.`).join('\n');
 const fixture={version:'1.1.22',config:{enabled:false,auto_ai:false,leaders:[],interval_minutes:5,daily_calls:40,work_start:'09:00',work_end:'18:00'},usage:{day:'fixture',calls:0,input_tokens:0,output_tokens:0},tasks:[],handling:[],schedules:[],messages:[],audit:[],activity:[],reports:[],suggestions:[],chat_sources:[],pending:0,ai_busy:false};
 const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.ipc={postMessage(raw){const r=JSON.parse(raw);requests.push(r);let data=true;if(r.method==='state')data=fixture;if(r.method==='activity_query')data={rows:[{kind:'ai_success',time:${now},detail:{kind:'analysis',model:'synthetic',request_id:'synthetic-trace'}}],total:1,pages:1,page:1};if(r.method==='ai_trace')data={input:${JSON.stringify(text)},output:${JSON.stringify(text)},schema:${JSON.stringify(text)},events:${JSON.stringify(text)},previous_input:'Synthetic previous request'};setTimeout(()=>receive({id:r.id,ok:true,data}),2)}};`;
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{
+withBrowser(async(browser)=>{
  const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));
  await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));await page.locator('#page-title').waitFor();await page.locator('[data-page="logs"]').first().click();await page.locator('[data-trace]').click();await page.locator('.trace-content').waitFor();
  const dialog=page.locator('#dialog'),overlay=page.locator('#overlay'),readers=page.locator('.trace-content > pre');assert.equal(await readers.count(),2);
@@ -29,4 +29,4 @@ const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.
  await page.locator('[data-trace]').click();await page.locator('[data-trace-compare]').click();await page.locator('.trace-comparison').waitFor();await page.evaluate(()=>window.dispatchEvent(new Event('blur')));await page.waitForTimeout(180);assert(!(await overlay.isHidden()),'comparison has the same external-focus behavior');await overlay.click({position:{x:4,y:4}});await overlay.waitFor({state:'hidden'});
  await page.locator('[data-trace]').click();await overlay.waitFor({state:'visible'});await page.keyboard.press('Escape');await overlay.waitFor({state:'hidden'});await page.locator('[data-trace]').click();await page.locator('#dialog [data-action="close"]').click();await overlay.waitFor({state:'hidden'});
  assert.equal(await page.locator('[data-motion-ghost]').count(),0);assert.deepEqual(errors,[]);console.log('PASS two-thirds trace reader height, four viewport sizes without default outer scrolling, inner scroll, expanded details, retained external blur/hidden/resume state, comparison, app-local backdrop, Escape and close button. '+out);
-}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});
+}).catch(e=>{console.error(e);process.exitCode=1;});

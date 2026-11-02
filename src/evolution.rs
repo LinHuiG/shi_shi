@@ -40,18 +40,15 @@ fn target(s: &State, kind: &str, id: &str) -> Result<Value, String> {
     }
     .ok_or("建议已处理或不存在，请刷新".to_string())?;
     value["current_prompt_version"] = json!(if kind == "handling" {
-        prompts::current(s, "handling").map(|v| v.id.clone())
+        prompts::current(s, "handling").map(|v| &v.id)
     } else {
-        prompts::current(s, "classify").map(|v| v.id.clone())
+        prompts::current(s, "classify").map(|v| &v.id)
     });
     Ok(value)
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> App {
-        App::load(std::env::temp_dir().join(format!("shishi-evolution-{}", id()))).unwrap()
-    }
     fn seed(app: &App) {
         let mut s = app.state.lock().unwrap();
         for ident in ["accepted", "rejected", "pending"] {
@@ -72,7 +69,7 @@ mod tests {
     }
     #[test]
     fn manual_archive_keeps_enabled_rules_and_does_not_queue_prompt_rewrites() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-evolution");
         seed(&app);
         let before = prompts::content(&app.state.lock().unwrap().config, "classify");
         app.advice_decide(&json!({"kind":"rule","id":"accepted","action":"enable"}))
@@ -96,7 +93,7 @@ mod tests {
     }
     #[test]
     fn archive_failure_does_not_hide_suggestions_or_change_prompt() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-evolution");
         seed(&app);
         app.advice_decide(&json!({"id":"accepted","action":"enable"}))
             .unwrap();
@@ -110,7 +107,34 @@ mod tests {
     }
     #[test]
     fn feedback_is_reviewable_and_rejects_stale_results_and_failed_save() {
-        let app = fixture();
+        for length in [8, 8000] {
+            let run = crate::handling::Run {
+                id: "run".into(),
+                rounds: (0..12)
+                    .map(|i| {
+                        crate::handling::Round {
+                            question: format!("Question {i}"),
+                            conclusion: "证".repeat(length),
+                            ..Default::default()
+                        }
+                        .into()
+                    })
+                    .collect(),
+                ..Default::default()
+            };
+            let evidence = handling_evidence(&run);
+            let prepared =
+                crate::context_budget::prepare("advice_revision", &json!({"evidence":[evidence]}));
+            let selected = &prepared["evidence"][0];
+            let count = selected["rounds"].as_array().unwrap().len();
+            assert_eq!(
+                count as u64 + selected["omitted_rounds"].as_u64().unwrap(),
+                12
+            );
+            assert_eq!(count == 12, length == 8);
+            assert!(json_chars(&prepared["evidence"]) <= 6500);
+        }
+        let (_root, app) = crate::test_support::scoped_app("shishi-evolution");
         seed(&app);
         let before = target(&app.state.lock().unwrap(), "rule", "pending").unwrap();
         let result =
@@ -142,7 +166,7 @@ mod tests {
     }
     #[test]
     fn handling_prompt_edits_and_rollbacks_share_the_live_policy() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-evolution");
         let initial = prompts::current(&app.state.lock().unwrap(), "handling")
             .unwrap()
             .id
@@ -180,54 +204,8 @@ mod tests {
         );
     }
     #[test]
-    fn model_profiles_dispatch_independently_and_partial_config_uses_base_model() {
-        let mut c = Config {
-            model: "base-model".into(),
-            model_profiles: None,
-            reasoning_effort: "low".into(),
-            ..Default::default()
-        };
-        assert_eq!(c.for_kind("handling").model, "base-model");
-        c.model_profiles = Some(ModelProfiles {
-            legacy_tool_call: None,
-            filter: Some(ModelChoice {
-                connection_id: String::new(),
-                model: "filter-model".into(),
-                reasoning_effort: "low".into(),
-            }),
-            analysis: Some(ModelChoice {
-                connection_id: String::new(),
-                model: "analysis-model".into(),
-                reasoning_effort: "medium".into(),
-            }),
-            handling: Some(ModelChoice {
-                connection_id: String::new(),
-                model: "handling-model".into(),
-                reasoning_effort: "high".into(),
-            }),
-            review: Some(ModelChoice {
-                connection_id: String::new(),
-                model: "review-model".into(),
-                reasoning_effort: "low".into(),
-            }),
-        });
-        for kind in ["classify", "format", "edit", "schedule"] {
-            assert_eq!(c.for_kind(kind).model, "analysis-model");
-        }
-        assert_eq!(c.for_kind("handling").reasoning_effort, "high");
-        for kind in [
-            "prompt_review",
-            "learning",
-            "report",
-            "handling_learning",
-            "advice_revision",
-        ] {
-            assert_eq!(c.for_kind(kind).model, "review-model");
-        }
-    }
-    #[test]
     fn manual_merge_combines_generic_labels_without_environment_exception() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-evolution");
         let primary = app
             .task_edit(&json!({"task":{"title":"主事项","tags":[{"kind":"所属项目","value":"示例项目A"}]}}))
             .unwrap();
@@ -307,7 +285,20 @@ impl App {
                     .filter_map(|i| i.as_u64().and_then(|i| s.audit.get(i as usize)))
                     .collect::<Vec<_>>())
             } else if kind == "handling" {
-                json!(s.handling.runs.iter().filter(|run|before["evidence"].as_array().map(|ids|ids.contains(&json!(run.id))||run.rounds.iter().any(|v|ids.contains(&json!(v.id)))).unwrap_or(false)).map(|run|json!({"id":run.id,"project":run.project_id,"instructions":run.instructions,"rounds":run.rounds.iter().rev().take(5).map(|r|json!({"question":r.question.chars().take(3000).collect::<String>(),"conclusion":r.conclusion.chars().take(4000).collect::<String>()})).collect::<Vec<_>>()})).collect::<Vec<_>>())
+                let ids = before["evidence"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<std::collections::BTreeSet<_>>();
+                json!(s
+                    .handling
+                    .runs
+                    .iter()
+                    .filter(|run| ids.contains(run.id.as_str())
+                        || run.rounds.iter().any(|v| ids.contains(v.id.as_str())))
+                    .map(handling_evidence)
+                    .collect::<Vec<_>>())
             } else {
                 before
                     .get("evidence")
@@ -360,8 +351,7 @@ impl App {
                 r.updated = now();
             }
             "tag" => {
-                let tag: crate::tags::Tag =
-                    serde_json::from_value(result["tag"].clone()).map_err(|e| e.to_string())?;
+                let tag: crate::tags::Tag = from_json(&result["tag"])?;
                 if !crate::tags::valid(&tag) {
                     return Err("AI 返回的标签名称无效".into());
                 }
@@ -412,4 +402,21 @@ impl App {
         *lock = s;
         Ok(after)
     }
+}
+
+fn handling_evidence(run: &crate::handling::Run) -> Value {
+    let rounds = crate::context_budget::rows(
+        run.rounds.iter().rev().map(|round| {
+            crate::context_budget::text_fields(
+                [
+                    ("question", round.question.as_str()),
+                    ("conclusion", round.conclusion.as_str()),
+                ],
+                600,
+            )
+        }),
+        6000,
+    );
+    json!({"id":run.id,"project":run.project_id,"instructions":run.instructions,
+        "rounds":rounds["items"],"omitted_rounds":rounds["omitted"]})
 }

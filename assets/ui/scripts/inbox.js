@@ -52,8 +52,8 @@ async function renderInbox() {
     }
     const rows = inboxData.rows;
     for (const id of inboxSelected) if (!rows.some((m) => m.id === id)) inboxSelected.delete(id);
-    $('#inbox-summary').textContent =
-      `共 ${inboxData.total} 条 · 待分析 ${state.pending || 0} 条 · 自动保留 ${state.config.message_retention_days ?? 90} 天 · 最近读取 ${date(state.last_scan)}`;
+    motionText($('#inbox-summary'),
+      `共 ${inboxData.total} 条 · 待分析 ${state.pending || 0} 条 · 自动保留 ${state.config.message_retention_days ?? 90} 天 · 最近读取 ${date(state.last_scan)}`);
     $('#inbox-page-label').textContent = `第 ${inboxPage} / ${inboxData.pages} 页`;
     $('[data-workflow="inbox-prev"]').disabled = inboxPage <= 1;
     $('[data-workflow="inbox-next"]').disabled = inboxPage >= inboxData.pages;

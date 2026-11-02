@@ -5,83 +5,75 @@ impl App {
     pub fn schedule_edit(&self, v: &Value) -> Result<Value, String> {
         // The UI snapshot decorates schedules with a derived `next_at`; it is
         // display-only and not part of the persisted schema.
-        let mut value = v["schedule"].clone();
-        if let Some(object) = value.as_object_mut() {
-            object.remove("next_at");
-        }
-        let mut schedule: Schedule = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let mut schedule: Schedule = from_json_ignoring(&v["schedule"], &["next_at"])?;
         schedule::validate(&mut schedule)?;
-        let mut locked = self.state.lock().unwrap();
-        let mut s = locked.clone();
-        let at = now();
-        let before;
-        if schedule.id.is_empty() {
-            schedule.id = id();
-            schedule.created = at;
-            schedule.updated = at;
-            schedule.active_from = at;
-            schedule.last_generated_on.clear();
-            before = Value::Null;
-            s.schedules.push(schedule.clone());
-        } else {
-            let old = s
-                .schedules
-                .iter_mut()
-                .find(|x| x.id == schedule.id)
-                .ok_or("定时事项不存在")?;
-            if old.updated != schedule.updated {
-                return Err("定时事项已更新，请重新打开编辑".into());
-            }
-            before = json!(old);
-            schedule.created = old.created;
-            schedule.updated = at.max(old.updated + 1);
-            schedule.last_generated_on = old.last_generated_on.clone();
-            schedule.active_from = if schedule.frequency != old.frequency
-                || schedule.weekdays != old.weekdays
-                || schedule.time != old.time
-                || (schedule.enabled && !old.enabled)
-            {
-                at
+        self.commit_state(|s| {
+            let at = now();
+            let before;
+            if schedule.id.is_empty() {
+                schedule.id = id();
+                schedule.created = at;
+                schedule.updated = at;
+                schedule.active_from = at;
+                schedule.last_generated_on.clear();
+                before = Value::Null;
+                s.schedules.push(schedule.clone());
             } else {
-                old.active_from
-            };
-            *old = schedule.clone();
-        }
-        Self::audit(
-            &mut s,
-            "schedule_edit",
-            "",
-            "保存定时事项",
-            before,
-            json!(schedule),
-        );
-        self.save(&s)?;
-        *locked = s;
-        Ok(json!(schedule))
+                let old = s
+                    .schedules
+                    .iter_mut()
+                    .find(|x| x.id == schedule.id)
+                    .ok_or("定时事项不存在")?;
+                if old.updated != schedule.updated {
+                    return Err("定时事项已更新，请重新打开编辑".into());
+                }
+                before = json!(old);
+                schedule.created = old.created;
+                schedule.updated = at.max(old.updated + 1);
+                schedule.last_generated_on = old.last_generated_on.clone();
+                schedule.active_from = if schedule.frequency != old.frequency
+                    || schedule.weekdays != old.weekdays
+                    || schedule.time != old.time
+                    || (schedule.enabled && !old.enabled)
+                {
+                    at
+                } else {
+                    old.active_from
+                };
+                *old = schedule.clone();
+            }
+            Self::audit(
+                s,
+                "schedule_edit",
+                "",
+                "保存定时事项",
+                before,
+                json!(schedule),
+            );
+            Ok(json!(schedule))
+        })
     }
     pub fn schedule_delete(&self, v: &Value) -> Result<Value, String> {
-        let mut locked = self.state.lock().unwrap();
-        let mut s = locked.clone();
-        let pos = s
-            .schedules
-            .iter()
-            .position(|x| Some(x.id.as_str()) == v["id"].as_str())
-            .ok_or("定时事项不存在")?;
-        if Some(s.schedules[pos].updated) != v["updated"].as_i64() {
-            return Err("定时事项已更新，请刷新后重试".into());
-        }
-        let old = s.schedules.remove(pos);
-        Self::audit(
-            &mut s,
-            "schedule_delete",
-            "",
-            "删除定时事项，保留已生成的事项",
-            json!(old),
-            Value::Null,
-        );
-        self.save(&s)?;
-        *locked = s;
-        Ok(json!(true))
+        self.commit_state(|s| {
+            let pos = s
+                .schedules
+                .iter()
+                .position(|x| Some(x.id.as_str()) == v["id"].as_str())
+                .ok_or("定时事项不存在")?;
+            if Some(s.schedules[pos].updated) != v["updated"].as_i64() {
+                return Err("定时事项已更新，请刷新后重试".into());
+            }
+            let old = s.schedules.remove(pos);
+            Self::audit(
+                s,
+                "schedule_delete",
+                "",
+                "删除定时事项，保留已生成的事项",
+                json!(old),
+                Value::Null,
+            );
+            Ok(json!(true))
+        })
     }
     pub fn schedule_format(&self, text: &str) -> Result<Value, String> {
         if text.trim().is_empty() || text.chars().count() > 6000 {
@@ -92,45 +84,49 @@ impl App {
     }
     pub fn generate_scheduled(&self, at: i64) -> Result<usize, String> {
         let mut locked = self.state.lock().unwrap();
-        if !locked
+        let mut due = locked
             .schedules
             .iter()
-            .any(|s| schedule::due_today(s, at).is_some())
-        {
+            .enumerate()
+            .filter_map(|(pos, s)| schedule::due_today(s, at).map(|due| (pos, due)))
+            .peekable();
+        if due.peek().is_none() {
             return Ok(0);
         }
+        let day = stamp(at)[..10].to_string();
+        let mut generated = locked
+            .tasks
+            .iter()
+            .filter(|task| task.scheduled_for == day)
+            .map(|task| task.schedule_id.as_str())
+            .collect::<BTreeSet<_>>();
+        let mut next_number = locked.task_numbers.values().copied().max().unwrap_or(0);
         let mut s = locked.clone();
-        let mut count = 0;
-        let mut changed = false;
-        for pos in 0..s.schedules.len() {
-            let schedule = s.schedules[pos].clone();
-            let Some(due) = schedule::due_today(&schedule, at) else {
-                continue;
-            };
-            let day = stamp(due)[..10].to_string();
+        for (pos, due) in due {
+            let schedule = &mut s.schedules[pos];
             // The durable marker and occurrence identity also guard retries after restart.
-            s.schedules[pos].last_generated_on = day.clone();
-            changed = true;
-            if s.tasks
-                .iter()
-                .any(|t| t.schedule_id == schedule.id && t.scheduled_for == day)
-            {
+            schedule.last_generated_on = day.clone();
+            if !generated.insert(locked.schedules[pos].id.as_str()) {
                 continue;
             }
             let task = Task {
                 id: id(),
-                title: schedule.title,
-                description: schedule.description,
-                tags: schedule.tags,
+                title: schedule.title.clone(),
+                description: schedule.description.clone(),
+                tags: schedule.tags.clone(),
                 status: "待处理".into(),
                 manual: true,
                 created: at,
                 updated: at,
-                schedule_id: schedule.id,
-                scheduled_for: day,
+                schedule_id: schedule.id.clone(),
+                scheduled_for: day.clone(),
                 reason: format!("定时生成 · {}（上海时间）", stamp(due)),
                 ..Default::default()
             };
+            if !s.task_numbers.contains_key(&task.id) {
+                next_number += 1;
+                s.task_numbers.insert(task.id.clone(), next_number);
+            }
             Self::audit(
                 &mut s,
                 "schedule_generate",
@@ -139,48 +135,48 @@ impl App {
                 Value::Null,
                 json!(task),
             );
-            s.tasks.insert(0, task);
-            count += 1;
+            s.tasks.push(task);
         }
-        if changed {
-            self.save(&s)?;
-            *locked = s;
+        let count = s.tasks.len() - locked.tasks.len();
+        if count > 0 {
+            s.tasks[locked.tasks.len()..].reverse();
+            s.tasks.rotate_right(count);
         }
+        self.save(&s)?;
+        *locked = s;
         Ok(count)
     }
     pub fn scan_control(&self, v: &Value) -> Result<Value, String> {
-        let mut locked = self.state.lock().unwrap();
-        let mut state = locked.clone();
-        let interval = match v.get("interval_minutes") {
-            Some(value) => value.as_u64().ok_or("扫描间隔必须是整数分钟")?,
-            None => state.config.interval_minutes,
-        };
-        if !(1..=120).contains(&interval) {
-            return Err("扫描间隔应为1–120分钟".into());
-        }
-        let enabled = v["enabled"].as_bool().unwrap_or(state.config.enabled);
-        if enabled && !state.chat_sources.iter().any(|s| s.enabled) {
-            return Err("请先在消息来源中配置并启用一个插件".into());
-        }
-        let before = json!({"enabled":state.config.enabled,"interval_minutes":state.config.interval_minutes});
-        state.config.enabled = enabled;
-        if !enabled {
-            state.message_filter.early = false;
-            state.message_filter.trigger.clear();
-        }
-        state.config.interval_minutes = interval;
-        let after = json!({"enabled":enabled,"interval_minutes":interval});
-        Self::audit(
-            &mut state,
-            "scan_control",
-            "",
-            "修改自动扫描",
-            before,
-            after.clone(),
-        );
-        self.save(&state)?;
-        *locked = state;
-        Ok(after)
+        self.commit_state(|state| {
+            let interval = match v.get("interval_minutes") {
+                Some(value) => value.as_u64().ok_or("扫描间隔必须是整数分钟")?,
+                None => state.config.interval_minutes,
+            };
+            if !(1..=120).contains(&interval) {
+                return Err("扫描间隔应为1–120分钟".into());
+            }
+            let enabled = v["enabled"].as_bool().unwrap_or(state.config.enabled);
+            if enabled && !state.chat_sources.iter().any(|s| s.enabled) {
+                return Err("请先在消息来源中配置并启用一个插件".into());
+            }
+            let before = json!({"enabled":state.config.enabled,"interval_minutes":state.config.interval_minutes});
+            state.config.enabled = enabled;
+            if !enabled {
+                state.message_filter.early = false;
+                state.message_filter.trigger.clear();
+            }
+            state.config.interval_minutes = interval;
+            let after = json!({"enabled":enabled,"interval_minutes":interval});
+            Self::audit(
+                state,
+                "scan_control",
+                "",
+                "修改自动扫描",
+                before,
+                after.clone(),
+            );
+            Ok(after)
+        })
     }
     pub fn configure(&self, v: Value) -> Result<Value, String> {
         self.configure_candidate(v, None).map(|_| json!(true))
@@ -251,9 +247,6 @@ impl App {
             return Err("AI 输入上限应为5000–200000字符".into());
         }
         crate::analysis_context::validate_budget(c.retrieval_budget_chars)?;
-        if !(30..=1800).contains(&c.ai_timeout_seconds) {
-            return Err("AI 总时限须为 30—1800 秒".into());
-        }
         if !(1..=1440).contains(&c.analysis_interval_minutes) {
             return Err("AI 分析间隔应为1–1440分钟".into());
         }
@@ -266,7 +259,8 @@ impl App {
         if !(1..=3650).contains(&c.message_retention_days) {
             return Err("消息保留期限应为1–3650天".into());
         }
-        work_hours::validate(&c)?;
+        let schedule = crate::work_state::WorkSchedule::parse(&c.work_start, &c.work_end)
+            .map_err(|error| format!("上下班时间无效：{error}"))?;
         if [
             &c.classify_prompt,
             &c.format_prompt,
@@ -289,59 +283,53 @@ impl App {
         if c.daily_calls > 500 {
             return Err("每日调用上限不能超过500".into());
         }
-        crate::work_state::WorkSchedule::parse(&c.work_start, &c.work_end)
-            .map_err(|error| format!("上下班时间无效：{error}"))?;
-        let mut locked = self.state.lock().unwrap();
-        if expected.is_some_and(|before| *before != json!(locked.config)) {
-            return Err("settings_concurrent_change".into());
-        }
-        let mut s = locked.clone();
-        // Tool CRUD has its own revision checks. Old/stale settings payloads
-        // must never clear the registry or overwrite a simultaneous tool edit.
-        c.tools = s.config.tools.clone();
-        prompts::record_config_changes(&mut s, &c);
-        let old = json!(s.config);
-        let filter_disabled = s.config.message_filter_enabled && !c.message_filter_enabled;
-        let scope_changed = s.config.analysis_related_only != c.analysis_related_only;
-        s.config = c;
-        if !s.config.early_analysis_enabled() {
-            s.message_filter.early = false;
-            s.message_filter.trigger.clear();
-        }
-        if scope_changed {
-            let pending = !crate::context_budget::pending(&s).is_empty()
-                || !self.analyzing_messages.lock().unwrap().is_empty();
-            crate::context_budget::mark_pending(&mut s, pending, now());
-        }
-        if filter_disabled {
-            // A disabled filter must not keep an old "run early" hint alive.
-            s.message_filter.early = false;
-            s.message_filter.checked.clear();
-            s.message_filter.reason.clear();
-        }
-        // A schedule edit must not leave overtime attributed to a stale
-        // business day or a claim that the new schedule no longer supports.
-        let schedule =
-            crate::work_state::WorkSchedule::parse(&s.config.work_start, &s.config.work_end)
-                .map_err(|error| format!("上下班时间无效：{error}"))?;
-        s.work_scheduler
-            .runtime
-            .expire_overtime(now(), &schedule)
-            .map_err(|error| error.to_string())?;
-        s.work_scheduler
-            .runtime
-            .observe(now(), &schedule, &self.calendar_for(&s))
-            .map_err(|error| error.to_string())?;
-        s.work_scheduler.last_schedule = Some(schedule);
-        if !self.archive_busy.load(Ordering::SeqCst) {
-            crate::messages::prune(&mut s);
-        }
-        let new = json!(s.config);
-        Self::audit(&mut s, "settings", "", "修改设置", old, new);
-        self.save(&s)?;
-        let config = json!(s.config);
-        *locked = s;
-        Ok(config)
+        self.commit_state(|s| {
+            if expected.is_some_and(|before| *before != json!(s.config)) {
+                return Err("settings_concurrent_change".into());
+            }
+            // Tool CRUD has its own revision checks. Old/stale settings payloads
+            // must never clear the registry or overwrite a simultaneous tool edit.
+            c.tools = s.config.tools.clone();
+            prompts::record_config_changes(s, &c);
+            let old = json!(s.config);
+            let filter_disabled = s.config.message_filter_enabled && !c.message_filter_enabled;
+            let scope_changed = s.config.analysis_related_only != c.analysis_related_only;
+            s.config = c;
+            if !s.config.early_analysis_enabled() {
+                s.message_filter.early = false;
+                s.message_filter.trigger.clear();
+            }
+            if scope_changed {
+                let pending = crate::context_budget::pending_refs(s, false)
+                    .next()
+                    .is_some()
+                    || !self.analyzing_messages.lock().unwrap().is_empty();
+                crate::context_budget::mark_pending(s, pending, now());
+            }
+            if filter_disabled {
+                // A disabled filter must not keep an old "run early" hint alive.
+                s.message_filter.early = false;
+                s.message_filter.checked.clear();
+                s.message_filter.reason.clear();
+            }
+            // A schedule edit must not leave overtime attributed to a stale
+            // business day or a claim that the new schedule no longer supports.
+            s.work_scheduler
+                .runtime
+                .expire_overtime(now(), &schedule)
+                .map_err(|error| error.to_string())?;
+            s.work_scheduler
+                .runtime
+                .observe(now(), &schedule, &self.calendar_for(s))
+                .map_err(|error| error.to_string())?;
+            s.work_scheduler.last_schedule = Some(schedule);
+            if !self.archive_busy.load(Ordering::SeqCst) {
+                crate::messages::prune(s);
+            }
+            let new = json!(s.config);
+            Self::audit(s, "settings", "", "修改设置", old, new);
+            Ok(json!(s.config))
+        })
     }
     pub fn task_edit(&self, v: &Value) -> Result<Value, String> {
         let submitted = &v["task"];
@@ -358,51 +346,44 @@ impl App {
         }
         self.commit_state(|s| {
             let before;
-            let t;
-            if let Some(pos) = s.tasks.iter().position(|x| x.id == incoming.id) {
+            let pos = if let Some(pos) = s.tasks.iter().position(|x| x.id == incoming.id) {
                 if incoming.updated != s.tasks[pos].updated {
                     return Err("事项已被更新，请刷新后重新编辑".into());
                 }
                 before = json!(s.tasks[pos]);
-                let old = s.tasks[pos].clone();
+                let old = &s.tasks[pos];
                 // A partial/old UI payload must not reset evidence, summaries,
                 // archive metadata or scheduling fields that it did not edit.
-                let patch = json!(incoming);
-                let mut next_value = json!(old);
+                let mut next = old.clone();
                 for field in EDIT_FIELDS {
                     if submitted.get(field).is_some() {
-                        next_value[field] = patch[field].clone();
+                        *next.text_field_mut(field).unwrap() =
+                            std::mem::take(incoming.text_field_mut(field).unwrap());
                     }
                 }
                 if submitted.get("tags").is_some_and(Value::is_array) {
-                    next_value["tags"] = patch["tags"].clone();
+                    next.tags = std::mem::take(&mut incoming.tags);
                 } else {
-                    let mut tags = old.tags.clone();
                     for (field, kind) in [
                         ("priority", "事项等级"),
                         ("category", "事项类型"),
                         ("environment", "适用环境"),
                     ] {
                         if submitted.get(field).is_some() {
-                            tags.retain(|tag| tag.kind != kind);
-                            tags.extend(
+                            next.tags.retain(|tag| tag.kind != kind);
+                            next.tags.extend(
                                 incoming.tags.iter().filter(|tag| tag.kind == kind).cloned(),
                             );
                         }
                     }
-                    next_value["tags"] = json!(tags);
                 }
                 if let Some(follow) = submitted.get("follow_deadline").and_then(Value::as_bool) {
-                    next_value["follow_deadline"] = json!(follow);
+                    next.follow_deadline = follow;
                 }
-                let mut next: Task =
-                    serde_json::from_value(next_value).map_err(|e| e.to_string())?;
                 let content_changed =
                     next.title != old.title || next.description != old.description;
                 if next.due != old.due {
                     next.deadline_changed = now();
-                } else {
-                    next.deadline_changed = old.deadline_changed;
                 }
                 next.updated = now().max(old.updated + 1);
                 next.manual = true;
@@ -410,24 +391,20 @@ impl App {
                 if content_changed {
                     let updated = next.updated;
                     mark_content_changed(&mut next, updated);
-                } else {
-                    next.summary = old.summary.clone();
-                    next.summary_updated_at = old.summary_updated_at;
-                    next.summary_fallback = old.summary_fallback;
-                    next.content_updated_at = old.content_updated_at;
                 }
                 if next.title.trim().is_empty() {
                     return Err("标题不能为空".into());
                 }
-                next.evidence = old.evidence.clone();
-                next.archive_note = old.archive_note.clone();
-                next.archived_at = old.archived_at;
-                next.schedule_id = old.schedule_id.clone();
-                next.scheduled_for = old.scheduled_for.clone();
-                next.deferred_until = old.deferred_until;
+                next.deferred_until = if next.status == "待处理" {
+                    old.deferred_until
+                } else {
+                    0
+                };
+                next.resume_processing =
+                    old.resume_processing && next.status == old.status && next.deferred_until > 0;
                 normalize_task(&mut next);
-                s.tasks[pos] = next.clone();
-                t = next;
+                s.tasks[pos] = next;
+                pos
             } else {
                 if incoming.title.trim().is_empty() {
                     return Err("标题不能为空".into());
@@ -448,18 +425,21 @@ impl App {
                 normalize_evidence(&mut incoming);
                 let updated = incoming.updated;
                 mark_content_changed(&mut incoming, updated);
-                s.tasks.push(incoming.clone());
-                t = incoming;
-            }
+                s.tasks.push(incoming);
+                s.tasks.len() - 1
+            };
+            let t = &s.tasks[pos];
+            let tid = t.id.clone();
+            let after = json!(t);
             Self::audit(
                 s,
                 "manual_edit",
-                &t.id,
+                &tid,
                 "人工修改，后续AI需结合修改记录和新证据判断",
                 before,
-                json!(t),
+                after.clone(),
             );
-            Ok(json!(t))
+            Ok(after)
         })
     }
     pub fn task_ai_edit(&self, v: &Value) -> Result<Value, String> {
@@ -467,7 +447,7 @@ impl App {
         if text.is_empty() || text.chars().count() > 6000 {
             return Err("请输入1–6000字的修改说明".into());
         }
-        let submitted = task_from_ui(&v["task"])?;
+        let mut submitted = task_from_ui(&v["task"])?;
         let original = {
             let s = self.state.lock().unwrap();
             let old = s
@@ -484,26 +464,14 @@ impl App {
             old.clone()
         };
         let mut draft = original.clone();
-        let submitted = json!(submitted);
-        let mut data = json!(draft);
+        let mut fields = serde_json::Map::new();
         for field in EDIT_FIELDS {
-            data[field] = submitted[field].clone();
+            let value = std::mem::take(submitted.text_field_mut(field).unwrap());
+            fields.insert(field.to_string(), json!(value));
+            *draft.text_field_mut(field).unwrap() = value;
         }
-        draft = serde_json::from_value(data).map_err(|e| e.to_string())?;
         validate_edit(&draft)?;
-        draft.tags = submitted["tags"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| serde_json::from_value(v.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_else(|| original.tags.clone());
-        let current = json!(draft);
-        let fields = EDIT_FIELDS
-            .iter()
-            .map(|f| ((*f).to_string(), current[*f].clone()))
-            .collect::<serde_json::Map<_, _>>();
+        draft.tags = submitted.tags;
         let result = self.ask_ai(
             "edit",
             &json!({"current_task":fields,"current_tags":draft.tags,"user_instruction":text,"_tool_task_id":draft.id}),
@@ -518,7 +486,6 @@ impl App {
         result: Value,
     ) -> Result<Value, String> {
         let changes = result["changes"].as_array().ok_or("AI结果缺少修改内容")?;
-        let mut data = json!(draft);
         let mut fields = BTreeSet::new();
         for change in changes {
             let field = change["field"].as_str().ok_or("AI修改字段无效")?;
@@ -526,179 +493,245 @@ impl App {
             if !EDIT_FIELDS.contains(&field) || !fields.insert(field) {
                 return Err("AI返回了不允许或重复的修改字段，原事项未改动".into());
             }
-            data[field] = json!(value);
+            *draft.text_field_mut(field).unwrap() = value.into();
         }
-        draft = serde_json::from_value(data).map_err(|e| e.to_string())?;
         validate_edit(&draft)?;
-        let mut locked = self.state.lock().unwrap();
-        let mut s = locked.clone();
-        let pos = s
-            .tasks
-            .iter()
-            .position(|t| t.id == original.id)
-            .ok_or("事项已不存在")?;
-        if json!(s.tasks[pos]) != json!(original) {
-            return Err("分析期间事项已有新修改，本次结果未覆盖。请重新打开编辑后再试".into());
-        }
-        let catalog = crate::tags::result_catalog(&s, &result);
-        for change in result["tag_changes"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .take(40)
-        {
-            if let Ok(tag) = serde_json::from_value::<crate::tags::Tag>(change["tag"].clone()) {
-                match change["action"].as_str() {
-                    Some("add") if crate::tags::known(&catalog, &tag) => draft.tags.push(tag),
-                    Some("remove") => draft.tags.retain(|t| t != &tag),
-                    _ => (),
-                }
+        self.commit_state(|s| {
+            let pos = s
+                .tasks
+                .iter()
+                .position(|t| t.id == original.id)
+                .ok_or("事项已不存在")?;
+            if &s.tasks[pos] != original {
+                return Err("分析期间事项已有新修改，本次结果未覆盖。请重新打开编辑后再试".into());
             }
-        }
-        crate::tags::sanitize(&mut draft, Some(original), &catalog);
-        draft.updated = now().max(original.updated + 1);
-        if draft.title != original.title || draft.description != original.description {
-            let updated = draft.updated;
-            mark_content_changed(&mut draft, updated);
-        }
-        if draft.due != original.due {
-            draft.deadline_changed = draft.updated;
-        }
-        if draft.status == "待处理" && original.status != "待处理" {
-            draft.archived = false;
-        }
-        draft.suggested_project_id = result["suggested_project_id"].as_str().unwrap_or("").into();
-        draft.suggested_project_reason = result["suggested_project_reason"]
-            .as_str()
-            .unwrap_or("")
-            .into();
-        draft.manual = true;
-        draft.locked = false;
-        draft.reason = result["reason"]
-            .as_str()
-            .unwrap_or("根据你的修改说明更新")
-            .chars()
-            .take(1000)
-            .collect();
-        s.tasks[pos] = draft.clone();
-        crate::tool_calling::link_tasks(&mut s, &result, &[draft.id.clone()]);
-        Self::audit(
-            &mut s,
-            "manual_ai_edit",
-            &draft.id,
-            &format!("一句话修改：{text}"),
-            json!(original),
-            json!(draft),
-        );
-        self.save(&s)?;
-        *locked = s;
-        Ok(json!(draft))
+            let catalog = crate::tags::result_catalog(s, &result);
+            draft.tags =
+                crate::tags::apply_changes(&draft.tags, &result["tag_changes"], &catalog, true)?;
+            crate::tags::sanitize(&mut draft, Some(original), &catalog);
+            draft.updated = now().max(original.updated + 1);
+            if draft.title != original.title || draft.description != original.description {
+                let updated = draft.updated;
+                mark_content_changed(&mut draft, updated);
+            }
+            if draft.due != original.due {
+                draft.deadline_changed = draft.updated;
+            }
+            draft.resume_processing = original.resume_processing
+                && draft.status == original.status
+                && draft.deferred_until > 0;
+            if draft.status != "待处理" {
+                draft.deferred_until = 0;
+            }
+            if ["待处理", "处理中"].contains(&draft.status.as_str())
+                && draft.status != original.status
+            {
+                draft.archived = false;
+            }
+            draft.suggested_project_id =
+                result["suggested_project_id"].as_str().unwrap_or("").into();
+            draft.suggested_project_reason = result["suggested_project_reason"]
+                .as_str()
+                .unwrap_or("")
+                .into();
+            draft.manual = true;
+            draft.locked = false;
+            draft.reason = result["reason"]
+                .as_str()
+                .unwrap_or("根据你的修改说明更新")
+                .chars()
+                .take(1000)
+                .collect();
+            let tid = draft.id.clone();
+            let after = json!(draft);
+            s.tasks[pos] = draft;
+            crate::tool_calling::link_tasks(s, &result, std::slice::from_ref(&tid));
+            Self::audit(
+                s,
+                "manual_ai_edit",
+                &tid,
+                &format!("一句话修改：{text}"),
+                json!(original),
+                after.clone(),
+            );
+            Ok(after)
+        })
     }
     pub fn task_action(&self, v: &Value) -> Result<Value, String> {
-        let mut locked = self.state.lock().unwrap();
-        let mut s = locked.clone();
-        let tid = v["id"].as_str().unwrap_or("");
-        let pos = s
-            .tasks
-            .iter()
-            .position(|t| t.id == tid)
-            .ok_or("事项不存在")?;
-        let before = json!(s.tasks[pos]);
-        let action = v["action"].as_str().unwrap_or("");
-        match action {
-            "tomorrow" => {
-                let t = &mut s.tasks[pos];
-                if t.status != "待处理"
-                    || t.archived
-                    || !t.merged_into.is_empty()
-                    || !t.generation.is_empty()
-                {
-                    return Err("只有未归档、已生成的待处理事项可以移至明日".into());
+        self.commit_state(|s| {
+            let tid = v["id"].as_str().unwrap_or("");
+            let pos = s
+                .tasks
+                .iter()
+                .position(|t| t.id == tid)
+                .ok_or("事项不存在")?;
+            let before = json!(s.tasks[pos]);
+            let action = v["action"].as_str().unwrap_or("");
+            if let Some(version) = v["updated"].as_i64() {
+                if version != s.tasks[pos].updated {
+                    return Err("事项已更新，请刷新后重试".into());
                 }
-                t.deferred_until = schedule::tomorrow_start(now());
             }
-            "resume_today" => s.tasks[pos].deferred_until = 0,
-            "done" => s.tasks[pos].status = "已完成".into(),
-            "reopen" => {
-                s.tasks[pos].status = "待处理".into();
-                s.tasks[pos].archived = false;
-                s.tasks[pos].deferred_until = 0;
+            let t = &mut s.tasks[pos];
+            match action {
+                "start" | "defer" => {
+                    if !["待处理", "处理中"].contains(&t.status.as_str())
+                        || t.archived
+                        || !t.merged_into.is_empty()
+                        || !t.generation.is_empty()
+                    {
+                        return Err("只有未归档、已生成的未完成事项可以开始或延后处理".into());
+                    }
+                    if action == "start" {
+                        t.status = "处理中".into();
+                        t.deferred_until = 0;
+                    } else {
+                        let choice = v
+                            .get("choice")
+                            .map(|x| x.as_str().ok_or("延后时间无效"))
+                            .transpose()?
+                            .unwrap_or("tomorrow");
+                        let until = schedule::defer_until(choice, &s.config.work_start, now())?;
+                        t.resume_processing = t.status == "处理中" || t.resume_processing;
+                        t.status = "待处理".into();
+                        t.deferred_until = until;
+                    }
+                }
+                "tomorrow" => {
+                    if t.status != "待处理"
+                        || t.archived
+                        || !t.merged_into.is_empty()
+                        || !t.generation.is_empty()
+                    {
+                        return Err("只有未归档、已生成的待处理事项可以移至明日".into());
+                    }
+                    t.deferred_until = schedule::tomorrow_start(now());
+                }
+                "resume_today" => t.deferred_until = 0,
+                "done" => t.status = "已完成".into(),
+                "reopen" => {
+                    t.status = "待处理".into();
+                    t.archived = false;
+                    t.deferred_until = 0;
+                }
+                "dismiss" => t.status = "无需处理".into(),
+                "unlock" => t.locked = false,
+                _ => return Err("未知操作".into()),
             }
-            "dismiss" => s.tasks[pos].status = "无需处理".into(),
-            "unlock" => s.tasks[pos].locked = false,
-            _ => return Err("未知操作".into()),
-        }
-        if action != "unlock" {
-            s.tasks[pos].manual = true;
-            s.tasks[pos].locked = false
-        }
-        s.tasks[pos].generation.clear();
-        s.tasks[pos].generation_error.clear();
-        s.tasks[pos].updated = now().max(s.tasks[pos].updated + 1);
-        let after = json!(s.tasks[pos]);
-        let detail = match action {
-            "tomorrow" => "明日处理",
-            "resume_today" => "恢复今日处理",
-            _ => action,
+            if t.status != "待处理" {
+                t.deferred_until = 0;
+            }
+            if t.deferred_until == 0 || t.status != "待处理" {
+                t.resume_processing = false;
+            }
+            if action != "unlock" {
+                t.manual = true;
+                t.locked = false
+            }
+            t.generation.clear();
+            t.generation_error.clear();
+            t.updated = now().max(t.updated + 1);
+            let after = json!(t);
+            let detail = match action {
+                "start" => "开始处理",
+                "defer" => "延后处理",
+                "tomorrow" => "明日处理",
+                "resume_today" => "恢复今日处理",
+                _ => action,
+            };
+            Self::audit(s, "manual_status", tid, detail, before, after);
+            Ok(json!(true))
+        })
+    }
+    pub fn resume_deferred(&self, at: i64) -> Result<(), String> {
+        let mut locked = self.state.lock().unwrap();
+        let eligible = |t: &Task| {
+            t.resume_processing
+                && t.status == "待处理"
+                && !t.archived
+                && t.merged_into.is_empty()
+                && t.deferred_until > 0
+                && t.deferred_until <= at
         };
-        Self::audit(&mut s, "manual_status", tid, detail, before, after);
-        self.save(&s)?;
-        *locked = s;
-        Ok(json!(true))
+        if !locked.tasks.iter().any(eligible) {
+            return Ok(());
+        }
+        let mut state = locked.clone();
+        for index in 0..state.tasks.len() {
+            if !eligible(&state.tasks[index]) {
+                continue;
+            }
+            let task = &mut state.tasks[index];
+            let before = json!(task);
+            task.status = "处理中".into();
+            task.deferred_until = 0;
+            task.resume_processing = false;
+            task.updated = at.max(task.updated + 1);
+            let tid = task.id.clone();
+            let after = json!(task);
+            Self::audit(
+                &mut state,
+                "defer_resumed",
+                &tid,
+                "延后到期，恢复处理中",
+                before,
+                after,
+            );
+        }
+        self.save(&state)?;
+        *locked = state;
+        Ok(())
     }
     pub fn merge(&self, v: &Value) -> Result<Value, String> {
-        let ids: Vec<String> =
-            serde_json::from_value(v["ids"].clone()).map_err(|e| e.to_string())?;
+        let ids: Vec<String> = from_json(&v["ids"])?;
         if ids.len() != 2 || ids[0] == ids[1] {
             return Err("请选择两个不同事项".into());
         }
-        let mut locked = self.state.lock().unwrap();
-        let mut s = locked.clone();
-        let a = s
-            .tasks
-            .iter()
-            .position(|t| t.id == ids[0])
-            .ok_or("主事项不存在")?;
-        let b = s
-            .tasks
-            .iter()
-            .position(|t| t.id == ids[1])
-            .ok_or("待合并事项不存在")?;
-        if s.tasks[a].archived
-            || s.tasks[b].archived
-            || !s.tasks[a].merged_into.is_empty()
-            || !s.tasks[b].merged_into.is_empty()
-        {
-            return Err("归档或已经合并的事项不能再次合并".into());
-        }
-        let before = json!([s.tasks[a], s.tasks[b]]);
-        let other = s.tasks[b].clone();
-        for tag in &other.tags {
-            if !s.tasks[a].tags.contains(tag) {
-                s.tasks[a].tags.push(tag.clone());
+        self.commit_state(|s| {
+            let a = s
+                .tasks
+                .iter()
+                .position(|t| t.id == ids[0])
+                .ok_or("主事项不存在")?;
+            let b = s
+                .tasks
+                .iter()
+                .position(|t| t.id == ids[1])
+                .ok_or("待合并事项不存在")?;
+            if s.tasks[a].archived
+                || s.tasks[b].archived
+                || !s.tasks[a].merged_into.is_empty()
+                || !s.tasks[b].merged_into.is_empty()
+            {
+                return Err("归档或已经合并的事项不能再次合并".into());
             }
-        }
-        merge_evidence(
-            &mut s.tasks[a],
-            &other.evidence.direct,
-            &other.evidence.background,
-            &other.evidence.completion,
-        );
-        s.tasks[a].description = format!(
-            "{}\n\n合并事项：{}\n{}",
-            s.tasks[a].description, other.title, other.description
-        );
-        s.tasks[a].manual = true;
-        s.tasks[a].locked = false;
-        s.tasks[a].updated = now();
-        normalize_task(&mut s.tasks[a]);
-        s.tasks[b].merged_into = ids[0].clone();
-        s.tasks[b].updated = now();
-        let after = json!([s.tasks[a], s.tasks[b]]);
-        Self::audit(&mut s, "merge", &ids[0], "人工合并", before, after);
-        self.save(&s)?;
-        *locked = s;
-        Ok(json!(true))
+            let before = json!([s.tasks[a], s.tasks[b]]);
+            let [main, other] = s.tasks.get_disjoint_mut([a, b]).unwrap();
+            for tag in &other.tags {
+                if !main.tags.contains(tag) {
+                    main.tags.push(tag.clone());
+                }
+            }
+            merge_evidence(
+                main,
+                &other.evidence.direct,
+                &other.evidence.background,
+                &other.evidence.completion,
+            );
+            main.description = format!(
+                "{}\n\n合并事项：{}\n{}",
+                main.description, other.title, other.description
+            );
+            main.manual = true;
+            main.locked = false;
+            main.updated = now();
+            normalize_task(main);
+            other.merged_into = ids[0].clone();
+            other.updated = now();
+            let after = json!([main, other]);
+            Self::audit(s, "merge", &ids[0], "人工合并", before, after);
+            Ok(json!(true))
+        })
     }
     pub fn undo(&self, index: usize) -> Result<Value, String> {
         self.commit_state(|s| {
@@ -709,16 +742,16 @@ impl App {
                 return Err("此记录不支持撤销".into());
             }
             let olds: Vec<Task> = if a.kind == "merge" {
-                serde_json::from_value(a.before.clone()).map_err(|e| e.to_string())?
+                from_json(&a.before)?
             } else if a.before.is_null() {
                 vec![]
             } else {
-                vec![serde_json::from_value(a.before.clone()).map_err(|e| e.to_string())?]
+                vec![from_json(&a.before)?]
             };
             let expected: Vec<Task> = if a.kind == "merge" {
-                serde_json::from_value(a.after.clone()).map_err(|e| e.to_string())?
+                from_json(&a.after)?
             } else {
-                vec![serde_json::from_value(a.after.clone()).map_err(|e| e.to_string())?]
+                vec![from_json(&a.after)?]
             };
             for e in &expected {
                 if !s
@@ -754,48 +787,46 @@ impl App {
         if note.chars().count() > 4000 {
             return Err("归档备注最多4000字".into());
         }
-        let mut locked = self.state.lock().unwrap();
-        let mut s = locked.clone();
-        let pos = s
-            .tasks
-            .iter()
-            .position(|t| t.id == tid)
-            .ok_or("事项不存在")?;
-        if v["updated"].as_i64() != Some(s.tasks[pos].updated) {
-            return Err("事项已更新，请重新打开归档窗口".into());
-        }
-        let status = v["status"]
-            .as_str()
-            .unwrap_or(&s.tasks[pos].status)
-            .to_string();
-        if !["已完成", "无需处理", "已取消"].contains(&status.as_str()) {
-            return Err("请先选择归档结果".into());
-        }
-        let before = json!(s.tasks[pos]);
-        let t = &mut s.tasks[pos];
-        t.status = status;
-        t.archived = true;
-        t.archived_at = now();
-        t.archive_note = note.into();
-        t.updated = now();
-        t.manual = true;
-        t.generation.clear();
-        t.generation_error.clear();
-        let after = json!(t);
-        Self::audit(
-            &mut s,
-            "manual_archive",
-            tid,
-            "人工归档并记录说明",
-            before,
-            after.clone(),
-        );
-        if !note.is_empty() {
-            s.pending_learning = true;
-        }
-        self.save(&s)?;
-        *locked = s;
-        Ok(after)
+        self.commit_state(|s| {
+            let pos = s
+                .tasks
+                .iter()
+                .position(|t| t.id == tid)
+                .ok_or("事项不存在")?;
+            if v["updated"].as_i64() != Some(s.tasks[pos].updated) {
+                return Err("事项已更新，请重新打开归档窗口".into());
+            }
+            let status = v["status"]
+                .as_str()
+                .unwrap_or(&s.tasks[pos].status)
+                .to_string();
+            if !["已完成", "无需处理", "已取消"].contains(&status.as_str()) {
+                return Err("请先选择归档结果".into());
+            }
+            let before = json!(s.tasks[pos]);
+            let t = &mut s.tasks[pos];
+            t.status = status;
+            t.archived = true;
+            t.archived_at = now();
+            t.archive_note = note.into();
+            t.updated = now();
+            t.manual = true;
+            t.generation.clear();
+            t.generation_error.clear();
+            let after = json!(t);
+            Self::audit(
+                s,
+                "manual_archive",
+                tid,
+                "人工归档并记录说明",
+                before,
+                after.clone(),
+            );
+            if !note.is_empty() {
+                s.pending_learning = true;
+            }
+            Ok(after)
+        })
     }
     pub fn rule_toggle(&self, tid: &str) -> Result<Value, String> {
         self.commit_state(|s| {

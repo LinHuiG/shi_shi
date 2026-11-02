@@ -1,4 +1,4 @@
-const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const root=path.resolve(__dirname,'..'),now=Date.now(),out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-ai-controls-'));
 const fixture={tasks:[],schedules:[],messages:[],handling:[],chat_sources:[],audit:[],reports:[],suggestions:[],activity:[],
   config:{codex:'fixture',analysis_workdir:'D:/fixture/kept-workdir',enabled:false,auto_ai:true,leaders:[],interval_minutes:5,daily_calls:40,max_input_chars:60000,work_start:'09:00',work_end:'18:00',archive_time:'21:00',morning_time:'08:30',evening_time:'17:30',model:'test',reasoning_effort:'low'},
@@ -10,12 +10,14 @@ const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.
   switch(method){case 'settings_patch':{const profiles={...fixture.config.model_profiles,...p.model_profiles};Object.assign(fixture.config,p);if(p.model_profiles)fixture.config.model_profiles=profiles;data={config:fixture.config};break;}case 'state':data=fixture;break;
   case 'activity_query':{const rows=fixture.activity.filter(r=>p.filter==='all'||p.filter==='ai'&&r.kind.startsWith('ai_')||p.filter==='errors'&&['error','request_error','ai_failed','ai_rejected','generation_failed'].includes(r.kind)).sort((a,b)=>b.time-a.time);data={rows:rows.slice((p.page-1)*p.page_size,p.page*p.page_size),page:p.page,pages:Math.max(1,Math.ceil(rows.length/p.page_size)),total:rows.length};break;}
   case 'ai_interrupt':fixture.ai_cancelling=true;fixture.ai_interrupted_at=Date.now();data={interrupted:true};break;
-  case 'analysis_backlog':data=p.apply?{skipped_count:2,remaining:1}:{hours:p.hours,count:2,records:{old:'fingerprint'},eligible:3};if(p.apply)fixture.pending=1;break;
+  case 'analysis_backlog':data=p.apply?{skipped_count:2,remaining:1}:{hours:p.hours,count:2,records:{old:'fingerprint'},eligible:3,retry_reasons:[{count:1,automatic_retry:false,reason:'本批存在结果未知的命令，须核对命令记录后手动重试'}]};if(p.apply)fixture.pending=1;break;
   case 'edit':case 'edit_ai':data={...p.task,updated:Date.now()};fixture.tasks=fixture.tasks.map(t=>t.id===data.id?data:t);break;
   case 'evidence':data=[];break;
   case 'messages_query':data={rows:[{id:'img-message',sender:'测试',time:Date.now(),text:'截图',images:[{id:'img-safe'}]}],page:1,page_size:50,total:1,pages:1};break;
   case 'image_preview':data={url:'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='};break;
-  case 'scan':window.finishScan=()=>window.receive({id,ok:true,data:{skipped:'fixture'}});fixture.busy=true;return;
+  case 'scan':case 'scan_only':window.finishScan=(result={ok:true,data:{skipped:'fixture'}})=>{delete window.finishScan;window.receive({id,...result});};fixture.busy=true;return;
+  case 'ai_job_start':fixture.busy=true;window.scanJobResult={done:false};data={job_id:'scan-job'};break;
+  case 'ai_job_result':data=window.scanJobResult;break;
   case 'archive':data={skipped:'无新增材料'};break;
   case 'config':fixture.config=p;break;case 'scan_control':fixture.config.enabled=p.enabled;data={enabled:p.enabled,interval_minutes:fixture.config.interval_minutes};break;
   case 'models':data={models:[{model:'test',displayName:'Test',isDefault:true,supportedReasoningEfforts:[{reasoningEffort:'low'}]}]};break;
@@ -23,9 +25,7 @@ const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.
   setTimeout(()=>window.receive({id,ok:true,data}),10);
 }};`;
 const html=require('../scripts/frontend.cjs').build().replace('<script>','<script>'+mock+'\n');
-(async()=>{
-  const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});
-  try{
+withBrowser(async(browser)=>{
     const page=await browser.newPage({viewport:{width:1240,height:820}}),errors=[];
     page.on('pageerror',e=>errors.push(e.message));
     await page.setContent(html);await page.locator('#page-title').waitFor();
@@ -37,8 +37,54 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     const scanRect=await page.locator('#top-actions [data-action="scan"]').boundingBox(),newRect=await page.locator('#top-actions [data-action="new"]').boundingBox();
     assert(scanRect.x+scanRect.width<=newRect.x);
     await page.screenshot({path:path.join(out,'refresh-busy.png')});
-    await page.evaluate(()=>{fixture.busy=false;finishScan();});
+    // Scan commit may publish an idle snapshot before the same request starts analysis.
+    await page.evaluate(async()=>{fixture.busy=false;await refreshState(false);});
+    assert(await page.locator('#top-actions [data-action="scan"]').isDisabled());
+    assert.equal(await page.locator('#top-actions [data-action="scan"]').getAttribute('aria-busy'),'true');
+    await page.evaluate(()=>refreshState(true));
+    assert(await page.locator('#top-actions [data-action="scan"]').isDisabled());
+    await page.locator('[data-page="inbox"]').first().click();await page.locator('#inbox-search').waitFor();
+    assert(await page.locator('#top-actions [data-action="refresh-messages"]').isDisabled());
+    await page.locator('#top-actions [data-action="refresh-messages"]').dispatchEvent('click');
+    assert.equal(await page.evaluate(()=>requests.filter(r=>r.method==='scan'||r.method==='scan_only').length),1);
+    await page.locator('[data-page="tasks"]').first().click();
+    assert(await page.locator('#top-actions [data-action="scan"]').isDisabled());
+    await page.locator('#top-actions [data-action="scan"]').dispatchEvent('click');
+    assert.equal(await page.evaluate(()=>requests.filter(r=>r.method==='scan').length),1);
+    await page.evaluate(()=>{fixture.ai_busy=true;finishScan();});
+    await page.waitForFunction(()=>document.querySelector('#toast').textContent==='fixture');
+    assert(await page.locator('#top-actions [data-action="scan"]').isDisabled(),'completion must respect newer background AI activity');
+    await page.evaluate(async()=>{fixture.ai_busy=false;await refreshState(false);});
     await page.waitForFunction(()=>!document.querySelector('#top-actions [data-action="scan"]').disabled);
+    // The request remains owned throughout asynchronous job-result polling.
+    await page.evaluate(async()=>{fixture.async_ai_requests=true;await refreshState(false);});
+    await page.locator('#top-actions [data-action="scan"]').click();
+    await page.waitForFunction(()=>requests.some(r=>r.method==='ai_job_result'));
+    await page.evaluate(async()=>{fixture.busy=false;fixture.ai_busy=false;await refreshState(true);});
+    assert(await page.locator('#top-actions [data-action="scan"]').isDisabled());
+    await page.locator('#top-actions [data-action="scan"]').dispatchEvent('click');
+    assert.deepEqual(await page.evaluate(()=>requests.filter(r=>r.method==='ai_job_start').map(r=>r.p)),[{method:'scan',params:{}}]);
+    await page.evaluate(()=>{fixture.ai_busy=true;window.scanJobResult={done:true,ok:true,data:{skipped:'合成后台刷新完成'}};});
+    await page.waitForFunction(()=>document.querySelector('#toast').textContent==='合成后台刷新完成');
+    assert(await page.locator('#top-actions [data-action="scan"]').isDisabled());
+    // Inbox refresh still scans only, and can run while an independent AI request is busy.
+    await page.locator('[data-page="inbox"]').first().click();await page.locator('#inbox-search').waitFor();
+    assert(await page.locator('#top-actions [data-action="refresh-messages"]').isEnabled());
+    await page.locator('#inbox-search').fill('保留搜索');
+    await page.waitForFunction(()=>inboxQuery==='保留搜索');
+    await page.locator('#top-actions [data-action="refresh-messages"]').click();await page.waitForFunction(()=>window.finishScan);
+    await page.evaluate(async()=>{fixture.busy=false;await refreshState(false);});
+    assert(await page.locator('#top-actions [data-action="refresh-messages"]').isDisabled());
+    await page.locator('#top-actions [data-action="refresh-messages"]').dispatchEvent('click');
+    assert.equal(await page.evaluate(()=>requests.filter(r=>r.method==='scan_only').length),1);
+    assert.equal(await page.evaluate(()=>requests.filter(r=>r.method==='ai_job_start').length),1);
+    await page.evaluate(()=>finishScan({ok:false,error:'合成扫描失败'}));
+    await page.waitForFunction(()=>document.querySelector('#toast').textContent==='合成扫描失败');
+    assert(await page.locator('#top-actions [data-action="refresh-messages"]').isEnabled());
+    assert.equal(await page.locator('#inbox-search').inputValue(),'保留搜索');
+    assert.equal(await page.evaluate(()=>requests.filter(r=>r.method==='analyze').length),0);
+    await page.evaluate(async()=>{fixture.async_ai_requests=false;fixture.ai_busy=false;await refreshState(false);});
+    await page.locator('[data-page="tasks"]').first().click();
 
     await page.evaluate(async()=>{Object.assign(fixture,{pending:1,analyzing:2,ai_busy:true,ai_request_id:'call-1',ai_started:Date.now(),ai_progress:'正在整理资料'});await refreshState(true);});
     const stop=page.locator('[data-action="ai-interrupt"]');await stop.waitFor();
@@ -75,6 +121,8 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     await page.locator('[data-action="backlog"]').click();
     await page.waitForFunction(()=>!document.querySelector('#backlog-apply').disabled);
     assert(await page.locator('#overlay').isHidden());
+    assert((await page.locator('#backlog-retries').innerText()).includes('1 条需手动重试'));
+    assert((await page.locator('#backlog-retries').innerText()).includes('核对命令记录'));
     await page.locator('#backlog-hours').fill('12');
     assert(await page.locator('#backlog-apply').isDisabled());
 
@@ -84,7 +132,7 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     await page.waitForFunction(()=>fixture.pending===1);
     await page.locator('#backlog-panel').waitFor({state:'detached'});
     assert.equal(await page.evaluate(()=>fixture.config.analysis_lookback_hours??24),24);
-    await page.evaluate(async()=>{const t={id:'task',title:'筛选测试',description:'正文',status:'待处理',priority:'普通',environment:'不适用',category:'问题排查',sources:[],tags:[],blocker:'等待验证',due:'',waiting_for:'',updated:1,created:1};fixture.tasks=[t];tab='待处理';quickView='blocked';query='筛选';page='tasks';await refreshState(true);});
+    await page.evaluate(async()=>{const t={id:'task',title:'筛选测试',description:'正文',status:'待处理',priority:'普通',environment:'不适用',category:'问题排查',sources:[],tags:[],blocker:'等待验证',due:'',waiting_for:'',updated:1,created:1};fixture.tasks=[t];tab='被阻塞';quickView='blocked';query='筛选';page='tasks';await refreshState(true);});
     for(const action of ['save-task','ai-edit-task']){
       await page.locator('[data-action="edit"]').click();
       assert.equal(await page.locator('#f-env').count(),0,'environment selector removed');
@@ -92,14 +140,14 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
       else await page.locator('#f-description').fill('更新后的描述');
       await page.locator(`[data-action="${action}"]`).click();
       await page.locator('#overlay').waitFor({state:'hidden'});
-      assert.deepEqual(await page.evaluate(()=>[tab,quickView,query]),['待处理','blocked','筛选']);
+      assert.deepEqual(await page.evaluate(()=>[tab,quickView,query]),['被阻塞','blocked','筛选']);
     }
     assert.equal(await page.evaluate(()=>fixture.tasks[0].environment),'','legacy environment placeholder cleared on edit');
     await page.locator('[data-action="edit"]').click();
-    await page.locator('#f-status').selectOption('已完成');
+    await page.locator('[data-task-status-value="已完成"]').click();
     await page.locator('[data-action="save-task"]').click();
     await page.locator('#overlay').waitFor({state:'hidden'});
-    assert.equal(await page.evaluate(()=>tab),'待处理');
+    assert.equal(await page.evaluate(()=>tab),'被阻塞');
     // The dialog closes before the follow-up refresh lands; wait for it.
     await page.waitForFunction(()=>document.querySelectorAll('.task-row').length===0);
     await page.locator('[data-page="reports"]').first().click();
@@ -183,5 +231,4 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
     assert((await page.locator('#status').innerText()).includes('补查覆盖不完整'));
     assert.deepEqual(errors,[]);
     console.log('PASS stop from modal; request identity; disabled while cancelling; cancel without pause; pending retained; backlog inline; edits preserve filters; archive single action; guide; configurable input limit; cancellation versus failure; reasoning usage. '+out);
-  }finally{await browser.close();}
-})().catch(e=>{console.error(e);process.exitCode=1});
+  }).catch(e=>{console.error(e);process.exitCode=1});

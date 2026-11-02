@@ -22,7 +22,6 @@
 //! absence is not treated as a deletion.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
@@ -45,85 +44,49 @@ pub const MAX_NOTE_CHARS: usize = 512;
 /// Bound for the upstream JSON Schema annotation strings (`$schema`, `$id`).
 pub const MAX_UPSTREAM_META_CHARS: usize = 512;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HolidayError {
+    #[error("holiday data is too large ({len} bytes, max {max})")]
     BodyTooLarge { len: usize, max: usize },
+    #[error("holiday data is empty")]
     EmptyBody,
+    #[error("holiday JSON is invalid: {0}")]
     InvalidJson(String),
+    #[error("unsupported holiday cache schema version {found} (expected {expected})")]
     UnsupportedSchemaVersion { found: u32, expected: u32 },
+    #[error("holiday year {0} is outside {MIN_YEAR}..={MAX_YEAR}")]
     InvalidYear(i32),
+    #[error("holiday year has no days")]
     EmptyDays,
+    #[error("holiday year has too many days ({0})")]
     TooManyDays(usize),
+    #[error("holiday year has too many source papers ({0})")]
     TooManyPapers(usize),
+    #[error("invalid holiday date {0:?}")]
     InvalidDate(String),
+    #[error("date {date} is outside publication year {year} (only that year and its previous December are allowed)")]
     DateOutsidePublicationYear { date: NaiveDate, year: i32 },
+    #[error("contradictory or duplicate date {0}")]
     DuplicateDate(NaiveDate),
+    #[error("holiday cache days are not strictly increasing at {0}")]
     CacheDaysNotStrictlyIncreasing(NaiveDate),
+    #[error("holiday cache source is empty or invalid")]
     InvalidSource,
+    #[error("holiday cache {0} header is invalid")]
     InvalidHeader(&'static str),
+    #[error("holiday cache fetched_at_ms {0} is invalid")]
     InvalidFetchedAtMs(i64),
+    #[error("holiday upstream metadata {0} is invalid")]
     InvalidUpstreamMetadata(&'static str),
+    #[error("manual day override is invalid: {0}")]
     InvalidManualOverride(&'static str),
 }
-
-impl fmt::Display for HolidayError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::BodyTooLarge { len, max } => {
-                write!(f, "holiday data is too large ({len} bytes, max {max})")
-            }
-            Self::EmptyBody => write!(f, "holiday data is empty"),
-            Self::InvalidJson(detail) => write!(f, "holiday JSON is invalid: {detail}"),
-            Self::UnsupportedSchemaVersion { found, expected } => write!(
-                f,
-                "unsupported holiday cache schema version {found} (expected {expected})"
-            ),
-            Self::InvalidYear(year) => {
-                write!(f, "holiday year {year} is outside {MIN_YEAR}..={MAX_YEAR}")
-            }
-            Self::EmptyDays => write!(f, "holiday year has no days"),
-            Self::TooManyDays(count) => write!(f, "holiday year has too many days ({count})"),
-            Self::TooManyPapers(count) => {
-                write!(f, "holiday year has too many source papers ({count})")
-            }
-            Self::InvalidDate(raw) => write!(f, "invalid holiday date {raw:?}"),
-            Self::DateOutsidePublicationYear { date, year } => write!(
-                f,
-                "date {date} is outside publication year {year} (only that year and its previous December are allowed)"
-            ),
-            Self::DuplicateDate(date) => write!(f, "contradictory or duplicate date {date}"),
-            Self::CacheDaysNotStrictlyIncreasing(date) => write!(
-                f,
-                "holiday cache days are not strictly increasing at {date}"
-            ),
-            Self::InvalidSource => write!(f, "holiday cache source is empty or invalid"),
-            Self::InvalidHeader(name) => write!(f, "holiday cache {name} header is invalid"),
-            Self::InvalidFetchedAtMs(ts) => {
-                write!(f, "holiday cache fetched_at_ms {ts} is invalid")
-            }
-            Self::InvalidUpstreamMetadata(field) => {
-                write!(f, "holiday upstream metadata {field} is invalid")
-            }
-            Self::InvalidManualOverride(detail) => {
-                write!(f, "manual day override is invalid: {detail}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for HolidayError {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DayKind {
     Holiday,
     Workday,
-}
-
-impl DayKind {
-    pub fn is_holiday(self) -> bool {
-        matches!(self, Self::Holiday)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,11 +286,6 @@ impl HolidayCache {
     pub fn is_stale(&self, now_ms: i64) -> bool {
         now_ms.saturating_sub(self.fetched_at_ms) >= CACHE_TTL_MS
     }
-
-    pub fn days_map(&self) -> Result<BTreeMap<NaiveDate, DayKind>, HolidayError> {
-        self.validate()?;
-        Ok(self.days.iter().map(|d| (d.date, d.kind)).collect())
-    }
 }
 
 /// Validated upstream data. Kept separate from the timestamped cache so the
@@ -416,7 +374,7 @@ pub fn parse_holiday_year(bytes: &[u8]) -> Result<PublishedHolidayYear, HolidayE
 /// In-memory calendar source set for one or more publication years.
 #[derive(Debug, Clone, Default)]
 pub struct CalendarData {
-    caches: BTreeMap<i32, HolidayCache>,
+    caches: std::sync::Arc<BTreeMap<i32, HolidayCache>>,
     manual_overrides: BTreeMap<NaiveDate, ManualOverride>,
 }
 
@@ -429,20 +387,12 @@ impl CalendarData {
     /// conflicting day inside its own JSON is already rejected by its parser.
     pub fn insert_cache(&mut self, cache: HolidayCache) -> Result<(), HolidayError> {
         cache.validate()?;
-        self.caches.insert(cache.year, cache);
+        std::sync::Arc::make_mut(&mut self.caches).insert(cache.year, cache);
         Ok(())
-    }
-
-    pub fn remove_cache(&mut self, year: i32) -> Option<HolidayCache> {
-        self.caches.remove(&year)
     }
 
     pub fn cache(&self, year: i32) -> Option<&HolidayCache> {
         self.caches.get(&year)
-    }
-
-    pub fn caches(&self) -> impl Iterator<Item = &HolidayCache> {
-        self.caches.values()
     }
 
     pub fn set_manual_override(&mut self, value: ManualOverride) -> Result<(), HolidayError> {
@@ -451,12 +401,9 @@ impl CalendarData {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn remove_manual_override(&mut self, date: NaiveDate) -> Option<ManualOverride> {
         self.manual_overrides.remove(&date)
-    }
-
-    pub fn manual_override(&self, date: NaiveDate) -> Option<&ManualOverride> {
-        self.manual_overrides.get(&date)
     }
 
     /// Classify one Shanghai calendar date at an explicit lookup time in Unix
@@ -480,41 +427,17 @@ impl CalendarData {
             };
         }
 
-        let years = applicable_publication_years(date);
+        let mut coverage = None;
         let mut explicit: Option<(&HolidayCache, DayKind)> = None;
-        for year in &years {
-            if let Some(cache) = self.caches.get(year) {
-                if let Some(kind) = cache.days.iter().find(|d| d.date == date).map(|d| d.kind) {
-                    // Caches are visited in ascending publication-year order.
-                    explicit = Some((cache, kind));
-                }
+        for cache in applicable_publication_years(date).filter_map(|year| self.caches.get(&year)) {
+            coverage = Some(cache);
+            if let Some(day) = cache.days.iter().find(|day| day.date == date) {
+                // Later publications override explicit dates, but an omitted
+                // date does not erase an older publication's explicit record.
+                explicit = Some((cache, day.kind));
             }
         }
-        if let Some((cache, kind)) = explicit {
-            let stale = cache.is_stale(now_ms);
-            let mut diagnostics = Vec::new();
-            if stale {
-                diagnostics.push(stale_diagnostic(cache, now_ms));
-            }
-            return CalendarDay {
-                date,
-                kind: match kind {
-                    DayKind::Holiday => CalendarKind::Holiday,
-                    DayKind::Workday => CalendarKind::Workday,
-                },
-                source: Some(CalendarSource::Cache),
-                publication_year: Some(cache.year),
-                fetched_at_ms: Some(cache.fetched_at_ms),
-                stale,
-                diagnostics,
-            };
-        }
-
-        let coverage = years
-            .iter()
-            .filter_map(|year| self.caches.get(year))
-            .max_by_key(|cache| cache.year);
-        let Some(cache) = coverage else {
+        let Some(cache) = explicit.map(|(cache, _)| cache).or(coverage) else {
             return CalendarDay {
                 date,
                 kind: CalendarKind::Unknown,
@@ -531,19 +454,18 @@ impl CalendarData {
         if stale {
             diagnostics.push(stale_diagnostic(cache, now_ms));
         }
-        let weekend = matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun);
+        let (kind, source) = match explicit {
+            Some((_, DayKind::Holiday)) => (CalendarKind::Holiday, CalendarSource::Cache),
+            Some((_, DayKind::Workday)) => (CalendarKind::Workday, CalendarSource::Cache),
+            None if matches!(date.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun) => {
+                (CalendarKind::Weekend, CalendarSource::Weekend)
+            }
+            None => (CalendarKind::Workday, CalendarSource::Cache),
+        };
         CalendarDay {
             date,
-            kind: if weekend {
-                CalendarKind::Weekend
-            } else {
-                CalendarKind::Workday
-            },
-            source: Some(if weekend {
-                CalendarSource::Weekend
-            } else {
-                CalendarSource::Cache
-            }),
+            kind,
+            source: Some(source),
             publication_year: Some(cache.year),
             fetched_at_ms: Some(cache.fetched_at_ms),
             stale,
@@ -562,12 +484,9 @@ fn stale_diagnostic(cache: &HolidayCache, now_ms: i64) -> CalendarDiagnostic {
 
 /// A date is covered by its own year's file and, in December, the next year's
 /// file (which can publish the following New Year arrangement).
-fn applicable_publication_years(date: NaiveDate) -> Vec<i32> {
-    let mut years = vec![date.year()];
-    if date.month() == 12 && date.year() < MAX_YEAR {
-        years.push(date.year() + 1);
-    }
-    years
+fn applicable_publication_years(date: NaiveDate) -> std::ops::RangeInclusive<i32> {
+    let include_next = date.month() == 12 && date.year() < MAX_YEAR;
+    date.year()..=date.year() + i32::from(include_next)
 }
 
 fn check_body(bytes: &[u8]) -> Result<(), HolidayError> {
@@ -1067,6 +986,7 @@ mod tests {
                 ],
             ))
             .unwrap();
+        let snapshot = calendar.clone();
         calendar
             .insert_cache(cache(
                 2025,
@@ -1077,6 +997,14 @@ mod tests {
                 ],
             ))
             .unwrap();
+        assert!(snapshot.cache(2025).is_none());
+        assert_eq!(
+            snapshot
+                .classify(d(2024, 12, 31), ts_ms(2025, 1, 2, 12, 0))
+                .kind,
+            CalendarKind::Workday,
+            "updating the cache preserves existing snapshots"
+        );
         let day = calendar.classify(d(2024, 12, 31), ts_ms(2025, 1, 2, 12, 0));
         assert_eq!(day.kind, CalendarKind::Holiday);
         assert_eq!(day.publication_year, Some(2025));

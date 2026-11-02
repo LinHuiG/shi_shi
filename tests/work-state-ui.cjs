@@ -1,4 +1,4 @@
-const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const root=path.resolve(__dirname,'..'),out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-work-state-ui-')),now=Date.now();
 const task={id:'t1',title:'核对发布结果',description:'收集发布日志并确认结果。',summary:'收集发布日志',status:'待处理',priority:'普通',category:'问题排查',environment:'未指定',due:'',evidence:{direct:['m1'],background:['m2'],completion:['m3']},steps:[{id:'s1',title:'收集发布日志',status:'running',depends_on:[],waiting_for:'发布人',next_step:'等待日志',confirmed:false}],tags:[],created:now,updated:now,today:true,manual:false,generation:'',archived:false};
 const state={tasks:[task],schedules:[],messages:[{id:'m1',text:'发布完成请核对',sender:'测试',group:'发布群',source_name:'测试来源',time:now,private:true},{id:'m2',text:'背景说明',sender:'测试',group:'发布群',source_name:'测试来源',time:now-1000,private:true}],config:{codex:'fixture',enabled:false,auto_ai:false,leaders:[],interval_minutes:5,analysis_interval_minutes:30,analysis_lookback_hours:24,daily_calls:40,max_input_chars:60000,message_retention_days:90,work_start:'09:00',work_end:'18:00',model:'model-analysis',reasoning_effort:'low',model_profiles:{filter:{model:'model-analysis',reasoning_effort:'low'},analysis:{model:'model-analysis',reasoning_effort:'low'},handling:{model:'model-analysis',reasoning_effort:'low'},review:{model:'model-analysis',reasoning_effort:'low'}}},usage:{day:'2026-10-18',calls:0,input_tokens:0,output_tokens:0,cached_input_tokens:0,cached_reports:0,unreported_calls:0},filter_usage:{calls:2,input_tokens:10,output_tokens:3,unreported_calls:1,reason:''},work_state:{at_ms:now,business_date:'2026-10-18',status:'off_duty',calendar_day:{date:'2026-10-18',kind:'weekend',source:'weekend',stale:false,diagnostics:[]},end_eligibility:'not_eligible'},archive_attempt:null,activity:[],audit:[],suggestions:[],reports:[],chat_sources:[],handling:[],pending:1,last_scan:now,in_work_hours:false,filter_usage:{calls:2,input_tokens:10,output_tokens:3,unreported_calls:1,reason:''}};
@@ -7,7 +7,7 @@ const history={versions:[{id:'v1',created:now-1000,action:'archive',reason:'初�
 const version={id:'v1',created:now,action:'archive',reason:'初始归档',prompt:'系统提示词',rules:[{title:'规则',rule:'只按证据判断'}],tags:[{name:'事项类型',values:['问题排查']}],memory:[{key:'职责',text:'核对环境'}],current:'v1'};
 const mock=`window.fixture=${JSON.stringify(state)};window.historyFixture=${JSON.stringify(history)};window.versionFixture=${JSON.stringify(version)};window.requests=[];window.ipc={postMessage(raw){const {id,method,params:p}=JSON.parse(raw);requests.push({method,p});setTimeout(()=>{let data=true;switch(method){case 'state':data=fixture;break;case 'work_state':if(p.overtime===true){fixture.work_state.status='overtime';}if(p.date){fixture.work_state.calendar_day={...fixture.work_state.calendar_day,date:p.date,kind:p.kind==='holiday'?'holiday':'workday',source:'manual'};}break;case 'edit':{const t=fixture.tasks.find(x=>x.id===p.task.id);if(t&&p.task.steps)t.steps=p.task.steps;data=t;break;}case 'evidence_query':data={rows:[...fixture.messages,{id:'m3',text:'合成确认结果',sender:'合成发送人',time:Date.now()}],all:3,total:3,page:1,pages:1};break;case 'evidence':data=[{id:'m1',source_name:'测试来源',group:'发布群',sender:'测试',time:Date.now(),text:'发布完成请核对',kind:'text',evidence_role:'direct'},{id:'m2',source_name:'测试来源',group:'发布群',sender:'测试',time:Date.now()-1000,text:'背景说明',kind:'text',evidence_role:'background'},{id:'m3',source_name:'测试来源',group:'发布群',sender:'测试',time:Date.now()-500,text:'结果已确认',kind:'text',evidence_role:'completion'}];break;case 'archive_history':data={versions:historyFixture.versions,current:historyFixture.current};break;case 'archive_version':data={...versionFixture,id:p.id,prompt:p.id==='v2'?'当前版本：先核对证据':'目标版本：记录行动项'};break;case 'archive_rollback':historyFixture.current='v2';break;case 'prompts':data={classify:'默认',handling:'默认',prompt_review:'默认',format:'默认',learning:'默认',report:'默认'};break;case 'models':data={models:[{model:'model-analysis',displayName:'analysis',supportedReasoningEfforts:[{reasoningEffort:'low'}]}]};break;}window.receive({id,ok:true,data});},5)}};`;
 const html=require('../scripts/frontend.cjs').build().replace('<script>','<script>'+mock+'\n');
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{const page=await browser.newPage({viewport:{width:1280,height:960}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.setContent(html);await page.locator('.task-row').first().waitFor();
+withBrowser(async(browser)=>{const page=await browser.newPage({viewport:{width:1280,height:960}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.setContent(html);await page.locator('.task-row').first().waitFor();
  await page.waitForFunction(()=>document.querySelector('#work-status')?.innerText.includes('已下班'));
  await page.evaluate(async()=>{page='tasks';selected='t1';await render();});
  assert.equal(await page.locator('[data-step-confirm],[data-step-status],.steps-section').count(),0);
@@ -45,15 +45,64 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
  assert(await page.evaluate(()=>requests.some(r=>r.method==='work_state'&&r.p.kind==='holiday')));
  await page.evaluate(()=>{fixture.tasks[0].archived=true;state.tasks[0].archived=true;tab='归档';renderTasks();});
  assert((await page.locator('.task-status').first().innerText()).includes('已归档'));
- await page.evaluate(async()=>{page='reports';await render();});
- await page.evaluate(()=>{state.archive_attempt={status:'failed',batches:1,processed:12,archived_tasks:2,remaining:8,error:'合成后续批次失败'};renderReports();});
+ const reportState=async(patch)=>page.evaluate(async patch=>{Object.assign(fixture,patch);await refreshState(false);},patch);
+ const reportNow=Date.parse('2026-10-20T12:00:00+08:00');
+ await page.clock.setFixedTime(reportNow);
+ const at=reportNow-60000;
+ const morningFailure={kind:'morning',id:'morning-old',label:'早报',status:'failed',finished:at,error:'合成早报失败'};
+ await page.evaluate(async outcome=>{page='reports';selected='';fixture.morning_jobs=[{id:outcome.id,status:'failed',error:outcome.error}];fixture.report_outcome=outcome;await refreshState(true);},morningFailure);
+ const statusFailure=page.locator('#status .status-error[data-page="reports"]');
+ assert.equal(await statusFailure.innerText(),'早报失败');
+ assert((await page.locator('.report-failure').innerText()).includes('合成早报失败'));
+ // A running/partially committed attempt does not resolve the prior failure.
+ const attempt={id:'archive-next',status:'running',finished:0,started:at+1000,batches:1,processed:12,archived_tasks:2,remaining:8,error:''};
+ await reportState({archive_attempt:attempt});
+ assert.equal(await statusFailure.innerText(),'早报失败');
+ assert((await page.locator('.report-page').innerText()).includes('归档处理中'));
+ assert(!(await page.locator('.report-page').innerText()).includes('归档完成'));
+ const archiveFailure={kind:'archive',id:attempt.id,label:'归档',status:'failed',finished:at+2000,error:'合成后续批次失败'};
+ await reportState({archive_attempt:{...attempt,status:'failed',finished:archiveFailure.finished,error:archiveFailure.error},report_outcome:archiveFailure});
+ assert.equal(await statusFailure.innerText(),'归档失败');
+ assert.equal(await page.locator('.report-page>.error-box').count(),1);
+ assert.equal(await page.locator('.report-failure').count(),0);
  assert((await page.locator('.report-page').innerText()).includes('归档部分已提交，后续未完成'));
  assert((await page.locator('.report-page').innerText()).includes('剩余 8 条'));
- await page.evaluate(()=>{state.archive_attempt={status:'succeeded',finished:Date.now(),batches:2,processed:20,archived_tasks:4,remaining:0};renderReports();});
+ const archiveSuccess={...archiveFailure,status:'succeeded',finished:at+3000,error:''};
+ const successAttempt={...attempt,status:'succeeded',finished:archiveSuccess.finished,batches:2,processed:20,archived_tasks:4,remaining:0};
+ await reportState({archive_attempt:successAttempt,report_outcome:archiveSuccess});
+ assert.equal(await statusFailure.count(),0);
+ assert.equal(await page.locator('.report-page>.error-box').count(),0);
+ assert.equal(await page.evaluate(()=>fixture.morning_jobs[0].status),'failed','old failure history is retained');
  assert((await page.locator('.report-page').innerText()).includes('归档完成'));
- await page.evaluate(()=>{state.archive_attempt.finished=Date.now()-86400000;renderReports();});assert(!(await page.locator('.report-page').innerText()).includes('归档完成'));
- await page.evaluate(()=>{state.archive_attempt.finished=Date.now()-300001;renderReports();});assert(!(await page.locator('.report-page').innerText()).includes('归档完成'));
- assert(await page.evaluate(()=>{const midnight=Date.parse('2026-10-20T00:00:00+08:00');return !visibleArchiveAttempt({status:'succeeded',finished:midnight-1000},midnight+1000);}));
+ await page.locator('[data-page="tasks"]').first().click();await page.waitForFunction(()=>page==='tasks');assert.equal(await statusFailure.count(),0);
+ await page.locator('[data-page="reports"]').first().click();await page.locator('.report-page').waitFor();await page.evaluate(()=>refreshState(true));assert.equal(await statusFailure.count(),0);
+ await reportState({archive_attempt:{...successAttempt,finished:reportNow-86400000}});assert(!(await page.locator('.report-page').innerText()).includes('归档完成'));
+ await reportState({archive_attempt:{...successAttempt,finished:reportNow-300001}});assert(!(await page.locator('.report-page').innerText()).includes('归档完成'));
+ assert(await page.evaluate(()=>{const midnight=Date.parse('2026-10-20T00:00:00+08:00');return !visibleArchiveAttempt({...state.archive_attempt,finished:midnight-1000},midnight+1000);}));
+ assert(await page.evaluate(()=>{const at=Date.parse('2026-10-20T12:00:00+08:00');return visibleArchiveAttempt({...state.archive_attempt,finished:at+1},at);}), 'same-millisecond completion remains visible');
+ // Only the compact outcome changes: normal refresh must invalidate the report page.
+ const staleArchive={...attempt,status:'failed',finished:at+2000,error:'合成旧归档错误'};
+ const reportSuccess={kind:'report',id:'report-next',label:'晚报',status:'succeeded',finished:at+4000,error:''};
+ await reportState({archive_attempt:staleArchive,report_outcome:reportSuccess});
+ assert.equal(await statusFailure.count(),0);assert.equal(await page.locator('.report-page>.error-box').count(),0);
+ const reportFailure={...reportSuccess,status:'failed',finished:at+5000,error:'合成新晚报错误'};
+ await reportState({report_outcome:reportFailure});
+ assert.equal(await statusFailure.innerText(),'晚报失败');
+ assert((await page.locator('.report-failure').innerText()).includes('合成新晚报错误'));
+ assert(!(await page.locator('.report-page').innerText()).includes('合成旧归档错误'));
+ for(const width of [1360,900]){
+  await page.setViewportSize({width,height:820});
+  const bar=await page.locator('#status').boundingBox(),failure=await statusFailure.boundingBox(),backlog=await page.locator('#status .backlog-trigger').boundingBox();
+  assert(Math.abs(failure.y+failure.height/2-backlog.y-backlog.height/2)<3,'failure and backlog remain on one line');assert(failure.y>=bar.y&&failure.y+failure.height<=bar.y+bar.height);
+ }
+ await page.setViewportSize({width:1280,height:960});
+ const markup={...reportFailure,label:'晚报<em>合成</em>',error:'<img src=x onerror="window.reportInjected=true"> & "合成"'};
+ await reportState({report_outcome:markup});
+ assert.equal(await statusFailure.textContent(),markup.label+'失败');assert.equal(await statusFailure.getAttribute('title'),markup.error);
+ assert((await page.locator('.report-failure').textContent()).includes(markup.error));assert.equal(await page.locator('.report-failure img,.report-failure em,#status em').count(),0);assert.equal(await page.evaluate(()=>!!window.reportInjected),false);
+ await reportState({report_outcome:{...reportSuccess,finished:at+6000},last_error:'合成事项分析失败'});
+ assert.equal(await statusFailure.count(),0);assert.equal(await page.locator('.report-page>.error-box').count(),0);assert.equal(await page.locator('#status .status-error[data-page="logs"]').count(),1);
+ await reportState({last_error:''});
 
  await page.locator('[data-action="archive-history"]').click();
  await page.locator('#dialog').getByText('归档版本历史').waitFor();
@@ -69,5 +118,5 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
  await page.screenshot({path:path.join(out,'archive-comparison.png')});
  await page.locator('[data-action="close"]').click();
  assert.deepEqual(errors,[]);
- console.log('PASS work status chip and overtime; legacy steps hidden and preserved; unified searchable/sortable evidence; transient archive success; archive version comparison. '+out);
-}finally{await browser.close();}})().catch(error=>{console.error(error);process.exitCode=1});
+ console.log('PASS work status chip and overtime; legacy steps hidden and preserved; unified searchable/sortable evidence; latest report outcome, failure recovery and escaped single-line status; transient archive success; archive version comparison. '+out);
+}).catch(error=>{console.error(error);process.exitCode=1});

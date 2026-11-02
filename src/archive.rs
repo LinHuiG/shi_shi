@@ -8,15 +8,36 @@ use crate::{
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs, sync::atomic::Ordering};
 
+fn group_snapshot(s: &State) -> ArchiveGroup {
+    ArchiveGroup {
+        active_rules: s
+            .suggestions
+            .iter()
+            .filter(|rule| rule.active && rule.archived_at == 0)
+            .cloned()
+            .collect(),
+        rule_version: s.rule_version,
+        tag_groups: crate::tags::groups(s),
+        tag_version: s
+            .tag_state
+            .versions
+            .last()
+            .map(|version| version.id.clone())
+            .unwrap_or_default(),
+        archived_version: s.analysis_memory.archived_version,
+        ..ArchiveGroup::default()
+    }
+}
+
 /// Archive groups keep the classify prompt by reference when an identical
 /// prompt version exists. Prompt versions are never pruned, so the rollback
 /// history stays complete without one full prompt copy per archived day.
-pub(crate) fn stored_prompt(s: &State, version: &str, content: String) -> String {
+pub(crate) fn stored_prompt<T: AsRef<str> + Default>(s: &State, version: &str, content: T) -> T {
     if s.prompt_versions
         .iter()
-        .any(|v| v.id == version && v.content == content)
+        .any(|v| v.id == version && v.content == content.as_ref())
     {
-        String::new()
+        T::default()
     } else {
         content
     }
@@ -75,11 +96,12 @@ pub fn initialize(s: &mut State) {
 /// Startup recovery is deliberately one-way: queued/running attempts become
 /// failed. A committed success is never replayed as failed.
 pub fn recover(s: &mut State, at: i64) {
+    let finished = s.next_report_finished(at);
     for attempt in &mut s.archive_attempts {
         if attempt.unfinished() {
             attempt.status = "failed".into();
             attempt.error = RECOVERY_ERROR.into();
-            attempt.finished = at;
+            attempt.finished = finished;
         }
     }
 }
@@ -110,29 +132,40 @@ pub(crate) struct Candidate {
     pub payload: Value,
     pub cutoff: usize,
     pub evidence_ids: Vec<usize>,
-    pub learning_ids: Vec<usize>,
     pub report: Value,
     pub tasks_to_archive: Vec<Task>,
-    pub referenced_messages: BTreeSet<String>,
     pub pending_count: usize,
     pub remaining_events: usize,
 }
 impl Candidate {
     fn has_ai_input(&self) -> bool {
         !self.evidence_ids.is_empty()
-    }
-    fn evidence_refs(&self) -> BTreeSet<String> {
-        self.evidence_ids
-            .iter()
-            .map(|i| format!("audit:{i}"))
-            .chain(self.learning_ids.iter().map(|i| format!("audit:{i}")))
-            .chain(self.referenced_messages.iter().cloned())
-            .collect()
+            || (self.trigger == "manual_archive"
+                && self.payload["_archived_memory"]
+                    .as_str()
+                    .is_some_and(|text| !text.trim().is_empty()))
     }
 }
 
+#[cfg(test)]
 fn batch(s: &State, mode: AiMode, at: i64, attempt_id: &str, business_day: &str) -> Candidate {
-    batch_limited(s, mode, at, attempt_id, business_day, usize::MAX)
+    let mut candidate = batch_limited(
+        s,
+        mode,
+        at,
+        attempt_id,
+        business_day,
+        usize::MAX,
+        true,
+        crate::context_budget::pending_refs(s, false).count(),
+    );
+    crate::analysis_context::attach_records(
+        &mut candidate.payload,
+        crate::snapshots::records_from_state(s, at),
+        s.config.retrieval_budget_chars,
+    )
+    .unwrap();
+    candidate
 }
 
 fn batch_limited(
@@ -142,6 +175,8 @@ fn batch_limited(
     attempt_id: &str,
     business_day: &str,
     max_events: usize,
+    include_current_tasks: bool,
+    pending_count: usize,
 ) -> Candidate {
     let start = s.archive_ai_cursor.unwrap_or(0).min(s.audit.len());
     let mut cutoff = start;
@@ -178,11 +213,6 @@ fn batch_limited(
         .iter()
         .filter(|t| related.contains(t.id.as_str()) && t.merged_into.is_empty())
         .collect::<Vec<_>>();
-    let selected = context_budget::rows(
-        tasks.iter().map(|t| context_budget::task(t)),
-        usize::MAX,
-        usize::MAX,
-    );
     // Only finalize tasks whose latest relevant event was processed. An early
     // update included in this batch is not enough: a final completion or new
     // archive note may sit beyond the evidence cutoff and still be pending.
@@ -207,10 +237,6 @@ fn batch_limited(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let referenced_messages = tasks
-        .iter()
-        .flat_map(|task| task.evidence.all())
-        .collect::<BTreeSet<_>>();
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for t in &s.tasks {
         if !t.archived {
@@ -225,10 +251,6 @@ fn batch_limited(
     };
     let mut payload = json!({
         "evidence":audits,
-        "archive_memory_sources": evidence_ids.iter().map(|i| {
-            let audit=&s.audit[*i];
-            json!({"evidence_id":format!("audit:{i}"),"task_id":audit.task_id,"kind":audit.kind})
-        }).collect::<Vec<_>>(),
         "archive_note_sources": evidence_ids.iter().filter_map(|i| {
             let audit = &s.audit[*i];
             (audit.kind == "manual_archive").then_some(audit.after["archive_note"].as_str()).flatten()
@@ -236,32 +258,35 @@ fn batch_limited(
                 .map(|note| json!({"evidence_id":format!("audit:{i}"),"task_id":audit.task_id,"note":note.chars().take(2000).collect::<String>()}))
         }).collect::<Vec<_>>(),
         "learning_evidence_ids":learning_ids.iter().map(|i|format!("audit:{i}")).collect::<Vec<_>>(),
-        "report_tasks":selected["items"],
-        "current_tasks":context_budget::rows(s.tasks.iter().filter(|t|!t.archived&&t.merged_into.is_empty()&&!related.contains(t.id.as_str())).map(context_budget::task),usize::MAX,usize::MAX)["items"],
-        "coverage":{"status_counts":counts,"remaining_events":remaining,"omitted_tasks":selected["omitted"]},
+        "coverage":{"status_counts":counts,"remaining_events":remaining,"omitted_tasks":0},
         "tag_catalog":crate::tags::groups(s),
         "_trigger":trigger,
         "_archive_attempt_id":attempt_id,
         "_data_until":s.last_scan,
     });
+    payload["report_tasks"] = Value::Array(tasks.iter().map(|t| context_budget::task(t)).collect());
+    payload["current_tasks"] = Value::Array(if include_current_tasks {
+        s.tasks
+            .iter()
+            .filter(|t| !t.archived && t.merged_into.is_empty() && !related.contains(t.id.as_str()))
+            .map(context_budget::task)
+            .collect()
+    } else {
+        Vec::new()
+    });
     if !s.config.report_prompt.trim().is_empty() {
         payload["report_policy"] = json!(s.config.report_prompt);
     }
-    let pending_count = crate::context_budget::pending(s).len();
-    let remaining_events = s.audit.iter().skip(cutoff).filter(|a| evidence(a)).count();
+    let remaining_events = remaining;
     crate::analysis_context::attach_memory_text(
         &mut payload,
         &s.analysis_memory.archived_text(),
         &s.analysis_memory.temporary,
     );
+    payload["_local_context"]["archived_memory"]["revision"] =
+        json!(s.analysis_memory.archived_version);
     payload["_local_context"]["memory"]["writable"] = json!(false);
     payload["memory"]["writable"] = json!(false);
-    let records = crate::snapshots::records_from_state(s, at);
-    let _ = crate::analysis_context::attach_records(
-        &mut payload,
-        records,
-        s.config.retrieval_budget_chars,
-    );
     // Freeze the exact candidate view: later scans/manual edits must not change
     // what the model sees while this archive is being generated.
     payload["_context_frozen"] = json!(true);
@@ -290,156 +315,55 @@ fn batch_limited(
         payload,
         cutoff,
         evidence_ids,
-        learning_ids,
         report,
         tasks_to_archive,
-        referenced_messages,
         pending_count,
         remaining_events,
     }
 }
 
-fn valid_summary(summary: &Value) -> bool {
-    summary["summary"].is_string()
-        && ["completed", "attention", "next_steps"].iter().all(|k| {
-            summary[k]
-                .as_array()
-                .is_some_and(|a| a.len() <= 5 && a.iter().all(Value::is_string))
-        })
-}
-
-fn archived_entries_text(entries: &[MemoryEntry]) -> String {
-    entries
-        .iter()
-        .filter(|entry| !entry.text.trim().is_empty())
-        .map(|entry| format!("- {}：{}", entry.key, entry.text.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn apply_memory_changes(
+fn apply_memory_update(
     s: &mut State,
-    changes: &[Value],
-    allowed: &BTreeSet<String>,
-    memory_sources: &BTreeSet<String>,
+    candidate: &Candidate,
+    result: &Value,
     at: i64,
 ) -> Result<usize, String> {
-    if changes.len() > 16 {
-        return Err("归档记忆变更超过16条，本次未保存".into());
+    if let Some(error) = result["_archived_memory_error"].as_str() {
+        return Err(format!("归档记忆未保存：{error}"));
     }
-    // Validate and apply against local copies. A failure at any point leaves the
-    // live archived memory and audit log untouched.
-    let mut entries = s.analysis_memory.archived_entries.clone();
-    let mut audits = Vec::new();
-    let mut applied = 0;
-    let base_version = s.analysis_memory.archived_version + 1;
-    for change in changes {
-        let action = change["action"].as_str().unwrap_or("");
-        let scope = change["scope"].as_str().unwrap_or("lasting");
-        let key = change["key"].as_str().unwrap_or("").trim();
-        if key.is_empty()
-            || key.chars().count() > 80
-            || !["add", "update", "revoke"].contains(&action)
-        {
-            return Err("归档记忆变更格式无效".into());
-        }
-        if !["lasting", "once"].contains(&scope) {
-            return Err("归档记忆范围无效".into());
-        }
-        let source = change["source"]
+    let Some(update) = result.get("_archived_memory_update") else {
+        if result["archived_memory"]
             .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .or_else(|| change["source"].as_str().map(|v| vec![v.to_owned()]))
-            .unwrap_or_default();
-        if source.is_empty()
-            || source.len() > 8
-            || source
-                .iter()
-                .any(|id| id.is_empty() || id.chars().count() > 256 || !allowed.contains(id))
+            .is_some_and(|rows| !rows.is_empty())
         {
-            return Err("归档记忆缺少有效来源".into());
+            return Err("归档记忆缺少完整读取校验，本批未提交".into());
         }
-        if !source.iter().any(|id| memory_sources.contains(id)) {
-            return Err("归档记忆必须引用本批操作记录或归档备注".into());
-        }
-        if scope == "once" {
-            // A one-off exception stays with the task/note and is only recorded.
-            audits.push(Audit {
-                time: at,
-                kind: "archive_memory_once".into(),
-                task_id: change["task_id"].as_str().unwrap_or("").into(),
-                detail: format!("一次性归档经验：{key}"),
-                change_summary: String::new(),
-                before: Value::Null,
-                after: json!({"key":key,"text":change["text"],"source":source}),
-            });
-            applied += 1;
-            continue;
-        }
-        let text = change["text"].as_str().unwrap_or("").trim().to_string();
-        if action != "revoke" && text.is_empty() {
-            return Err("归档记忆内容为空".into());
-        }
-        if text.chars().count() > crate::analysis_context::ARCHIVED_MEMORY_LIMIT {
-            return Err("归档记忆超过长度上限".into());
-        }
-        let before = json!(entries);
-        let existing = entries.iter().position(|entry| entry.key == key);
-        match (action, existing) {
-            ("revoke", Some(pos)) => {
-                entries.remove(pos);
-                applied += 1;
-            }
-            ("revoke", None) => {}
-            ("add" | "update", Some(pos)) => {
-                // Latest explicit correction in the same scope wins.
-                entries[pos].text = text;
-                entries[pos].source = source;
-                entries[pos].updated = at;
-                entries[pos].version = base_version;
-                applied += 1;
-            }
-            ("add" | "update", None) => {
-                entries.push(MemoryEntry {
-                    id: id(),
-                    key: key.into(),
-                    text,
-                    source,
-                    version: base_version,
-                    created: at,
-                    updated: at,
-                });
-                applied += 1;
-            }
-            _ => return Err("归档记忆变更动作无效".into()),
-        }
-        audits.push(Audit {
-            time: at,
-            kind: "archive_memory".into(),
-            task_id: change["task_id"].as_str().unwrap_or("").into(),
-            detail: format!("归档维护长期记忆：{key}"),
-            change_summary: String::new(),
-            before,
-            after: json!(entries),
-        });
-    }
-    if archived_entries_text(&entries).chars().count()
-        > crate::analysis_context::ARCHIVED_MEMORY_LIMIT
+        return Ok(0);
+    };
+    let current = s.analysis_memory.archived_text();
+    if s.analysis_memory.archived_version != candidate.memory_revision
+        || update["expected"].as_u64() != Some(candidate.memory_revision)
+        || update["before"].as_str() != Some(current.as_str())
     {
-        return Err("归档记忆超过长度上限，保留原记忆".into());
+        return Err("归档记忆已被人工编辑，本批未提交，请核对后重新归档".into());
     }
-    if applied > 0 {
-        s.analysis_memory.archived_entries = entries;
-        s.analysis_memory.archived_version += 1;
-        s.audit.extend(audits);
-        s.revision += 1;
+    let text = update["text"].as_str().ok_or("归档记忆正文无效")?;
+    if text.chars().count() > crate::analysis_context::ARCHIVED_MEMORY_LIMIT {
+        return Err("归档记忆超过4000字符，保留原记忆".into());
     }
-    Ok(applied)
+    if text == current {
+        return Ok(0);
+    }
+    s.analysis_memory.replace_archived(text.into(), at);
+    App::audit(
+        s,
+        "archive_memory",
+        "",
+        "归档更新记忆正文",
+        Value::Null,
+        json!({"revision":s.analysis_memory.archived_version,"chars":text.chars().count()}),
+    );
+    Ok(1)
 }
 
 fn finalize_tasks(s: &mut State, candidate: &Candidate, at: i64) -> usize {
@@ -469,6 +393,11 @@ fn finalize_tasks(s: &mut State, candidate: &Candidate, at: i64) -> usize {
 }
 
 fn record_batch(s: &mut State, candidate: &Candidate, archived: usize, at: i64) {
+    let finished = if candidate.remaining_events == 0 {
+        s.next_report_finished(at)
+    } else {
+        0
+    };
     if let Some(attempt) = s
         .archive_attempts
         .iter_mut()
@@ -484,42 +413,15 @@ fn record_batch(s: &mut State, candidate: &Candidate, archived: usize, at: i64) 
             "running"
         }
         .into();
-        attempt.finished = if candidate.remaining_events == 0 {
-            at
-        } else {
-            0
-        };
+        attempt.finished = finished;
         attempt.error.clear();
     }
 }
 
 fn apply(s: &mut State, candidate: &Candidate, result: Value, at: i64) -> Result<Value, String> {
-    if s.analysis_memory.archived_version != candidate.memory_revision
-        && result["memory_changes"]
-            .as_array()
-            .is_some_and(|v| !v.is_empty())
-    {
-        return Err("归档记忆已被人工编辑，本批未提交，请核对后重新归档".into());
-    }
     let summary = &result["report"];
-    if !valid_summary(summary) {
-        return Err("归档汇总格式不正确".into());
-    }
-    let memory_changes = result["memory_changes"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    let allowed = candidate.evidence_refs();
-    let memory_sources = candidate
-        .evidence_ids
-        .iter()
-        .map(|index| format!("audit:{index}"))
-        .collect::<BTreeSet<_>>();
-
-    // The only AI-maintained policy data admitted by archive is archived memory.
-    // Legacy/unsolicited policy outputs have no mutation path, even if old
-    // automatic-adoption flags remain set in an upgraded configuration.
-    let memory_applied = apply_memory_changes(s, &memory_changes, &allowed, &memory_sources, at)?;
+    // A validated full-document replacement is the only policy write allowed.
+    let memory_applied = apply_memory_update(s, candidate, &result, at)?;
 
     // Completed tasks become archived only in the successful commit. Tasks
     // edited while the model was running are left for a later archive.
@@ -594,34 +496,19 @@ fn apply(s: &mut State, candidate: &Candidate, result: Value, at: i64) -> Result
         reason: "归档成功：保存私有归档记忆版本，保留提示词、规则与标签快照".into(),
         prompt: stored_prompt(s, &prompt_version, prompts::content(&s.config, "classify")),
         prompt_version,
-        active_rules: s
-            .suggestions
-            .iter()
-            .filter(|suggestion| suggestion.active && suggestion.archived_at == 0)
-            .cloned()
-            .collect(),
-        rule_version: s.rule_version,
-        tag_groups: crate::tags::groups(s),
-        tag_version: s
-            .tag_state
-            .versions
-            .last()
-            .map(|version| version.id.clone())
-            .unwrap_or_default(),
-        archived_entries: vec![],
-        archived_version: s.analysis_memory.archived_version,
+        ..group_snapshot(s)
     };
-    s.archive_versions.push(group.clone());
     report["archive_group_id"] = json!(group.id);
+    s.archive_versions.push(group);
     s.reports.insert(0, report.clone());
-    s.reports.truncate(60);
+    s.truncate_reports();
     App::audit(
         s,
         "archive_commit",
         "",
         "归档结果、成功状态、游标、事项归档标记和归档记忆同次保存",
         json!({"attempt":candidate.attempt_id,"cutoff":candidate.cutoff}),
-        json!({"report":report["id"],"group":group.id,"archived_tasks":archived}),
+        json!({"report":report["id"],"group":report["archive_group_id"],"archived_tasks":archived}),
     );
     Ok(report)
 }
@@ -660,27 +547,26 @@ fn fallback_report(s: &State, candidate: &Candidate, at: i64) -> Value {
 
 impl App {
     fn upsert_attempt(&self, attempt: ArchiveAttempt) -> Result<(), String> {
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        if let Some(existing) = s
-            .archive_attempts
-            .iter_mut()
-            .find(|existing| existing.id == attempt.id)
-        {
-            *existing = attempt;
-        } else {
-            s.archive_attempts.push(attempt);
-        }
-        self.save(&s)?;
-        *lock = s;
-        Ok(())
+        self.commit_state(|s| {
+            if let Some(existing) = s
+                .archive_attempts
+                .iter_mut()
+                .find(|existing| existing.id == attempt.id)
+            {
+                *existing = attempt;
+            } else {
+                s.archive_attempts.push(attempt);
+            }
+            Ok(())
+        })
     }
     fn fail_attempt(&self, id: &str, error: &str) -> Result<(), String> {
         let mut lock = self.state.lock().unwrap();
         let mut s = lock.clone();
+        let finished = s.next_report_finished(now());
         if let Some(attempt) = s.archive_attempts.iter_mut().find(|a| a.id == id) {
             attempt.status = "failed".into();
-            attempt.finished = now();
+            attempt.finished = finished;
             attempt.error = error.into();
         }
         let saved = self.save(&s);
@@ -698,9 +584,10 @@ impl App {
     }
     fn mark_attempt_failed_in_memory(&self, id: &str, error: &str) {
         let mut lock = self.state.lock().unwrap();
+        let finished = lock.next_report_finished(now());
         if let Some(attempt) = lock.archive_attempts.iter_mut().find(|a| a.id == id) {
             attempt.status = "failed".into();
-            attempt.finished = now();
+            attempt.finished = finished;
             attempt.error = error.into();
         }
         drop(lock);
@@ -821,44 +708,70 @@ impl App {
         mode: AiMode,
         at: i64,
         attempt: &ArchiveAttempt,
-    ) -> Result<(Candidate, engine::PreparedAiRequest), String> {
-        let prepare =
-            |candidate: &Candidate| self.prepare_archive_request(&candidate.payload, mode);
-        let mut all = batch(frozen, mode, at, &attempt.id, &attempt.business_day);
+        snapshots: &mut crate::snapshots::Cache,
+    ) -> Result<(Candidate, Option<engine::PreparedAiRequest>), String> {
+        #[cfg(test)]
+        let _gate = self.prepare_gate.lock().unwrap();
+        let records = snapshots.records(frozen, at);
+        let pending_count = crate::context_budget::pending_refs(frozen, false).count();
+        let mut all = batch_limited(
+            frozen,
+            mode,
+            at,
+            &attempt.id,
+            &attempt.business_day,
+            usize::MAX,
+            true,
+            pending_count,
+        );
         all.trigger = attempt.trigger.clone();
         all.payload["_trigger"] = json!(attempt.trigger);
-        let request = prepare(&all)?;
+        // Automatic archives with no new evidence reuse the report. An explicit
+        // manual archive can also consolidate existing memory on its own.
+        if !all.has_ai_input() {
+            return Ok((all, None));
+        }
+        let mut context = self.capture_archive_context(frozen, records);
+        let mut prepare = |candidate: &Candidate| {
+            self.prepare_ai_candidate_with("archive", &candidate.payload, mode, &mut context)
+        };
+        let mut request = prepare(&all)?;
         if request.prepared.total <= request.config.max_input_chars {
-            return Ok((all, request));
+            request.materialize_records();
+            return Ok((all, Some(request)));
         }
         // Prefer new evidence over unrelated background summaries. Full records
         // remain in the frozen read-only tool snapshot.
         let omitted = all.payload["current_tasks"].as_array().map_or(0, Vec::len);
         all.payload["current_tasks"] = json!([]);
         all.payload["coverage"]["omitted_current_tasks"] = json!(omitted);
-        let request = prepare(&all)?;
+        let mut request = prepare(&all)?;
         if request.prepared.total <= request.config.max_input_chars {
-            return Ok((all, request));
+            request.materialize_records();
+            return Ok((all, Some(request)));
         }
-        let (mut low, mut high) = (1, all.evidence_ids.len());
-        let mut accepted = None;
-        while low <= high {
-            let count = low + (high - low) / 2;
-            let mut candidate =
-                batch_limited(frozen, mode, at, &attempt.id, &attempt.business_day, count);
+        let accepted = context_budget::fit_prefix(all.evidence_ids.len(), |count| {
+            let mut candidate = batch_limited(
+                frozen,
+                mode,
+                at,
+                &attempt.id,
+                &attempt.business_day,
+                count,
+                false,
+                pending_count,
+            );
             candidate.trigger = attempt.trigger.clone();
             candidate.payload["_trigger"] = json!(attempt.trigger);
             candidate.payload["current_tasks"] = json!([]);
             candidate.payload["coverage"]["omitted_current_tasks"] = json!(omitted);
             let request = prepare(&candidate)?;
-            if request.prepared.total <= request.config.max_input_chars {
-                accepted = Some((candidate, request));
-                low = count + 1;
-            } else {
-                high = count - 1;
-            }
-        }
-        accepted.ok_or_else(|| "归档的单条材料及必需上下文已超过单次输入上限，未调用 AI；请精简配置或提高输入上限后手动归档".into())
+            Ok((request.prepared.total <= request.config.max_input_chars)
+                .then_some((candidate, request)))
+        })?;
+        let (_, (candidate, mut request)) = accepted.ok_or_else(|| "归档的单条材料及必需上下文已超过单次输入上限，未调用 AI；请精简配置或提高输入上限后手动归档".to_string())?;
+        request.materialize_records();
+        Ok((candidate, Some(request)))
     }
 
     fn run_archive(
@@ -935,33 +848,10 @@ impl App {
         let started = std::time::Instant::now();
         let mut frozen = self.state.lock().unwrap().clone();
         let deadline = std::time::Duration::from_secs(frozen.config.ai_timeout_seconds);
-        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let timed_out = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        struct DeadlineGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for DeadlineGuard {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let _deadline_guard = DeadlineGuard(done.clone());
-        let (worker_done, worker_timeout, worker_cancel) =
-            (done.clone(), timed_out.clone(), call.cancel.clone());
-        std::thread::spawn(move || {
-            while !worker_done.load(Ordering::SeqCst) {
-                if started.elapsed() >= deadline {
-                    worker_timeout.store(true, Ordering::SeqCst);
-                    worker_cancel.store(true, Ordering::SeqCst);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-        });
+        let mut deadline_guard =
+            crate::ai_control::DeadlineGuard::new(started + deadline, call.cancel.clone());
         let run = (|| -> Result<Value, String> {
-            {
-                let _files = self.snapshot_files.lock().unwrap();
-                crate::snapshots::ensure(&self.root, &frozen, at)
-                    .map_err(|e| format!("分析快照不完整：{e}"))?;
-            }
+            let mut snapshots = crate::snapshots::Cache::default();
             loop {
                 crate::process::check_running()?;
                 if call.cancel.load(Ordering::SeqCst) {
@@ -970,8 +860,8 @@ impl App {
                 if started.elapsed() >= deadline {
                     return Err("归档总时限已到，后续批次未提交；请手动继续归档".into());
                 }
-                let (candidate, mut request) =
-                    self.fitted_archive_batch(&frozen, mode, at, &attempt)?;
+                let (candidate, request) =
+                    self.fitted_archive_batch(&frozen, mode, at, &attempt, &mut snapshots)?;
                 // Persist pending coverage before dispatch so a failure or
                 // restart truthfully reports the uncommitted remainder.
                 {
@@ -987,7 +877,7 @@ impl App {
                     self.save(&next)?;
                     *lock = next;
                 }
-                if !candidate.has_ai_input() {
+                let Some(mut request) = request else {
                     if candidate.remaining_events > 0 {
                         return Err("归档材料无法装入单批，游标和事项保留".into());
                     }
@@ -995,8 +885,11 @@ impl App {
                     if call.cancel.load(Ordering::SeqCst) {
                         return Err(crate::ai_control::CANCELLED.into());
                     }
+                    if started.elapsed() >= deadline {
+                        return Err("归档总时限已到，本批未提交；请手动继续归档".into());
+                    }
                     return self.commit_without_ai(candidate, now());
-                }
+                };
                 call.next_request()?;
                 request.config.ai_timeout_seconds =
                     deadline.saturating_sub(started.elapsed()).as_secs().max(1);
@@ -1007,11 +900,8 @@ impl App {
                 if started.elapsed() >= deadline {
                     return Err("归档总时限已到，本批未提交；请手动继续归档".into());
                 }
-                if result["_context_usage"]["budget_exhausted"] == true {
-                    return Err(
-                        "补查预算已用尽，归档覆盖不完整，本批未提交；请调整预算后手动归档".into(),
-                    );
-                }
+                // Retrieval exhaustion does not revoke evidence already delivered.
+                // The candidate cutoff and memory receipt still bound the commit.
                 let cutoff = candidate.cutoff;
                 let remaining = candidate.remaining_events;
                 let report = {
@@ -1031,6 +921,8 @@ impl App {
                 // Preserve the original task/audit/message boundary. Only our
                 // committed archive marks and memory carry into the next batch.
                 let live = self.state.lock().unwrap();
+                frozen.analysis_memory.archived = live.analysis_memory.archived.clone();
+                frozen.analysis_memory.archived_updated = live.analysis_memory.archived_updated;
                 frozen.analysis_memory.archived_entries =
                     live.analysis_memory.archived_entries.clone();
                 frozen.analysis_memory.archived_version = live.analysis_memory.archived_version;
@@ -1041,8 +933,8 @@ impl App {
                 }
             }
         })();
-        done.store(true, Ordering::SeqCst);
-        let run = if run.is_err() && timed_out.load(Ordering::SeqCst) {
+        let timed_out = deadline_guard.finish();
+        let run = if run.is_err() && timed_out {
             Err("归档总时限已到，本批未提交；已提交批次保留，请手动继续归档".into())
         } else {
             run
@@ -1052,18 +944,25 @@ impl App {
         }
         run
     }
-    pub(crate) fn write_report_file(&self, report: &Value) -> Result<(), String> {
+    /// Derived files are best effort, after the business transaction commits.
+    pub(crate) fn write_report_file(&self, report: &Value, error_event: &str) {
         let dir = crate::storage::data_dir(&self.root).join("reports");
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        fs::write(
-            dir.join(format!(
-                "{}-{}.json",
-                report["date"].as_str().unwrap_or(""),
-                report["id"].as_str().unwrap_or("")
-            )),
-            serde_json::to_vec_pretty(report).unwrap(),
-        )
-        .map_err(|e| e.to_string())
+        let result = fs::create_dir_all(&dir).and_then(|_| {
+            fs::write(
+                dir.join(format!(
+                    "{}-{}.json",
+                    report["date"].as_str().unwrap_or(""),
+                    report["id"].as_str().unwrap_or("")
+                )),
+                serde_json::to_vec_pretty(report).unwrap(),
+            )
+        });
+        if let Err(error) = result {
+            self.log(
+                error_event,
+                json!({"error":error.to_string(),"report":report["id"]}),
+            );
+        }
     }
     fn commit_without_ai(&self, candidate: Candidate, at: i64) -> Result<Value, String> {
         let mut lock = self.state.lock().unwrap();
@@ -1084,12 +983,11 @@ impl App {
             .find(|a| a.id == candidate.attempt_id)
         {
             attempt.status = "succeeded".into();
-            attempt.finished = at;
             attempt.report_id = report["id"].as_str().unwrap_or("").into();
             attempt.reused = report["summary_status"] == "reused";
         }
         s.reports.insert(0, report.clone());
-        s.reports.truncate(60);
+        s.truncate_reports();
         App::audit(
             &mut s,
             "archive_reuse",
@@ -1112,12 +1010,7 @@ impl App {
             .task_changes(&lock.tasks, &s.tasks);
         *lock = s;
         drop(lock);
-        if let Err(error) = self.write_report_file(&report) {
-            self.log(
-                "archive_report_file_failed",
-                json!({"error":error,"report":report["id"]}),
-            );
-        }
+        self.write_report_file(&report, "archive_report_file_failed");
         self.log(
             "archive_result",
             json!({"kind":"archive","trigger":candidate.trigger,"processed":0,"reused":true,"report":report["id"]}),
@@ -1148,12 +1041,7 @@ impl App {
         }
         *lock = s;
         drop(lock);
-        if let Err(error) = self.write_report_file(&output) {
-            self.log(
-                "archive_report_file_failed",
-                json!({"error":error,"report":output["id"]}),
-            );
-        }
+        self.write_report_file(&output, "archive_report_file_failed");
         self.log(
             "archive_result",
             json!({"kind":"archive","trigger":candidate.trigger,"processed":candidate.evidence_ids.len(),"remaining":output["remaining_events"],"report":output["id"],"attempt_id":candidate.attempt_id}),
@@ -1216,7 +1104,7 @@ impl App {
             "tag_version":group.tag_version,
             "memory":group.archived_entries,
             "archived_version":group.archived_version,
-            "current":s.archive_versions.last().map(|group|group.id.clone()),
+            "current":s.archive_versions.last().map(|group| &group.id),
         }))
     }
     pub fn archive_history(&self) -> Value {
@@ -1236,7 +1124,7 @@ impl App {
                 "tag_version":group.tag_version,
                 "archived_version":group.archived_version,
             })).collect::<Vec<_>>(),
-            "current":s.archive_versions.last().map(|g|g.id.clone()),
+            "current":s.archive_versions.last().map(|g| &g.id),
             "memory":s.analysis_memory.archived_text(),
         })
     }
@@ -1244,8 +1132,7 @@ impl App {
     /// message progress, analyzed fingerprints and later manual task edits are
     /// deliberately outside this operation.
     pub fn archive_rollback(&self, version_id: &str, expected: &str) -> Result<Value, String> {
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
+        self.commit_state(|s| {
         let current = s.archive_versions.last().map(|g| g.id.clone());
         if current.as_deref() != Some(expected) {
             return Err("归档版本已变化，请刷新后重试".into());
@@ -1261,7 +1148,7 @@ impl App {
             .ok_or("归档版本不存在")?;
         // Rollback is only safe if no component was manually changed after the
         // latest group. Group ids alone do not change on manual edits.
-        let current_prompt_version = prompts::current(&s, "classify")
+        let current_prompt_version = prompts::current(s, "classify")
             .map(|version| version.id.clone())
             .unwrap_or_default();
         let current_tag_version = s
@@ -1282,7 +1169,7 @@ impl App {
             .map(|rule| (rule.id.clone(), rule.title.clone(), rule.rule.clone()))
             .collect::<Vec<_>>();
         let conflict = current_prompt_version != latest.prompt_version
-            || prompts::content(&s.config, "classify") != archive_prompt(&s, &latest)
+            || prompts::content(&s.config, "classify") != archive_prompt(s, &latest)
             || s.rule_version != latest.rule_version
             || current_rules != latest_rules
             || current_tag_version != latest.tag_version;
@@ -1290,10 +1177,10 @@ impl App {
             return Err("最新归档之后提示词、规则或标签已有手动修改，整组回滚会覆盖这些修改，已取消；请先确认当前版本或生成新版本".into());
         }
 
-        let restored_prompt = archive_prompt(&s, &group).to_string();
+        let restored_prompt = archive_prompt(s, &group).to_string();
         prompts::set_content(&mut s.config, "classify", restored_prompt.clone())?;
         let prompt_version = prompts::record(
-            &mut s,
+            s,
             "classify",
             restored_prompt.clone(),
             "archive_rollback",
@@ -1332,7 +1219,7 @@ impl App {
         s.tag_state.versions.push(crate::tags::Version {
             priority_kind: String::new(),
             assignments: vec![],
-            id: model_id(),
+            id: id(),
             created: now(),
             action: "archive_rollback".into(),
             reason: format!("随归档版本回滚至 {}", group.id),
@@ -1350,49 +1237,32 @@ impl App {
             attempt_id: String::new(),
             report_id: String::new(),
             reason: format!("整组回滚至 {}，以新版本记录，不倒退消息/事项进度", group.id),
-            prompt: stored_prompt(&s, &prompt_version, restored_prompt),
+            prompt: stored_prompt(s, &prompt_version, restored_prompt),
             prompt_version,
-            active_rules: s
-                .suggestions
-                .iter()
-                .filter(|rule| rule.active && rule.archived_at == 0)
-                .cloned()
-                .collect(),
-            rule_version: s.rule_version,
-            tag_groups: crate::tags::groups(&s),
-            tag_version: s
-                .tag_state
-                .versions
-                .last()
-                .map(|version| version.id.clone())
-                .unwrap_or_default(),
-            archived_entries: vec![],
-            archived_version: s.analysis_memory.archived_version,
+            ..group_snapshot(s)
         };
-        s.archive_versions.push(next.clone());
+        let response = json!({"group":next.id,"prompt_version":next.prompt_version});
+        s.archive_versions.push(next);
         App::audit(
-            &mut s,
+            s,
             "archive_rollback",
             "",
             "归档整组回滚：仅提示词、规则、标签和私有归档记忆；保留后续建议记录",
             json!({"restored_from":group.id}),
-            json!({"group":next.id}),
+            json!({"group":response["group"]}),
         );
-        self.save(&s)?;
-        *lock = s;
-        Ok(json!({"group":next.id,"prompt_version":next.prompt_version}))
+        Ok(response)
+        })
     }
 }
-fn model_id() -> String {
-    id()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn root() -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("shishi-archive-{}", id()))
+    fn archive_app() -> (crate::test_support::TestRoot, App) {
+        let (root, app) = crate::test_support::scoped_app("shishi-archive");
+        app.state.lock().unwrap().config.model_profiles = None;
+        (root, app)
     }
     fn result(report_summary: &str) -> Value {
         json!({
@@ -1401,9 +1271,34 @@ mod tests {
             "suggestions":[],
             "handling_review":[],
             "advice_decisions":[],
-            "memory_changes":[],
+            "archived_memory":[],
             "tag_changes":[]
         })
+    }
+    fn manual_candidate(app: &App) -> Candidate {
+        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
+        batch(
+            &app.state.lock().unwrap(),
+            AiMode::Manual,
+            now(),
+            &attempt.id,
+            &attempt.business_day,
+        )
+    }
+    fn with_memory(candidate: &Candidate, value: &mut Value, text: &str) {
+        let mut payload = candidate.payload.clone();
+        let prepared = crate::ai::prepare(&Config::default(), "archive", &payload);
+        crate::analysis_context::acknowledge_inline_memory(
+            &mut payload,
+            "archive",
+            &prepared.prompt,
+        );
+        value["archived_memory"] = json!([text]);
+        crate::ai_backend::api::attach_result(
+            value,
+            &payload["_local_context"],
+            &Default::default(),
+        );
     }
     fn seed(app: &App, note: &str) -> String {
         let task = app
@@ -1462,16 +1357,17 @@ mod tests {
 
     #[test]
     fn archive_rejects_stale_memory_and_legacy_rollback_keeps_current_memory() {
-        let app = App::load(root()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-archive");
         seed(&app, "合成归档依据");
         let candidate = {
             let state = app.state.lock().unwrap();
             batch(&state, AiMode::Manual, now(), "attempt", "day")
         };
-        app.memory_save(&json!({"kind":"archived","expected":0,"entries":[{"key":"人工主题","text":"人工保存的最新内容"}]})).unwrap();
+        app.memory_save(&json!({"kind":"archived","expected":0,"text":"人工保存的最新内容"}))
+            .unwrap();
         let before = app.memory_read();
         let mut output = result("合成结论");
-        output["memory_changes"] = json!([{"action":"add","key":"旧主题","text":"旧结果"}]);
+        with_memory(&candidate, &mut output, "旧结果");
         assert!(app
             .commit(candidate, output, now())
             .unwrap_err()
@@ -1480,9 +1376,7 @@ mod tests {
     }
     #[test]
     fn archive_uses_full_rendered_budget_instead_of_fixed_event_or_task_caps() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, app) = archive_app();
         batch_fixture(&app, 60_000, 40);
         let frozen = app.state.lock().unwrap().clone();
         let attempt = ArchiveAttempt {
@@ -1491,8 +1385,15 @@ mod tests {
             ..Default::default()
         };
         let (candidate, request) = app
-            .fitted_archive_batch(&frozen, AiMode::Manual, now(), &attempt)
+            .fitted_archive_batch(
+                &frozen,
+                AiMode::Manual,
+                now(),
+                &attempt,
+                &mut crate::snapshots::Cache::default(),
+            )
             .unwrap();
+        let request = request.expect("new archive evidence requires an AI request");
         assert_eq!(candidate.evidence_ids.len(), 40);
         assert_eq!(candidate.remaining_events, 0);
         assert_eq!(
@@ -1508,16 +1409,12 @@ mod tests {
         );
         assert!(candidate.payload["evidence"].to_string().chars().count() > 9000);
         assert!(request.prepared.total <= 60_000);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn manual_and_claimed_automatic_archive_finish_all_batches_in_one_attempt() {
         for automatic in [false, true] {
-            let root = root();
-            let app = App::load(root.clone()).unwrap();
-            app.state.lock().unwrap().config.model_profiles = None;
+            let (_root, app) = archive_app();
             app.test_force_working();
             batch_fixture(&app, 10_000, 40);
             let existing = if automatic {
@@ -1589,17 +1486,173 @@ mod tests {
             drop(s);
             assert!(!app.ai_busy.load(Ordering::SeqCst));
             assert!(!app.archive_busy.load(Ordering::SeqCst));
-            drop(app);
-            let _ = fs::remove_dir_all(root);
         }
+    }
+
+    fn exhausted_result(request: &engine::PreparedAiRequest, replacement: Value) -> Value {
+        let snapshot = &request.payload["_local_context"];
+        let mut meter = crate::analysis_context::Meter {
+            chars: request.config.retrieval_budget_chars,
+            ..Default::default()
+        };
+        let notice: Value = serde_json::from_str(&crate::analysis_context::query(
+            snapshot,
+            &mut meter,
+            &json!({"kind":"task"}),
+        ))
+        .unwrap();
+        assert_eq!(notice["budget_exhausted"], true);
+        let mut value = result("依据已交付材料完成合成归档");
+        value["archived_memory"] = replacement;
+        crate::ai_backend::api::attach_result(&mut value, snapshot, &meter);
+        value
+    }
+
+    #[test]
+    fn exhausted_retrieval_accepts_delivered_evidence_and_complete_inline_memory() {
+        let (root, app) = archive_app();
+        batch_fixture(&app, 60_000, 3);
+        // This is a persistence check, not an expired-audit pruning fixture.
+        // Keep evidence inside retention so reopening preserves its cursor.
+        for event in app.state.lock().unwrap().audit.iter_mut() {
+            event.time = now() - 1_000;
+        }
+        app.memory_save(&json!({"kind":"archived","expected":0,"text":"合成原记忆"}))
+            .unwrap();
+        let boundary = app.state.lock().unwrap().audit.len();
+        let mut calls = 0;
+        let report = app
+            .run_archive_with("manual_archive", AiMode::Manual, None, &mut |request, _| {
+                calls += 1;
+                assert_eq!(request.payload["evidence"].as_array().unwrap().len(), 3);
+                assert!(request.prepared.prompt.contains("合成原记忆"));
+                let value = exhausted_result(request, json!(["整理后的合成记忆"]));
+                assert!(value.get("_archived_memory_error").is_none());
+                Ok(value)
+            })
+            .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(report["archive_complete"], true);
+        let state = app.state.lock().unwrap();
+        assert_eq!(state.archive_ai_cursor, Some(boundary));
+        assert!(state.tasks.iter().all(|task| task.archived));
+        assert_eq!(state.analysis_memory.archived_text(), "整理后的合成记忆");
+        assert_eq!(state.analysis_memory.temporary, "合成临时记忆保留");
+        assert_eq!(state.archive_attempts.last().unwrap().status, "succeeded");
+        drop(state);
+        drop(app);
+        let restored = App::load(root.clone()).unwrap();
+        assert_eq!(
+            restored.state.lock().unwrap().archive_ai_cursor,
+            Some(boundary)
+        );
+        assert_eq!(
+            restored.memory_read()["archived"]["text"],
+            "整理后的合成记忆"
+        );
+        drop(restored);
+    }
+
+    #[test]
+    fn exhausted_retrieval_never_authorizes_a_partial_memory_replacement() {
+        let (_root, app) = archive_app();
+        batch_fixture(&app, 60_000, 3);
+        let original = "合成".repeat(2_000);
+        app.memory_save(&json!({"kind":"archived","expected":0,"text":original}))
+            .unwrap();
+        let before = app.state.lock().unwrap().clone();
+        let error = app
+            .run_archive_with("manual_archive", AiMode::Manual, None, &mut |request, _| {
+                // Fault injection: this adapter did not deliver the inline body.
+                // Reading only its first page must not authorize replacing it.
+                let mut payload = request.payload.clone();
+                crate::analysis_context::acknowledge_inline_memory(
+                    &mut payload,
+                    "archive",
+                    &request.prepared.prompt.replace(&original, "省略后的摘要"),
+                );
+                let snapshot = &mut payload["_local_context"];
+                snapshot["budget_chars"] = json!(crate::analysis_context::PAGE);
+                let mut meter = crate::analysis_context::Meter::default();
+                let page: Value = serde_json::from_str(&crate::analysis_context::query(
+                    snapshot,
+                    &mut meter,
+                    &json!({"ids":["archived-memory"]}),
+                ))
+                .unwrap();
+                let offset = page["records"][0]["next_offset"].as_u64().unwrap();
+                let notice: Value = serde_json::from_str(&crate::analysis_context::query(
+                    snapshot,
+                    &mut meter,
+                    &json!({"ids":["archived-memory"],"offset":offset}),
+                ))
+                .unwrap();
+                assert_eq!(notice["budget_exhausted"], true);
+                assert!(!meter.complete.contains("archived-memory"));
+                let mut value = result("缺失原文的合成归档");
+                value["archived_memory"] = json!(["不得覆盖原文"]);
+                crate::ai_backend::api::attach_result(&mut value, snapshot, &meter);
+                Ok(value)
+            })
+            .unwrap_err();
+        assert!(error.contains("未完整读取原笔记"), "{error}");
+        let state = app.state.lock().unwrap();
+        assert_eq!(state.archive_ai_cursor, before.archive_ai_cursor);
+        assert_eq!(json!(state.tasks), json!(before.tasks));
+        assert_eq!(state.reports, before.reports);
+        assert_eq!(json!(state.analysis_memory), json!(before.analysis_memory));
+        assert_eq!(state.archive_attempts.last().unwrap().status, "failed");
+        drop(state);
+    }
+
+    #[test]
+    fn exhausted_retrieval_keeps_prior_batches_when_later_memory_is_stale() {
+        let (_root, app) = archive_app();
+        batch_fixture(&app, 10_000, 40);
+        let mut calls = 0;
+        let mut committed_cursor = 0;
+        let mut committed_tasks = Value::Null;
+        let error = app
+            .run_archive_with("manual_archive", AiMode::Manual, None, &mut |request, _| {
+                calls += 1;
+                let value = exhausted_result(request, json!(["本批合成记忆"]));
+                if calls == 2 {
+                    let state = app.state.lock().unwrap();
+                    committed_cursor = state.archive_ai_cursor.unwrap();
+                    committed_tasks = json!(state.tasks);
+                    assert!(committed_cursor > 0 && committed_cursor < 40);
+                    // The first commit must not archive tasks whose latest
+                    // evidence is still in this unprocessed tail.
+                    assert!(state.tasks.iter().any(|task| task.archived));
+                    assert!(state.tasks.iter().any(|task| !task.archived));
+                    let revision = state.analysis_memory.archived_version;
+                    drop(state);
+                    app.memory_save(&json!({
+                        "kind":"archived","expected":revision,"text":"人工最新记忆"
+                    }))?;
+                }
+                Ok(value)
+            })
+            .unwrap_err();
+        assert!(error.contains("人工编辑"), "{error}");
+        assert_eq!(calls, 2);
+        let state = app.state.lock().unwrap();
+        let attempt = state.archive_attempts.last().unwrap();
+        assert_eq!(attempt.status, "failed");
+        assert_eq!(attempt.batches, 1);
+        assert!(attempt.remaining > 0);
+        assert_eq!(state.archive_ai_cursor, Some(committed_cursor));
+        assert_eq!(json!(state.tasks), committed_tasks);
+        assert_eq!(state.reports.len(), 1);
+        assert_eq!(state.reports[0]["archive_complete"], false);
+        assert_eq!(state.analysis_memory.archived_text(), "人工最新记忆");
+        drop(state);
     }
 
     #[test]
     fn later_batch_failure_cancellation_and_total_timeout_preserve_prior_commit() {
         for stop in ["failure", "cancel", "timeout"] {
-            let root = root();
-            let app = App::load(root.clone()).unwrap();
-            app.state.lock().unwrap().config.model_profiles = None;
+            let (_root, app) = archive_app();
             batch_fixture(&app, 10_000, 40);
             if stop == "timeout" {
                 app.state.lock().unwrap().config.ai_timeout_seconds = 1;
@@ -1637,41 +1690,15 @@ mod tests {
             assert!(s.tasks.iter().any(|t| t.archived) && s.tasks.iter().any(|t| !t.archived));
             drop(s);
             assert!(app.archive_tick().unwrap()["skipped"].is_string());
-            drop(app);
-            let _ = fs::remove_dir_all(root);
         }
     }
 
     #[test]
-    fn invalid_result_and_save_failure_leave_every_business_effect_unchanged() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
-        let task = seed(&app, "明确说明只做一次");
-        let latest = app.state.lock().unwrap().archive_attempts.last().cloned();
-        assert!(latest.is_none());
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
+    fn save_failure_leaves_every_business_effect_unchanged() {
+        let (_root, app) = archive_app();
+        seed(&app, "明确说明只做一次");
+        let candidate = manual_candidate(&app);
         assert!(!candidate.evidence_ids.is_empty());
-        let before = json!(*app.state.lock().unwrap());
-        assert!(app.commit(candidate.clone(), json!({}), now()).is_err());
-        {
-            let s = app.state.lock().unwrap();
-            assert_eq!(json!(s.tasks), before["tasks"]);
-            assert_eq!(json!(s.archive_ai_cursor), before["archive_ai_cursor"]);
-            assert_eq!(json!(s.analysis_memory), before["analysis_memory"]);
-            assert_eq!(s.archive_attempts.last().unwrap().status, "failed");
-        }
-        assert_eq!(app.state.lock().unwrap().tasks[0].id, task);
         // A final save failure must not apply the candidate in memory.
         let before_save = json!(*app.state.lock().unwrap());
         crate::test_support::persistence_failure(&app.root, true).unwrap();
@@ -1693,26 +1720,12 @@ mod tests {
         assert!(attempt.error.contains("保存失败"));
         crate::test_support::persistence_failure(&app.root, false).unwrap();
         drop(after);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn successful_commit_sets_success_cursor_and_effects_in_one_save() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (root, app) = archive_app();
         seed(&app, "普通确认");
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
+        let candidate = manual_candidate(&app);
         let report = app
             .commit(candidate.clone(), result("处理完毕"), now())
             .unwrap();
@@ -1723,7 +1736,7 @@ mod tests {
         assert_eq!(
             s.archive_attempts
                 .iter()
-                .find(|a| a.id == attempt.id)
+                .find(|a| a.id == candidate.attempt_id)
                 .unwrap()
                 .status,
             "succeeded"
@@ -1736,14 +1749,10 @@ mod tests {
         assert!(!reloaded.state.lock().unwrap().archive_attempts[0].unfinished());
         assert_eq!(reloaded.state.lock().unwrap().archive_versions.len(), 1);
         drop(reloaded);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn restart_before_commit_fails_without_replay_and_success_survives() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (root, app) = archive_app();
         seed(&app, "重启前");
         let queued = app.queue_attempt("nightly_archive", now()).unwrap();
         assert_eq!(queued["queued"], true);
@@ -1761,17 +1770,7 @@ mod tests {
         drop(s);
         assert!(app.archive_tick().unwrap()["skipped"].is_string());
         // A committed success is not turned into a failure on the next restart.
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
+        let candidate = manual_candidate(&app);
         app.commit(candidate, result("成功"), now()).unwrap();
         drop(app);
         let app = App::load(root.clone()).unwrap();
@@ -1779,16 +1778,23 @@ mod tests {
         let s = app.state.lock().unwrap();
         assert_eq!(s.archive_attempts.last().unwrap().status, "succeeded");
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
-    fn no_new_input_reuses_report_and_first_empty_uses_fallback() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+    fn no_new_input_ignores_ai_budget_and_reuses_report_or_fallback() {
+        let (_root, app) = crate::test_support::scoped_app("shishi-archive");
+        {
+            let mut state = app.state.lock().unwrap();
+            state.config.model_profiles = None;
+            state.config.max_input_chars = 10_000;
+            state.config.report_prompt = "Synthetic report policy. ".repeat(1000);
+            state.analysis_memory.temporary = "合成临时记忆保留".into();
+        }
         app.test_force_working();
-        let empty = app.archive(AiMode::Manual).unwrap();
+        let empty = app
+            .run_archive_with("manual_archive", AiMode::Manual, None, &mut |_, _| {
+                panic!("empty archive must never invoke a model")
+            })
+            .unwrap();
         assert_eq!(empty["summary_status"], "fallback");
         assert_eq!(app.state.lock().unwrap().calls, 0);
         {
@@ -1797,13 +1803,21 @@ mod tests {
             s.reports[0]["ai_summary"] =
                 json!({"summary":"上次报表","completed":[],"attention":[],"next_steps":[]});
         }
-        let reused = app.archive(AiMode::Manual).unwrap();
+        let reused = app
+            .run_archive_with("manual_archive", AiMode::Manual, None, &mut |_, _| {
+                panic!("reused archive must never invoke a model")
+            })
+            .unwrap();
         assert_eq!(reused["summary_status"], "reused");
         assert_eq!(
             reused["reused_from"],
             app.state.lock().unwrap().reports[1]["id"]
         );
         assert_eq!(app.state.lock().unwrap().calls, 0);
+        assert_eq!(
+            app.state.lock().unwrap().analysis_memory.temporary,
+            "合成临时记忆保留"
+        );
         assert!(app
             .state
             .lock()
@@ -1811,139 +1825,62 @@ mod tests {
             .archive_attempts
             .iter()
             .all(|a| a.status != "running"));
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
-    fn memory_changes_support_lasting_once_correction_and_revoke() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
-        let task = seed(&app, "以后默认先核对环境，只此一次忽略版本");
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
-        let source = candidate.payload["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["event"]["kind"] == "manual_archive")
-            .unwrap()["evidence_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        let mut value = result("完成");
-        value["memory_changes"] = json!([
-            {"action":"add","scope":"lasting","key":"职责","text":"先核对环境","source":[source],"task_id":task},
-            {"action":"add","scope":"once","key":"本次例外","text":"忽略版本","source":[source],"task_id":task}
-        ]);
-        app.commit(candidate, value, now()).unwrap();
-        {
-            let s = app.state.lock().unwrap();
-            assert_eq!(s.analysis_memory.archived_entries.len(), 1);
-            assert_eq!(s.analysis_memory.archived_entries[0].text, "先核对环境");
-            assert_eq!(s.analysis_memory.archived_version, 1);
-            assert!(s.analysis_memory.archived_text().contains("先核对环境"));
-            assert!(!s.analysis_memory.archived_text().contains("忽略版本"));
-        }
-        // Same-scope correction wins and revoke removes it.
-        let s = app.state.lock().unwrap();
-        let mut value = result("完成");
-        value["memory_changes"] = json!([
-            {"action":"update","scope":"lasting","key":"职责","text":"先核对环境再发布","source":["audit:0"]},
-            {"action":"revoke","scope":"lasting","key":"职责","source":["audit:0"]}
-        ]);
-        let mut state = s.clone();
-        drop(s);
-        let allowed = (0..state.audit.len())
-            .map(|i| format!("audit:{i}"))
-            .collect::<BTreeSet<_>>();
-        apply_memory_changes(
-            &mut state,
-            value["memory_changes"].as_array().unwrap(),
-            &allowed,
-            &allowed,
-            now(),
-        )
-        .unwrap();
-        assert!(state.analysis_memory.archived_entries.is_empty());
-        drop(app);
-        let _ = fs::remove_dir_all(root);
+    fn new_archive_evidence_still_requires_a_request_within_budget() {
+        let (_root, app) = archive_app();
+        batch_fixture(&app, 10_000, 1);
+        app.state.lock().unwrap().config.report_prompt = "Synthetic report policy. ".repeat(1000);
+        let error = app
+            .run_archive_with("manual_archive", AiMode::Manual, None, &mut |_, _| {
+                panic!("over-budget archive must never invoke a model")
+            })
+            .unwrap_err();
+        assert!(error.contains("超过单次输入上限"), "{error}");
+        let state = app.state.lock().unwrap();
+        assert_eq!(state.archive_ai_cursor, Some(0));
+        assert!(!state.tasks[0].archived);
+        assert!(state.reports.is_empty());
+        assert_eq!(state.calls, 0);
+        assert_eq!(state.archive_attempts.last().unwrap().status, "failed");
+        drop(state);
     }
     #[test]
-    fn archive_contract_accepts_operation_learning_without_notes_and_rejects_unseen_sources() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
-        let task = seed(&app, "");
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(&s, AiMode::Manual, now(), "attempt", "day")
-        };
-        assert!(candidate.payload["archive_note_sources"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        let sources = candidate.payload["archive_memory_sources"]
-            .as_array()
-            .unwrap();
-        assert!(!sources.is_empty());
-        let config = app.state.lock().unwrap().config.clone();
-        let prepared = crate::ai::prepare(&config, "archive", &candidate.payload);
-        let schema = &prepared.schema["properties"]["memory_changes"];
-        assert_eq!(schema["maxItems"], 16);
-        assert_eq!(
-            schema["items"]["properties"]["source"]["items"]["enum"],
-            json!(sources
-                .iter()
-                .map(|r| r["evidence_id"].clone())
-                .collect::<Vec<_>>())
-        );
-        assert!(prepared.prompt.contains("archive_memory_sources"));
-        let source = sources[0]["evidence_id"].clone();
-        let mut value = result("汇总");
-        value["memory_changes"] = json!([{"action":"add","scope":"lasting","key":"核对习惯","text":"优先核对合成证据","source":[source],"task_id":task}]);
-        let mut state = app.state.lock().unwrap().clone();
-        apply(&mut state, &candidate, value.clone(), now()).unwrap();
-        assert_eq!(
-            state.analysis_memory.archived_entries[0].text,
-            "优先核对合成证据"
-        );
-        assert_eq!(
-            state.analysis_memory.temporary,
-            app.state.lock().unwrap().analysis_memory.temporary
-        );
-        let mut state = app.state.lock().unwrap().clone();
-        let before = json!(state);
-        value["memory_changes"][0]["source"] = json!(["audit:999999"]);
-        assert!(apply(&mut state, &candidate, value.clone(), now()).is_err());
-        assert_eq!(json!(state), before);
-        value["memory_changes"][0]["source"] = json!(["unseen-message"]);
-        assert!(apply(&mut state, &candidate, value, now()).is_err());
-        assert_eq!(json!(state), before);
-        let mut no_operations = candidate.payload.clone();
-        no_operations["archive_memory_sources"] = json!([]);
-        assert_eq!(
-            crate::ai::prepare(&config, "archive", &no_operations).schema["properties"]
-                ["memory_changes"]["maxItems"],
-            0
-        );
-        drop(app);
-        let _ = fs::remove_dir_all(root);
+    fn empty_archive_cancelled_during_preparation_has_no_business_commit() {
+        let (_root, app) = archive_app();
+        let before_cursor = app.state.lock().unwrap().archive_ai_cursor;
+        std::thread::scope(|scope| {
+            let snapshots = app.prepare_gate.lock().unwrap();
+            let worker = scope.spawn(|| {
+                app.run_archive_with("manual_archive", AiMode::Manual, None, &mut |_, _| {
+                    panic!("empty archive must never invoke a model")
+                })
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let request = loop {
+                if let Some(id) = app.active_ai.lock().unwrap().as_ref().map(|a| a.id.clone()) {
+                    break Some(id);
+                }
+                if std::time::Instant::now() >= deadline {
+                    break None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            };
+            let interrupted = request.map(|request| app.interrupt_ai(&request));
+            drop(snapshots);
+            assert!(interrupted.is_some_and(|result| result.is_ok()));
+            assert!(worker.join().unwrap().unwrap_err().contains("中断"));
+        });
+        let state = app.state.lock().unwrap();
+        assert!(state.reports.is_empty());
+        assert_eq!(state.archive_ai_cursor, before_cursor);
+        assert_eq!(state.calls, 0);
+        assert_eq!(state.archive_attempts.last().unwrap().status, "failed");
+        drop(state);
     }
     #[test]
     fn manual_archive_with_its_own_attempt_reaches_quota_outside_work_hours() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, app) = archive_app();
         seed(&app, "合成归档备注");
         app.test_force_working();
         app.test_end_overtime();
@@ -1956,58 +1893,15 @@ mod tests {
         assert_eq!(s.archive_attempts.last().unwrap().status, "failed");
         assert!(s.reports.is_empty());
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
-    }
-    #[test]
-    fn corrupt_snapshot_rebuild_failure_prevents_archive_side_effects() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
-        app.test_force_working();
-        seed(&app, "快照失败也要保留");
-        let before = json!(*app.state.lock().unwrap());
-        std::fs::write(app.root.join(crate::snapshots::DIR), b"not-a-directory").unwrap();
-        assert!(app.archive(AiMode::Manual).is_err());
-        let after = app.state.lock().unwrap();
-        assert_eq!(after.tasks[0].archived, before["tasks"][0]["archived"]);
-        assert_eq!(json!(after.archive_ai_cursor), before["archive_ai_cursor"]);
-        assert_eq!(after.analysis_memory.archived_version, 0);
-        assert_eq!(after.tag_state.versions.len(), 1);
-        drop(after);
-        std::fs::remove_file(app.root.join(crate::snapshots::DIR)).unwrap();
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn rollback_creates_a_new_group_without_rewinding_cursor_or_task_state() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, app) = archive_app();
         app.test_force_working();
-        let task = seed(&app, "整组回滚依据");
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
-        let source = candidate.payload["evidence"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["event"]["kind"] == "manual_archive")
-            .unwrap()["evidence_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        seed(&app, "整组回滚依据");
+        let candidate = manual_candidate(&app);
         let mut value = result("完成");
-        value["memory_changes"] = json!([{"action":"add","scope":"lasting","key":"职责","text":"核对环境","source":[source],"task_id":task}]);
+        with_memory(&candidate, &mut value, "核对环境");
         value["tag_changes"] =
             json!([{"action":"add","tag":{"kind":"所属项目","value":"合成项目"}}]);
         app.commit(candidate, value, now()).unwrap();
@@ -2038,14 +1932,10 @@ mod tests {
             .iter()
             .any(|g| g.name == "所属项目" && g.values.contains(&"合成项目".into())));
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn queued_archive_needs_the_matching_claim_and_failures_are_not_retried() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, app) = archive_app();
         app.test_force_working();
         {
             let mut s = app.state.lock().unwrap();
@@ -2123,16 +2013,12 @@ mod tests {
             "归档失败或等待下次到点；失败仅手动重试"
         );
         assert_eq!(app.state.lock().unwrap().calls, 1);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn archive_only_maintains_archived_memory_even_with_legacy_auto_flags_and_outputs() {
         for enabled in [false, true] {
-            let root = root();
-            let app = App::load(root.clone()).unwrap();
-            app.state.lock().unwrap().config.model_profiles = None;
-            let task = seed(&app, "以后优先核对原始证据");
+            let (root, app) = archive_app();
+            seed(&app, "以后优先核对原始证据");
             {
                 let mut s = app.state.lock().unwrap();
                 s.config.auto_adopt_prompt = enabled;
@@ -2154,16 +2040,9 @@ mod tests {
             assert!(candidate.payload.get("current_prompt").is_none());
             assert!(candidate.payload.get("pending_advice").is_none());
             assert!(candidate.payload.get("handling_learning").is_none());
-            let source = candidate.payload["evidence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|row| row["event"]["kind"] == "manual_archive")
-                .unwrap()["evidence_id"]
-                .clone();
             let before = app.state.lock().unwrap().clone();
             let mut value = result("本批归档完成");
-            value["memory_changes"] = json!([{"action":"add","scope":"lasting","key":"核对习惯","text":"优先核对原始证据","source":[source],"task_id":task}]);
+            with_memory(&candidate, &mut value, "优先核对原始证据");
             // Simulate an obsolete/unsolicited result reaching the commit boundary.
             value["review"] = json!({"improved":true,"proposed_prompt":"不应采用的新提示词"});
             value["suggestions"] = json!([{"title":"不应启用的规则","rule":"不应写入"}]);
@@ -2205,27 +2084,13 @@ mod tests {
                 before.config.archive_prompt
             );
             drop(reload);
-            drop(app);
-            fs::remove_dir_all(root).unwrap();
         }
     }
     #[test]
     fn note_only_archive_advances_shared_cursor_and_archives_after_success() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, app) = archive_app();
         seed(&app, "只有新增备注也构成新材料");
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
+        let candidate = manual_candidate(&app);
         assert!(!candidate.evidence_ids.is_empty());
         let cursor = app.state.lock().unwrap().archive_ai_cursor.unwrap_or(0);
         app.commit(candidate.clone(), result("备注已分析"), now())
@@ -2236,63 +2101,10 @@ mod tests {
         assert!(s.analysis_memory.temporary.is_empty());
         assert!(s.reports[0]["summary_status"] == "done");
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
-    #[test]
-    fn memory_changes_are_atomic_and_bounded_without_silent_truncation() {
-        let mut s = State::default();
-        s.analysis_memory.archived_entries.push(MemoryEntry {
-            id: "old".into(),
-            key: "已有".into(),
-            text: "保留".into(),
-            source: vec!["audit:0".into()],
-            version: 1,
-            ..Default::default()
-        });
-        let allowed = ["audit:0".to_string()].into_iter().collect::<BTreeSet<_>>();
-        let notes = allowed.clone();
-        let change = |key: &str, text: &str| json!({"action":"add","scope":"lasting","key":key,"text":text,"source":["audit:0"]});
-        let too_many = (0..17)
-            .map(|i| change(&format!("k{i}"), "值"))
-            .collect::<Vec<_>>();
-        assert!(apply_memory_changes(&mut s, &too_many, &allowed, &notes, now()).is_err());
-        assert_eq!(s.analysis_memory.archived_entries.len(), 1);
-        assert!(s.audit.is_empty());
-        assert!(apply_memory_changes(
-            &mut s,
-            &[
-                change("a", &"甲".repeat(3000)),
-                change("b", &"乙".repeat(3000))
-            ],
-            &allowed,
-            &notes,
-            now()
-        )
-        .is_err());
-        assert_eq!(s.analysis_memory.archived_entries.len(), 1);
-        assert!(s.audit.is_empty());
-        assert_eq!(
-            apply_memory_changes(
-                &mut s,
-                &[change("a", "甲"), change("b", "乙")],
-                &allowed,
-                &notes,
-                now()
-            )
-            .unwrap(),
-            2
-        );
-        assert_eq!(s.analysis_memory.archived_entries.len(), 3);
-        assert_eq!(s.analysis_memory.archived_version, 1);
-        assert_eq!(s.audit.len(), 2);
-    }
-
     #[test]
     fn archive_candidate_freezes_snapshot_and_version_checks_memory_and_task_edits() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, app) = archive_app();
         let task = seed(&app, "并发修改依据");
         {
             let mut s = app.state.lock().unwrap();
@@ -2300,17 +2112,7 @@ mod tests {
             s.analysis_memory.temporary_version = 3;
             app.save(&s).unwrap();
         }
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
+        let candidate = manual_candidate(&app);
         let frozen = candidate.payload["_local_context"]["records"]
             .as_array()
             .unwrap()
@@ -2324,11 +2126,8 @@ mod tests {
             s.messages.insert(
                 "late".into(),
                 Message {
-                    id: "late".into(),
-                    text: "候选之后的新消息".into(),
-                    time: now() + 1,
                     private: true,
-                    ..Default::default()
+                    ..crate::test_support::message("late", "候选之后的新消息", now() + 1)
                 },
             );
             s.tasks[0].updated += 1;
@@ -2345,71 +2144,46 @@ mod tests {
         assert_eq!(report["temporary_memory_cleared"], false);
         assert!(report["memory_note"].as_str().is_some());
         drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn a_task_with_a_later_unprocessed_completion_or_note_is_not_archived_early() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+    fn partial_archive_waits_for_latest_event_and_keeps_unprocessed_memory() {
+        let (_root, app) = archive_app();
+        batch_fixture(&app, 80_000, 80);
         {
             let mut s = app.state.lock().unwrap();
-            let mut task = Task {
+            s.analysis_memory.temporary_version = 1;
+            let task = Task {
                 id: "t".into(),
                 title: "先有进展后有完成".into(),
                 description: "核对".into(),
                 status: "已完成".into(),
-                environment: "未指定".into(),
                 updated: 2,
                 created: 1,
                 ..Default::default()
             };
-            s.audit.push(Audit {
-                time: 1,
-                kind: "ai_update".into(),
-                task_id: task.id.clone(),
-                detail: "早期进展".into(),
-                change_summary: String::new(),
-                before: json!([task.clone()]),
-                after: json!([task.clone()]),
-            });
-            for i in 0..100 {
-                let filler = Task {
-                    id: format!("f{i}"),
-                    title: format!("填充{i}"),
-                    description: "填充材料".into(),
-                    status: "已完成".into(),
-                    updated: 2,
-                    created: 1,
+            s.audit.insert(
+                0,
+                Audit {
+                    time: 1,
+                    kind: "ai_update".into(),
+                    task_id: task.id.clone(),
+                    detail: "早期进展".into(),
+                    before: json!([task]),
+                    after: json!([task]),
                     ..Default::default()
-                };
-                s.audit.push(Audit {
-                    time: 2,
-                    kind: "manual_status".into(),
-                    task_id: filler.id.clone(),
-                    detail: "人工完成".into(),
-                    change_summary: String::new(),
-                    before: json!([filler.clone()]),
-                    after: json!([filler.clone()]),
-                });
-                s.tasks.push(filler);
-            }
-            task.status = "已完成".into();
+                },
+            );
             s.audit.push(Audit {
                 time: 3,
                 kind: "manual_archive".into(),
                 task_id: task.id.clone(),
                 detail: "最终完成与备注".into(),
-                change_summary: String::new(),
-                before: json!([task.clone()]),
-                after: json!([{
-                    "id":"t","archive_note":"最终才出现的备注","status":"已完成"
-                }]),
+                before: json!([task]),
+                after: json!([{"id":"t","archive_note":"最终才出现的备注","status":"已完成"}]),
+                ..Default::default()
             });
             s.tasks.push(task);
-            s.archive_ai_cursor = Some(0);
             app.save(&s).unwrap();
         }
         let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
@@ -2422,98 +2196,48 @@ mod tests {
                 &attempt.id,
                 &attempt.business_day,
                 10,
-            )
-        };
-        assert!(candidate.remaining_events > 0);
-        assert!(candidate.tasks_to_archive.iter().all(|task| task.id != "t"));
-        // The earlier update was included, but the latest relevant event was not.
-        assert!(candidate
-            .evidence_ids
-            .iter()
-            .any(|index| app.state.lock().unwrap().audit[*index].task_id == "t"));
-        drop(app);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn large_delta_only_finalizes_covered_tasks_and_keeps_unprocessed_temporary_memory() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
-        {
-            let mut s = app.state.lock().unwrap();
-            s.analysis_memory.temporary = "尚未完整处理的临时记忆".into();
-            s.analysis_memory.temporary_version = 1;
-            for i in 0..80 {
-                let mut task = Task {
-                    id: format!("t{i}"),
-                    title: format!("合成事项{i}"),
-                    description: "核对完成".into(),
-                    status: "已完成".into(),
-                    environment: "未指定".into(),
-                    updated: 1,
-                    created: 1,
-                    ..Default::default()
-                };
-                let before = task.clone();
-                task.updated = 2;
-                s.audit.push(Audit {
-                    time: i as i64 + 1,
-                    kind: "manual_status".into(),
-                    task_id: task.id.clone(),
-                    detail: "人工完成".into(),
-                    change_summary: String::new(),
-                    before: json!([before]),
-                    after: json!([task.clone()]),
-                });
-                s.tasks.push(task);
-            }
-            s.archive_ai_cursor = Some(0);
-            app.save(&s).unwrap();
-        }
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch_limited(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-                10,
+                true,
+                crate::context_budget::pending_refs(&s, false).count(),
             )
         };
         assert!(candidate.remaining_events > 0);
         assert!(candidate.cutoff < 80);
+        assert!(!candidate.tasks_to_archive.is_empty());
         assert!(candidate.tasks_to_archive.len() < 80);
-        let covered = candidate
-            .evidence_ids
-            .iter()
-            .map(|i| app.state.lock().unwrap().audit[*i].task_id.clone())
-            .collect::<BTreeSet<_>>();
-        assert!(candidate
-            .tasks_to_archive
-            .iter()
-            .all(|task| covered.contains(&task.id)));
+        assert!(candidate.tasks_to_archive.iter().all(|task| task.id != "t"));
+        let memory = {
+            let s = app.state.lock().unwrap();
+            let covered = candidate
+                .evidence_ids
+                .iter()
+                .map(|i| s.audit[*i].task_id.as_str())
+                .collect::<BTreeSet<_>>();
+            assert!(covered.contains("t"));
+            assert!(candidate
+                .tasks_to_archive
+                .iter()
+                .all(|task| covered.contains(task.id.as_str())));
+            s.analysis_memory.clone()
+        };
         let report = app
             .commit(candidate.clone(), result("部分处理"), now())
             .unwrap();
         let s = app.state.lock().unwrap();
         assert_eq!(s.archive_ai_cursor, Some(candidate.cutoff));
         assert_eq!(report["temporary_memory_cleared"], false);
-        assert_eq!(s.analysis_memory.temporary, "尚未完整处理的临时记忆");
+        assert_eq!(s.analysis_memory.temporary, memory.temporary);
+        assert_eq!(
+            s.analysis_memory.temporary_version,
+            memory.temporary_version
+        );
         assert!(s.tasks.iter().filter(|t| t.archived).count() < 80);
-        drop(s);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
+        assert!(!s.tasks.iter().find(|t| t.id == "t").unwrap().archived);
     }
 
     #[test]
     fn rollback_conflicts_on_manual_prompt_rule_tag_or_memory_changes() {
-        fn group_app() -> (App, String, std::path::PathBuf) {
-            let root = root();
-            let app = App::load(root.clone()).unwrap();
-            app.state.lock().unwrap().config.model_profiles = None;
+        fn group_app() -> (crate::test_support::TestRoot, App, String) {
+            let (root, app) = archive_app();
             seed(&app, "回滚冲突依据");
             {
                 let mut s = app.state.lock().unwrap();
@@ -2528,17 +2252,7 @@ mod tests {
                 });
                 app.save(&s).unwrap();
             }
-            let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-            let candidate = {
-                let s = app.state.lock().unwrap();
-                batch(
-                    &s,
-                    AiMode::Manual,
-                    now(),
-                    &attempt.id,
-                    &attempt.business_day,
-                )
-            };
+            let candidate = manual_candidate(&app);
             app.commit(candidate, result("完成"), now()).unwrap();
             let group = app
                 .state
@@ -2549,10 +2263,10 @@ mod tests {
                 .unwrap()
                 .id
                 .clone();
-            (app, group, root)
+            (root, app, group)
         }
         {
-            let (app, group, root) = group_app();
+            let (_root, app, group) = group_app();
             app.state.lock().unwrap().config.classify_prompt = "手动新提示词".into();
             app.save(&app.state.lock().unwrap()).unwrap();
             let error = app.archive_rollback(&group, &group).unwrap_err();
@@ -2561,21 +2275,17 @@ mod tests {
                 app.state.lock().unwrap().config.classify_prompt,
                 "手动新提示词"
             );
-            drop(app);
-            let _ = fs::remove_dir_all(root);
         }
         {
-            let (app, group, root) = group_app();
+            let (_root, app, group) = group_app();
             app.state.lock().unwrap().suggestions[0].rule = "手动改规则".into();
             app.save(&app.state.lock().unwrap()).unwrap();
             let error = app.archive_rollback(&group, &group).unwrap_err();
             assert!(error.contains("手动修改"), "{error}");
             assert_eq!(app.state.lock().unwrap().suggestions[0].rule, "手动改规则");
-            drop(app);
-            let _ = fs::remove_dir_all(root);
         }
         {
-            let (app, group, root) = group_app();
+            let (_root, app, group) = group_app();
             app.state
                 .lock()
                 .unwrap()
@@ -2593,11 +2303,9 @@ mod tests {
             app.save(&app.state.lock().unwrap()).unwrap();
             let error = app.archive_rollback(&group, &group).unwrap_err();
             assert!(error.contains("手动修改"), "{error}");
-            drop(app);
-            let _ = fs::remove_dir_all(root);
         }
         {
-            let (app, group, root) = group_app();
+            let (_root, app, group) = group_app();
             app.state.lock().unwrap().analysis_memory.archived_version += 1;
             app.state
                 .lock()
@@ -2617,17 +2325,13 @@ mod tests {
                 serde_json::to_value(&app.state.lock().unwrap().analysis_memory).unwrap(),
                 before
             );
-            drop(app);
-            let _ = fs::remove_dir_all(root);
         }
     }
 
     #[test]
     fn archive_groups_store_only_active_rules_and_current_tags_not_full_history() {
-        let (app, group, root) = {
-            let root = root();
-            let app = App::load(root.clone()).unwrap();
-            app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, _app, group) = {
+            let (root, app) = archive_app();
             seed(&app, "紧凑组依据");
             {
                 let mut s = app.state.lock().unwrap();
@@ -2647,17 +2351,7 @@ mod tests {
                 });
                 app.save(&s).unwrap();
             }
-            let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-            let candidate = {
-                let s = app.state.lock().unwrap();
-                batch(
-                    &s,
-                    AiMode::Manual,
-                    now(),
-                    &attempt.id,
-                    &attempt.business_day,
-                )
-            };
+            let candidate = manual_candidate(&app);
             app.commit(candidate, result("完成"), now()).unwrap();
             let group = app
                 .state
@@ -2667,7 +2361,7 @@ mod tests {
                 .last()
                 .cloned()
                 .unwrap();
-            (app, group, root)
+            (root, app, group)
         };
         let serialized = serde_json::to_value(&group).unwrap();
         assert!(serialized.get("suggestions").is_none());
@@ -2676,27 +2370,13 @@ mod tests {
         assert_eq!(group.active_rules[0].id, "active");
         assert!(!group.tag_groups.is_empty());
         assert!(!group.tag_version.is_empty());
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn derived_report_file_failure_after_atomic_commit_is_a_success_with_diagnostic() {
-        let root = root();
-        let app = App::load(root.clone()).unwrap();
-        app.state.lock().unwrap().config.model_profiles = None;
+        let (_root, app) = archive_app();
         seed(&app, "报表文件失败依据");
-        let attempt = app.start_attempt("manual_archive", now(), None).unwrap();
-        let candidate = {
-            let s = app.state.lock().unwrap();
-            batch(
-                &s,
-                AiMode::Manual,
-                now(),
-                &attempt.id,
-                &attempt.business_day,
-            )
-        };
+        let candidate = manual_candidate(&app);
         let report_id = candidate.report["id"].as_str().unwrap().to_string();
         let report_dir = app.root.join("data/reports");
         fs::create_dir_all(&report_dir).unwrap();
@@ -2720,7 +2400,9 @@ mod tests {
             .iter()
             .any(|row| row["kind"] == "archive_report_file_failed"));
         let _ = fs::remove_dir_all(&blocked);
-        drop(app);
-        let _ = fs::remove_dir_all(root);
     }
 }
+
+#[cfg(test)]
+#[path = "archive/memory_tests.rs"]
+mod memory_tests;

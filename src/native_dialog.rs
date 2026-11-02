@@ -150,6 +150,17 @@ unsafe extern "system" fn callback(
     }
     S_OK
 }
+pub fn backend_exit_confirmation(owner: isize) -> bool {
+    // Closing this dialog is the same as choosing the default No button:
+    // release the GUI owner while the CLI owner keeps the backend alive.
+    unsafe {
+        MessageBoxW(owner as HWND,
+            wide("CLI 仍在使用后台。是否同时强制关闭 CLI 后台？\n\n默认只退出图形端，CLI 和后台继续运行。强制关闭会中断正在执行的工作。").as_ptr(),
+            wide("退出拾事").as_ptr(),
+            MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) == IDYES
+    }
+}
+
 pub fn installer_confirmation(
     owner: isize,
     smoke: bool,

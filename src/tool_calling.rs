@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shishi_api::{ToolFailure, ToolFailureKind, ToolInvocation, ToolResult};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -101,29 +101,23 @@ impl ToolRun {
                 .any(|call| self.call_relates_to_task(call, id))
     }
     pub fn call_relates_to_task(&self, call: &CallRecord, id: &str) -> bool {
-        if !self.task_id.is_empty() {
-            return self.task_id == id;
-        }
-        if !call.task_ids.is_empty() {
-            return call.task_ids.iter().any(|task| task == id);
-        }
-        self.related_task_ids.len() == 1 && self.related_task_ids[0] == id
+        self.call_task_ids(call).iter().any(|task| task == id)
     }
-    pub fn task_ids(&self) -> BTreeSet<&str> {
+    fn call_task_ids<'a>(&'a self, call: &'a CallRecord) -> &'a [String] {
+        if !self.task_id.is_empty() {
+            std::slice::from_ref(&self.task_id)
+        } else if !call.task_ids.is_empty() {
+            &call.task_ids
+        } else if self.related_task_ids.len() == 1 {
+            &self.related_task_ids
+        } else {
+            &[]
+        }
+    }
+    pub fn task_ids(&self) -> impl Iterator<Item = &str> {
         self.calls
             .iter()
-            .flat_map(|call| {
-                if !self.task_id.is_empty() {
-                    vec![self.task_id.as_str()]
-                } else if !call.task_ids.is_empty() {
-                    call.task_ids.iter().map(String::as_str).collect()
-                } else if self.related_task_ids.len() == 1 {
-                    vec![self.related_task_ids[0].as_str()]
-                } else {
-                    vec![]
-                }
-            })
-            .collect()
+            .flat_map(move |call| self.call_task_ids(call).iter().map(String::as_str))
     }
 }
 pub(crate) fn link_tasks(state: &mut State, result: &Value, task_ids: &[String]) {
@@ -248,15 +242,7 @@ impl App {
                 if task_id.is_some_and(|id| !run.call_relates_to_task(call, id)) {
                     continue;
                 }
-                let id = if call.tool_id.is_empty() {
-                    run.tools
-                        .iter()
-                        .find(|t| t.name == call.tool)
-                        .map(|t| t.id.as_str())
-                        .unwrap_or("")
-                } else {
-                    &call.tool_id
-                };
+                let id = history_tool_id(run, call);
                 if !id.is_empty() {
                     tools
                         .entry(id.to_owned())
@@ -318,13 +304,11 @@ impl App {
         Ok(json!({"rows":rows,"total":total,"page":page,"pages":pages,"tools":tools}))
     }
     pub fn tool_command_preview(&self, p: &Value) -> Result<Value, String> {
-        let tool: ToolDefinition =
-            serde_json::from_value(p["tool"].clone()).map_err(|e| e.to_string())?;
+        let tool: ToolDefinition = from_json(&p["tool"])?;
         Ok(json!({"command":tool_runner::render(&tool,&p["arguments"])?}))
     }
     pub fn tool_test(&self, p: &Value) -> Result<Value, String> {
-        let tool: ToolDefinition =
-            serde_json::from_value(p["tool"].clone()).map_err(|e| e.to_string())?;
+        let tool: ToolDefinition = from_json(&p["tool"])?;
         let test_id = p["test_id"]
             .as_str()
             .filter(|s| !s.is_empty() && s.len() <= 100)
@@ -342,15 +326,8 @@ impl App {
             tests.running = Some((test_id.into(), cancel.clone()));
         }
         let config = self.state.lock().unwrap().config.clone();
-        let mut session = ToolSession::new(
-            self,
-            test_id,
-            "tool_test",
-            "",
-            vec![tool.clone()],
-            &config,
-            0,
-        );
+        let mut session =
+            ToolSession::new(self, test_id, "tool_test", "", vec![tool.clone()], &config);
         session.source = Value::Null;
         let result = (|| {
             session
@@ -481,11 +458,160 @@ pub(crate) struct ToolSession<'a> {
     task_id: String,
     tools: Vec<ToolDefinition>,
     source: Value,
-    max_input_chars: usize,
+    continuation_limit: usize,
     continuation_chars: Mutex<usize>,
-    pub budget_exhausted: AtomicBool,
-    pub stopped: AtomicBool,
 }
+
+fn tool_result_text(
+    mut result: CommandResult,
+    max_chars: usize,
+    json_encoded: bool,
+) -> Option<String> {
+    let raw_limit = max_chars.min(60_000);
+    let max_bytes = shishi_api::openai::MAX_TOOL_RESULT_BYTES;
+    let fits = |text: &str| {
+        text.len() <= max_bytes
+            && text.chars().count() <= raw_limit
+            && result_input_chars(text, json_encoded) <= max_chars
+    };
+    let text = serde_json::to_string(&result).ok()?;
+    if fits(&text) {
+        return Some(text);
+    }
+    drop(text);
+
+    // Keep all metadata, including the truncation flag, inside the budget.
+    result.truncated = true;
+    let mut stdout = std::mem::take(&mut result.stdout);
+    let mut stderr = std::mem::take(&mut result.stderr);
+    let metadata = serde_json::to_string(&result).ok()?;
+    let chars = raw_limit.checked_sub(metadata.chars().count())?;
+    let bytes = max_bytes.checked_sub(metadata.len())?;
+    let json_chars = if json_encoded {
+        max_chars.checked_sub(result_input_chars(&metadata, true))?
+    } else {
+        usize::MAX
+    };
+
+    // Split only when trimming is necessary. A short/empty stream gives its
+    // unused space to the other; JSON escapes and UTF-8 count at their real size.
+    let (out_end, out_chars, out_bytes, out_json) =
+        json_string_prefix(&stdout, chars / 2, bytes / 2, json_chars / 2);
+    let (err_end, err_chars, err_bytes, err_json) = json_string_prefix(
+        &stderr,
+        chars - out_chars,
+        bytes - out_bytes,
+        json_chars - out_json,
+    );
+    let (out_extra, _, _, _) = json_string_prefix(
+        &stdout[out_end..],
+        chars - out_chars - err_chars,
+        bytes - out_bytes - err_bytes,
+        json_chars - out_json - err_json,
+    );
+    // Changing false to true saves one JSON character. Still remove output if
+    // that alone made the result fit, so the truncation flag remains truthful.
+    if out_end + out_extra == stdout.len() && err_end == stderr.len() {
+        if stderr.pop().is_none() {
+            stdout.pop()?;
+        }
+    } else {
+        stdout.truncate(out_end + out_extra);
+        stderr.truncate(err_end);
+    }
+    result.stdout = stdout;
+    result.stderr = stderr;
+    let text = serde_json::to_string(&result).ok()?;
+    fits(&text).then_some(text)
+}
+
+fn json_character_chars(ch: char) -> usize {
+    match ch {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        '\u{0}'..='\u{1f}' => 6,
+        _ => 1,
+    }
+}
+
+/// API callers budget the content string inside an outer JSON object; local
+/// MCP callers keep counting the result text itself. Outer quotes are reserved
+/// by the API's empty-content wrapper and are not charged a second time here.
+fn result_input_chars(text: &str, json_encoded: bool) -> usize {
+    if json_encoded {
+        text.chars().map(json_character_chars).sum()
+    } else {
+        text.chars().count()
+    }
+}
+
+/// Byte boundary and raw JSON/byte/outer JSON sizes (without string quotes).
+fn json_string_prefix(
+    text: &str,
+    max_chars: usize,
+    max_bytes: usize,
+    max_json_chars: usize,
+) -> (usize, usize, usize, usize) {
+    let (mut end, mut chars, mut bytes, mut json_chars) = (0, 0, 0, 0);
+    for (offset, ch) in text.char_indices() {
+        let encoded_chars = json_character_chars(ch);
+        let encoded_bytes = if encoded_chars == 1 {
+            ch.len_utf8()
+        } else {
+            encoded_chars
+        };
+        let outer_chars = encoded_chars
+            + match ch {
+                '"' | '\\' => 2,
+                '\u{0}'..='\u{1f}' => 1,
+                _ => 0,
+            };
+        if chars + encoded_chars > max_chars
+            || bytes + encoded_bytes > max_bytes
+            || json_chars + outer_chars > max_json_chars
+        {
+            break;
+        }
+        end = offset + ch.len_utf8();
+        chars += encoded_chars;
+        bytes += encoded_bytes;
+        json_chars += outer_chars;
+    }
+    (end, chars, bytes, json_chars)
+}
+
+fn uncertain_prior_call<'a>(
+    calls: &'a [CallRecord],
+    tool: &ToolDefinition,
+    arguments: &Value,
+) -> Option<&'a CallRecord> {
+    // Omitted string parameters and explicit empty strings render identically.
+    let arguments = tool.arguments(arguments).ok()?;
+    calls.iter().rev().find(|call| {
+        call.tool_id == tool.id
+            && call.tool == tool.name
+            && call.result.as_ref().is_none_or(|result| {
+                !matches!(result.status.as_str(), "rejected" | "start_failed")
+                    && (result.exit_code.is_none()
+                        || result.timed_out
+                        || result.cancelled
+                        || !result.error.is_empty()
+                        || !matches!(result.status.as_str(), "completed" | "nonzero_exit"))
+            })
+            && tool.arguments(&call.arguments).ok().as_ref() == Some(&arguments)
+    })
+}
+
+fn unsafe_replay(call: &CallRecord) -> ToolFailure {
+    ToolFailure::with_message(
+        ToolFailureKind::UnsafeReplay,
+        format!(
+            "先前调用 {} 的命令可能已执行，但结果尚未确定（{}）；本次未重放。不要重复相同命令，请依据已有资料完成，并说明无法核实的结果。",
+            call.call_id,
+            call.result.as_ref().map_or("执行中", |result| result.status.as_str())
+        ),
+    )
+}
+
 impl<'a> ToolSession<'a> {
     pub(crate) fn handling(
         app: &'a App,
@@ -493,7 +619,7 @@ impl<'a> ToolSession<'a> {
         tools: Vec<ToolDefinition>,
         config: &Config,
     ) -> Self {
-        let mut session = Self::new(app, &ticket.run, "handling", &ticket.task, tools, config, 0);
+        let mut session = Self::new(app, &ticket.run, "handling", &ticket.task, tools, config);
         session.source = json!({"driver":"mcp","label":"MCP"});
         session
     }
@@ -504,7 +630,6 @@ impl<'a> ToolSession<'a> {
         task: &str,
         tools: Vec<ToolDefinition>,
         config: &Config,
-        prompt_chars: usize,
     ) -> Self {
         Self {
             app,
@@ -514,14 +639,12 @@ impl<'a> ToolSession<'a> {
             task_id: task.into(),
             tools,
             source: crate::ai_backend::source_info(config),
-            max_input_chars: if purpose == "tool_test" {
+            continuation_limit: if purpose == "tool_test" {
                 usize::MAX
             } else {
-                config.max_input_chars
+                config.retrieval_budget_chars
             },
-            continuation_chars: Mutex::new(prompt_chars),
-            budget_exhausted: AtomicBool::new(false),
-            stopped: AtomicBool::new(false),
+            continuation_chars: Mutex::new(0),
         }
     }
     fn run_mut<'s>(&self, state: &'s mut State) -> &'s mut ToolRun {
@@ -597,7 +720,25 @@ impl<'a> ToolSession<'a> {
                         );
                     }
                 }
-                return Err(ToolFailure::new(ToolFailureKind::Failed));
+                return Err(ToolFailure::with_message(
+                    ToolFailureKind::InvalidArguments,
+                    error,
+                ));
+            }
+        }
+        let state = self.app.state.lock().unwrap();
+        if let Some(run) = state.tool_runs.iter().find(|run| run.id == self.run_id) {
+            for call in calls {
+                // Names and arguments were validated above. Reject the entire
+                // batch before any otherwise valid command can start.
+                let tool = self
+                    .tools
+                    .iter()
+                    .find(|tool| tool.name == call.name())
+                    .unwrap();
+                if let Some(prior) = uncertain_prior_call(&run.calls, tool, call.arguments()) {
+                    return Err(unsafe_replay(prior));
+                }
             }
         }
         Ok(())
@@ -704,18 +845,36 @@ impl<'a> ToolSession<'a> {
         cancel: &AtomicBool,
         deadline: Instant,
     ) -> Result<ToolResult, ToolFailure> {
+        self.execute_with_result_budget(name, call_id, arguments, cancel, deadline, None)
+    }
+
+    pub(crate) fn execute_with_result_budget(
+        &self,
+        name: &str,
+        call_id: &str,
+        arguments: &Value,
+        cancel: &AtomicBool,
+        deadline: Instant,
+        result_budget: Option<usize>,
+    ) -> Result<ToolResult, ToolFailure> {
         let fail = || ToolFailure::new(ToolFailureKind::Failed);
         let tool = self
             .tools
             .iter()
             .find(|t| t.name == name)
             .ok_or_else(fail)?;
-        // A durable intent precedes execution. If its commit fails, do not run.
+        // A durable intent precedes execution. Recheck under the same lock so
+        // concurrent callbacks cannot replay a still-running command.
+        let mut replay_failure = None;
         self.app
             .commit_state(|state| {
                 let run = self.run_mut(state);
                 if run.calls.iter().any(|c| c.call_id == call_id) {
                     return Err("重复调用编号，未重放".into());
+                }
+                if let Some(prior) = uncertain_prior_call(&run.calls, tool, arguments) {
+                    replay_failure = Some(unsafe_replay(prior));
+                    return Err("先前命令执行结果未确定，未重放".into());
                 }
                 run.calls.push(CallRecord {
                     task_ids: Vec::new(),
@@ -729,17 +888,45 @@ impl<'a> ToolSession<'a> {
                 });
                 Ok(())
             })
-            .map_err(|_| fail())?;
+            .map_err(|_| replay_failure.unwrap_or_else(fail))?;
         self.log_call(tool, call_id, "tool_call_started", None);
+        let result_wrapper = result_budget.map_or(0, |_| {
+            let empty = json!({"role":"tool","tool_call_id":call_id,"content":""});
+            shishi_api::openai::message_input_chars(&empty) + 1
+        });
+        let content_budget = |used: usize| {
+            let remaining = self.continuation_limit.saturating_sub(used);
+            result_budget.map_or(remaining, |budget| {
+                budget.min(remaining).saturating_sub(result_wrapper)
+            })
+        };
         let within_budget = {
             let mut chars = self.continuation_chars.lock().unwrap();
-            *chars = chars.saturating_add(
-                arguments.to_string().chars().count() + name.len() + call_id.len() + 100,
-            );
-            *chars < self.max_input_chars
+            // API callers supply the shared remainder. This session records
+            // only its own delivered results, never another caller's reserved
+            // wrappers or already charged model/query text.
+            if result_budget.is_none() {
+                *chars =
+                    chars.saturating_add(json_chars(&arguments) + name.len() + call_id.len() + 100);
+            }
+            // Even an empty command result must fit before a process starts.
+            // Reserve the longest status and numeric widths instead of assuming
+            // success/zero milliseconds; stdout/stderr remain independently bounded.
+            tool_result_text(
+                CommandResult {
+                    tool: name.into(),
+                    call_id: call_id.into(),
+                    status: "nonzero_exit".into(),
+                    exit_code: Some(i32::MIN),
+                    duration_ms: u64::MAX,
+                    ..Default::default()
+                },
+                content_budget(*chars),
+                result_budget.is_some(),
+            )
+            .is_some()
         };
         let result = if !within_budget {
-            self.budget_exhausted.store(true, Ordering::SeqCst);
             CommandResult::rejected(
                 name,
                 call_id,
@@ -750,30 +937,48 @@ impl<'a> ToolSession<'a> {
                 tool,
                 call_id,
                 arguments,
-                || cancel.load(Ordering::SeqCst) || self.stopped.load(Ordering::SeqCst),
+                || cancel.load(Ordering::SeqCst),
                 deadline,
                 |cmd| {
                     // Hold the authority lock through process creation, so a saved
                     // disable and a command start have a well-defined ordering.
                     let state = self.app.state.lock().unwrap();
-                    if self.purpose != "tool_test"
-                        && (!state
+                    if self.purpose != "tool_test" {
+                        let current = state
                             .config
                             .tools
                             .iter()
-                            .any(|t| t.id == tool.id && t.enabled)
+                            .find(|current| current.id == tool.id && current.enabled);
+                        if current.is_none()
                             || (!self.task_id.is_empty()
-                                && !state
-                                    .tasks
-                                    .iter()
-                                    .any(|t| t.id == self.task_id && t.merged_into.is_empty())))
-                    {
-                        return Err((true, "工具已停用、删除或事项已不可用，未执行命令".into()));
+                                && !state.tasks.iter().any(|task| {
+                                    task.id == self.task_id && task.merged_into.is_empty()
+                                }))
+                        {
+                            return Err((
+                                true,
+                                "工具已停用、删除或事项已不可用，未执行命令".into(),
+                            ));
+                        }
+                        let current = current.unwrap();
+                        // Descriptive edits do not change command authority.
+                        // Legacy execution options must still be compatible.
+                        if current.compatibility_issue().is_some()
+                            || current.name != tool.name
+                            || current.command_template != tool.command_template
+                            || !current
+                                .parameters
+                                .iter()
+                                .map(|p| &p.name)
+                                .eq(tool.parameters.iter().map(|p| &p.name))
+                        {
+                            return Err((
+                                true,
+                                "工具执行配置已变更，本轮旧命令未执行；请依据已有资料完成。".into(),
+                            ));
+                        }
                     }
-                    if cancel.load(Ordering::SeqCst)
-                        || self.stopped.load(Ordering::SeqCst)
-                        || Instant::now() >= deadline
-                    {
+                    if cancel.load(Ordering::SeqCst) || Instant::now() >= deadline {
                         return Err((true, "运行已取消或到达总期限，未执行命令".into()));
                     }
                     self.app.tool_runtime.charge(tool).map_err(|e| (true, e))?;
@@ -795,41 +1000,37 @@ impl<'a> ToolSession<'a> {
             })
             .map_err(|_| fail())?;
         self.log_call(tool, call_id, "tool_call_finished", Some(&result));
+        if !within_budget {
+            return Err(ToolFailure::with_message(
+                ToolFailureKind::BudgetExhausted,
+                "本次续轮额度不足，命令未执行；请依据已有结果完成。",
+            ));
+        }
+        if result_budget.is_some() && matches!(result.status.as_str(), "rejected" | "start_failed")
+        {
+            return Err(ToolFailure::with_message(
+                if result.status == "rejected" {
+                    ToolFailureKind::Denied
+                } else {
+                    ToolFailureKind::Unavailable
+                },
+                format!("命令未执行：{}", result.error),
+            ));
+        }
         // Retain the full bounded result locally. Bound the copy returned to
         // the model as well, including JSON escaping; never resend on failure.
-        let mut returned = result;
-        let target = self
-            .max_input_chars
-            .saturating_sub(*self.continuation_chars.lock().unwrap())
-            .min(60_000)
-            / 2;
-        if returned.stdout.chars().count() + returned.stderr.chars().count() > target {
-            returned.stdout = returned.stdout.chars().take(target / 2).collect();
-            returned.stderr = returned.stderr.chars().take(target / 2).collect();
-            returned.truncated = true;
-        }
-        let mut text = serde_json::to_string(&returned).map_err(|_| fail())?;
-        while text.len() > shishi_api::openai::MAX_TOOL_RESULT_BYTES {
-            returned.stdout = returned
-                .stdout
-                .chars()
-                .take(returned.stdout.chars().count() / 2)
-                .collect();
-            returned.stderr = returned
-                .stderr
-                .chars()
-                .take(returned.stderr.chars().count() / 2)
-                .collect();
-            returned.truncated = true;
-            text = serde_json::to_string(&returned).map_err(|_| fail())?;
-        }
+        // Reserve and charge the returned text under one short lock, so concurrent
+        // callbacks cannot both use the same remaining space. No I/O holds it.
         let mut chars = self.continuation_chars.lock().unwrap();
-        *chars = chars.saturating_add(text.chars().count());
-        if *chars > self.max_input_chars {
-            self.budget_exhausted.store(true, Ordering::SeqCst);
-            self.stopped.store(true, Ordering::SeqCst);
-            return Err(fail());
-        }
+        let Some(text) = tool_result_text(result, content_budget(*chars), result_budget.is_some())
+        else {
+            return Err(ToolFailure::with_message(
+                ToolFailureKind::BudgetExhausted,
+                "命令结果已保存在调用记录中，但续轮额度不足以完整交付；不要重放命令，请依据已收到的资料完成。",
+            ));
+        };
+        *chars = chars
+            .saturating_add(result_wrapper + result_input_chars(&text, result_budget.is_some()));
         Ok(ToolResult::Text(text))
     }
 }

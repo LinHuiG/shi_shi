@@ -9,6 +9,58 @@ pub struct Tag {
     pub kind: String,
     pub value: String,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignmentChange {
+    action: String,
+    kind: String,
+    value: String,
+}
+
+/// Empty changes retain all existing assignments, including tags omitted from
+/// a bounded model summary. Validate the whole patch before returning a result.
+pub fn apply_changes(
+    current: &[Tag],
+    changes: &Value,
+    catalog: &[Group],
+    allow_remove: bool,
+) -> Result<Vec<Tag>, String> {
+    let changes: Vec<AssignmentChange> =
+        from_json(changes).map_err(|_| "标签变更格式无效，需要 action、kind、value；事项未保存")?;
+    if changes.len() > 40 {
+        return Err("标签变更超过 40 项，事项未保存".into());
+    }
+    let mut seen = BTreeSet::new();
+    let mut result: BTreeSet<Tag> = current.iter().cloned().collect();
+    for change in changes {
+        let tag = Tag {
+            kind: change.kind,
+            value: change.value,
+        };
+        if !valid(&tag) || !seen.insert(tag.clone()) {
+            return Err("标签变更包含非法、重复或冲突的标签，事项未保存".into());
+        }
+        match change.action.as_str() {
+            "add" if known(catalog, &tag.kind, &tag.value) => {
+                result.insert(tag);
+            }
+            "add" => {
+                return Err(
+                    "新增标签不在本次可用目录中，请先采用标签建议或重新分析；事项未保存".into(),
+                )
+            }
+            "remove" if allow_remove => {
+                result.remove(&tag);
+            }
+            "remove" => return Err("新建事项只能添加标签，不能删除已有标签；事项未保存".into()),
+            _ => return Err("标签变更只支持 add/remove；事项未保存".into()),
+        }
+    }
+    if result.len() > 40 {
+        return Err("事项标签超过 40 个，事项未保存".into());
+    }
+    Ok(result.into_iter().collect())
+}
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
@@ -52,10 +104,6 @@ pub struct TagState {
     pub priorities: Vec<String>,
 }
 
-pub fn category_aliases(_s: &State) -> BTreeMap<String, String> {
-    BTreeMap::new()
-}
-
 pub fn groups(s: &State) -> Vec<Group> {
     let mut groups = s
         .tag_state
@@ -77,25 +125,27 @@ pub fn groups(s: &State) -> Vec<Group> {
     }
     groups
 }
-pub fn known(groups: &[Group], tag: &Tag) -> bool {
+fn known(groups: &[Group], kind: &str, value: &str) -> bool {
     groups
         .iter()
-        .any(|g| g.name == tag.kind && g.values.contains(&tag.value))
+        .any(|g| g.name == kind && g.values.iter().any(|v| v == value))
 }
 pub fn result_catalog(s: &State, result: &Value) -> Vec<Group> {
     let current = groups(s);
-    let mut at_call: Vec<Group> =
-        serde_json::from_value(result["_tag_catalog"].clone()).unwrap_or_else(|_| current.clone());
+    let Ok(mut at_call) = from_json::<Vec<Group>>(&result["_tag_catalog"]) else {
+        return current;
+    };
+    let available = current
+        .iter()
+        .flat_map(|g| {
+            g.values
+                .iter()
+                .map(move |value| (g.name.as_str(), value.as_str()))
+        })
+        .collect::<BTreeSet<_>>();
     for g in &mut at_call {
-        g.values.retain(|v| {
-            known(
-                &current,
-                &Tag {
-                    kind: g.name.clone(),
-                    value: v.clone(),
-                },
-            )
-        });
+        g.values
+            .retain(|v| available.contains(&(g.name.as_str(), v.as_str())));
     }
     at_call
 }
@@ -285,8 +335,9 @@ pub fn initialize(s: &mut State) {
 }
 pub fn sanitize(t: &mut Task, old: Option<&Task>, catalog: &[Group]) {
     sync_category_tags(t);
-    t.tags
-        .retain(|tag| known(catalog, tag) || old.is_some_and(|o| o.tags.contains(tag)));
+    t.tags.retain(|tag| {
+        known(catalog, &tag.kind, &tag.value) || old.is_some_and(|o| o.tags.contains(tag))
+    });
     t.tags.sort();
     t.tags.dedup();
 }
@@ -294,7 +345,7 @@ pub fn effective_tags(t: &Task, catalog: &[Group], priority: &str, at: i64) -> V
     let mut tags = t
         .tags
         .iter()
-        .filter(|tag| known(catalog, tag))
+        .filter(|tag| known(catalog, &tag.kind, &tag.value))
         .cloned()
         .collect::<Vec<_>>();
     if let Some(group) = catalog
@@ -306,7 +357,8 @@ pub fn effective_tags(t: &Task, catalog: &[Group], priority: &str, at: i64) -> V
             .filter(|t| t.kind == priority)
             .filter_map(|t| group.values.iter().position(|v| v == &t.value))
             .min();
-        let deadline = if t.follow_deadline && t.status == "待处理" {
+        let deadline = if t.follow_deadline && ["待处理", "处理中"].contains(&t.status.as_str())
+        {
             deadline_ms(&t.due).and_then(|due| {
                 let left = due - at;
                 if left <= 7_200_000 {
@@ -343,20 +395,12 @@ pub fn priority_rank(tags: &[Tag], catalog: &[Group], priority: &str) -> usize {
         .unwrap_or(10_000)
 }
 pub fn snapshot(s: &State) -> Value {
-    json!({"unified":true,"priority_kind":priority_kind(s),"groups":groups(s),"versions":s.tag_state.versions,"proposals":s.tag_state.proposals,"filters":s.tag_state.filters,"priorities":s.tag_state.priorities,"category_aliases":category_aliases(s)})
+    json!({"unified":true,"priority_kind":priority_kind(s),"groups":groups(s),"versions":s.tag_state.versions,"proposals":s.tag_state.proposals,"filters":s.tag_state.filters,"priorities":s.tag_state.priorities,"category_aliases":{}})
 }
 
 fn prune_filters(s: &mut State, catalog: &[Group]) {
     s.tag_state.filters.retain(|kind, values| {
-        values.retain(|value| {
-            known(
-                catalog,
-                &Tag {
-                    kind: kind.clone(),
-                    value: value.clone(),
-                },
-            )
-        });
+        values.retain(|value| known(catalog, kind, value));
         !values.is_empty()
     });
     s.tag_state.priorities.clear();
@@ -425,7 +469,7 @@ pub fn collect(s: &mut State, result: &Value, payload: &Value, request: &str) {
             })
             .unwrap_or_default();
         if !valid(&tag)
-            || known(&catalog, &tag)
+            || known(&catalog, &tag.kind, &tag.value)
             || reason.is_empty()
             || ids.is_empty()
             || ids.iter().any(|id| !evidence.contains_key(id))
@@ -480,8 +524,7 @@ pub fn collect(s: &mut State, result: &Value, payload: &Value, request: &str) {
 }
 impl App {
     pub fn tag_filters(&self, v: &Value) -> Result<Value, String> {
-        let filters: BTreeMap<String, Vec<String>> =
-            serde_json::from_value(v["filters"].clone()).map_err(|e| e.to_string())?;
+        let filters: BTreeMap<String, Vec<String>> = from_json(&v["filters"])?;
         if filters.len() > 64
             || filters.iter().any(|(k, vs)| {
                 vs.len() > 200
@@ -495,47 +538,38 @@ impl App {
         {
             return Err("标签筛选超出范围".into());
         }
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        if let Some(priorities) = v.get("priorities") {
-            let mut priorities: Vec<String> =
-                serde_json::from_value(priorities.clone()).map_err(|_| "事项等级筛选无效")?;
-            let kind = priority_kind(&s);
-            let catalog = groups(&s);
-            if priorities.len() > 200
-                || priorities.iter().any(|value| {
-                    !known(
-                        &catalog,
-                        &Tag {
-                            kind: kind.clone(),
-                            value: value.clone(),
-                        },
+        self.commit_state(|s| {
+            if let Some(priorities) = v.get("priorities") {
+                let mut priorities: Vec<String> =
+                    from_json(priorities).map_err(|_| "事项等级筛选无效")?;
+                let kind = priority_kind(s);
+                let catalog = groups(s);
+                if priorities.len() > 200
+                    || priorities
+                        .iter()
+                        .any(|value| !known(&catalog, &kind, value))
+                {
+                    return Err("事项等级筛选无效".into());
+                }
+                priorities.sort();
+                priorities.dedup();
+                s.tag_state.priorities = priorities;
+            }
+            s.tag_state.filters = filters
+                .into_iter()
+                .map(|(k, vs)| {
+                    (
+                        k,
+                        vs.into_iter()
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect(),
                     )
                 })
-            {
-                return Err("事项等级筛选无效".into());
-            }
-            priorities.sort();
-            priorities.dedup();
-            s.tag_state.priorities = priorities;
-        }
-        s.tag_state.filters = filters
-            .into_iter()
-            .map(|(k, vs)| {
-                (
-                    k,
-                    vs.into_iter()
-                        .collect::<BTreeSet<_>>()
-                        .into_iter()
-                        .collect(),
-                )
-            })
-            .filter(|(_, vs): &(_, Vec<String>)| !vs.is_empty())
-            .collect();
-        self.save(&s)?;
-        let reply = json!(s.tag_state.filters);
-        *lock = s;
-        Ok(reply)
+                .filter(|(_, vs): &(_, Vec<String>)| !vs.is_empty())
+                .collect();
+            Ok(json!(s.tag_state.filters))
+        })
     }
     pub fn tag_decide(&self, v: &Value) -> Result<Value, String> {
         let mut lock = self.state.lock().unwrap();
@@ -620,7 +654,7 @@ impl App {
                 return Err("不支持的标签操作".into());
             }
             let tag: Tag = if v.get("tag").is_some() {
-                serde_json::from_value(v["tag"].clone()).map_err(|e| e.to_string())?
+                from_json(&v["tag"])?
             } else {
                 p.tag.clone()
             };
@@ -688,8 +722,43 @@ impl App {
 mod tests {
     use super::*;
     #[test]
+    fn assignment_patches_reject_malformed_or_conflicting_changes_atomically() {
+        let current = vec![Tag {
+            kind: "旧目录".into(),
+            value: "旧值".into(),
+        }];
+        let catalog = vec![Group {
+            name: "类型".into(),
+            values: vec!["核对".into()],
+            ..Default::default()
+        }];
+        let add = json!({"action":"add","kind":"类型","value":"核对"});
+        for changes in [
+            Value::Null,
+            json!([{"kind":"类型","value":"核对"}]),
+            json!([{"action":"add","tag":{"kind":"类型","value":"核对"}}]),
+            json!([add.clone(), add.clone()]),
+            json!([add.clone(), {"action":"remove","kind":"类型","value":"核对"}]),
+            json!([add.clone(), {"action":"add","kind":"类型","value":"未知值"}]),
+            json!([{"action":"replace","kind":"类型","value":"核对"}]),
+            json!([{"action":"remove","kind":"旧目录","value":" 旧值"}]),
+            json!(vec![add; 41]),
+        ] {
+            assert!(
+                apply_changes(&current, &changes, &catalog, true).is_err(),
+                "{changes}"
+            );
+            assert_eq!(current[0].value, "旧值");
+        }
+        let remove = json!([{"action":"remove","kind":"旧目录","value":"旧值"}]);
+        assert!(apply_changes(&current, &remove, &catalog, true)
+            .unwrap()
+            .is_empty());
+        assert!(apply_changes(&[], &remove, &catalog, false).is_err());
+    }
+    #[test]
     fn display_priority_persists_rolls_back_and_rejects_stale_or_bad_edits() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         let original = app
             .state
             .lock()
@@ -730,7 +799,7 @@ mod tests {
     }
     #[test]
     fn unified_catalog_has_no_environment_defaults_and_empty_tags_stay_empty() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         app.commit_state(|s| {
             assert!(s.tag_state.unified);
             assert!(!groups(s).iter().any(|g| g.name == "适用环境"));
@@ -757,7 +826,7 @@ mod tests {
     }
     #[test]
     fn historical_catalog_assignments_still_rollback_and_dynamic_ranking_uses_current_order() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         let original = app
             .state
             .lock()
@@ -817,7 +886,7 @@ mod tests {
     }
     #[test]
     fn legacy_conversion_keeps_real_labels_once_without_restoring_removed_values() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         let mut s = app.state.lock().unwrap();
         s.tag_state.unified = false;
         s.tasks.push(Task {
@@ -850,7 +919,7 @@ mod tests {
     }
     #[test]
     fn user_categories_are_preserved_when_initializing_again() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         let mut state = app.state.lock().unwrap();
         state.tag_state.versions.last_mut().unwrap().groups[0]
             .values
@@ -867,11 +936,10 @@ mod tests {
                 .map(|g| (&g.name, &g.values))
                 .collect::<Vec<_>>()
         );
-        assert!(category_aliases(&state).is_empty());
     }
     #[test]
     fn priority_filters_persist_and_reject_invalid_values_atomically() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         app.tag_filters(&json!({"filters":{"事项类型":["日常事务"]},"priorities":["紧急","高"]}))
             .unwrap();
         assert!(app
@@ -882,12 +950,9 @@ mod tests {
         assert_eq!(s.tag_state.priorities, vec!["紧急", "高"]);
         assert_eq!(s.tag_state.filters["事项类型"], vec!["日常事务"]);
     }
-    fn fixture() -> App {
-        App::load(std::env::temp_dir().join(format!("shishi-tags-{}", id()))).unwrap()
-    }
     #[test]
     fn proposals_require_real_evidence_and_do_not_apply_until_adopted() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         let before = app.state.lock().unwrap().tasks.clone();
         {
             let mut s = app.state.lock().unwrap();
@@ -905,7 +970,8 @@ mod tests {
                 "r",
             );
             assert_eq!(s.tag_state.proposals.len(), 1);
-            assert!(!known(&groups(&s), &s.tag_state.proposals[0].tag));
+            let tag = &s.tag_state.proposals[0].tag;
+            assert!(!known(&groups(&s), &tag.kind, &tag.value));
         }
         let s = app.state.lock().unwrap().clone();
         let first = s.tag_state.versions[0].id.clone();
@@ -925,11 +991,11 @@ mod tests {
         let s = restored.state.lock().unwrap();
         assert_eq!(s.tag_state.versions.len(), 3);
         assert!(!s.tag_state.filters.contains_key("所属项目"));
-        assert!(!known(&groups(&s), &p.tag));
+        assert!(!known(&groups(&s), &p.tag.kind, &p.tag.value));
     }
     #[test]
     fn unknown_tags_cannot_silently_expand_catalog_and_rollback_keeps_history() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         let s = app.state.lock().unwrap();
         let catalog = groups(&s);
         let mut t = Task {
@@ -963,7 +1029,7 @@ mod tests {
     }
     #[test]
     fn failed_save_does_not_change_filters() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-tags");
         crate::test_support::persistence_failure(&app.root, true).unwrap();
         assert!(app
             .tag_filters(&json!({"filters":{"提出者":["产品"]}}))

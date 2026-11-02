@@ -47,6 +47,7 @@ function openHandlingWindow(id) {
   } else { syncHandlingWindow(); updateHandlingLive(); }
   const input = handlingComposerHost(id)?.querySelector('textarea');
   (input || handlingWindow.el.querySelector('[data-handling-close]'))?.focus({preventScroll:true});
+  if(run._details===false)void refreshState(true);
 }
 document.addEventListener('click', e => {
   if (e.target.closest('[data-handling-close]')) closeHandlingWindow(true);

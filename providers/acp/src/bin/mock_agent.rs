@@ -4,7 +4,7 @@
 use serde_json::{json, Value};
 use shishi_acp::jsonrpc::{
     decode_line, encode_error, encode_notification, encode_request, encode_response, Incoming,
-    RequestId,
+    RequestId, RpcError,
 };
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static SESSION_SEQ: AtomicUsize = AtomicUsize::new(1);
 
-#[derive(Clone, Default)]
 struct Session {
     model: String,
     effort: String,
@@ -27,6 +26,10 @@ struct State {
 
 fn main() {
     let scenario = std::env::var("MOCK_SCENARIO").unwrap_or_else(|_| "happy".into());
+    if scenario == "sleep" {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        return;
+    }
     if scenario == "stderr" {
         for index in 0..200 {
             let _ = writeln!(
@@ -46,7 +49,6 @@ fn main() {
     let mut state = State {
         sessions: HashMap::new(),
     };
-    let mut pending: HashMap<RequestId, Result<Value, Value>> = HashMap::new();
     loop {
         let Some(line) = read_line(&mut reader) else {
             return;
@@ -63,31 +65,18 @@ fn main() {
             }
         };
         match incoming {
-            Incoming::Response { id, result } => {
-                pending.insert(id, result.map_err(|error| json!(error.message)));
-            }
-            Incoming::Notification { method, params } => {
-                if method == "$/cancel_request" {
-                    continue;
-                }
-                if method == "session/cancel" {
-                    if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
-                        let _ = session_id;
-                    }
-                }
-            }
             Incoming::Request { id, method, params } => {
                 handle_request(
                     &mut reader,
                     &mut out,
                     &mut state,
-                    &mut pending,
                     &scenario,
                     id,
                     &method,
                     params,
                 );
             }
+            _ => {}
         }
     }
 }
@@ -96,12 +85,19 @@ fn handle_request(
     reader: &mut BufReader<std::io::StdinLock<'_>>,
     out: &mut std::io::StdoutLock<'_>,
     state: &mut State,
-    pending: &mut HashMap<RequestId, Result<Value, Value>>,
     scenario: &str,
     id: RequestId,
     method: &str,
     params: Value,
 ) {
+    if let Ok(path) = std::env::var("MOCK_REQUESTS_FILE") {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{}", json!({"method":method,"params":params})).unwrap();
+    }
     let result = match method {
         "initialize" => {
             if scenario == "malformed" {
@@ -118,6 +114,9 @@ fn handle_request(
                 json!({"protocolVersion": 2, "agentInfo": {"name": "mock", "version": "0"}, "agentCapabilities": {}})
             } else {
                 let mut session_caps = json!({"close": {}, "list": {}});
+                if std::env::var("MOCK_CLOSE_MODE").as_deref() == Ok("unsupported") {
+                    session_caps.as_object_mut().unwrap().remove("close");
+                }
                 if scenario != "no-resume" {
                     session_caps["resume"] = json!({});
                 }
@@ -152,8 +151,10 @@ fn handle_request(
                 effort: "low".into(),
                 mcp_servers: params.get("mcpServers").cloned().unwrap_or(json!([])),
             };
-            state.sessions.insert(session_id.clone(), session);
-            json!({"sessionId": session_id, "configOptions": config_options(state, &session_id)})
+            let result =
+                json!({"sessionId": session_id, "configOptions": config_options(&session)});
+            state.sessions.insert(session_id, session);
+            result
         }
         "session/resume" => {
             let session_id = params
@@ -161,17 +162,12 @@ fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("mock-session-1")
                 .to_string();
-            if !state.sessions.contains_key(&session_id) {
-                state.sessions.insert(
-                    session_id.clone(),
-                    Session {
-                        model: "[\"mock\",\"mock-model\"]".into(),
-                        effort: "low".into(),
-                        mcp_servers: json!([]),
-                    },
-                );
-            }
-            json!({"configOptions": config_options(state, &session_id)})
+            let session = state.sessions.entry(session_id).or_insert_with(|| Session {
+                model: "[\"mock\",\"mock-model\"]".into(),
+                effort: "low".into(),
+                mcp_servers: json!([]),
+            });
+            json!({"configOptions": config_options(session)})
         }
         "session/list" => {
             let sessions = state
@@ -182,6 +178,10 @@ fn handle_request(
             json!({"sessions": sessions})
         }
         "session/close" => {
+            if std::env::var("MOCK_CLOSE_MODE").as_deref() == Ok("error") {
+                send_error(out, &id, -32603, "synthetic close failure");
+                return;
+            }
             if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                 state.sessions.remove(session_id);
             }
@@ -215,7 +215,7 @@ fn handle_request(
                 send_error(out, &id, -32602, "unknown config option");
                 return;
             }
-            json!({"configOptions": config_options(state, &session_id)})
+            json!({"configOptions": config_options(session)})
         }
         "session/prompt" => {
             let session_id = params
@@ -223,7 +223,7 @@ fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let Some(session) = state.sessions.get(&session_id).cloned() else {
+            let Some(session) = state.sessions.get(&session_id) else {
                 send_error(out, &id, -32602, "unknown session");
                 return;
             };
@@ -235,21 +235,16 @@ fn handle_request(
                 .and_then(Value::as_str)
                 .unwrap_or("");
             record_prompt(prompt);
+            if let Ok(events) = std::env::var("MOCK_NOTIFICATIONS") {
+                for event in serde_json::from_str::<Vec<Value>>(&events).unwrap() {
+                    send_value(out, &event);
+                }
+            }
             if scenario == "exit" {
                 let _ = out.flush();
                 std::process::exit(7);
             }
-            run_prompt(
-                reader,
-                out,
-                state,
-                pending,
-                scenario,
-                &id,
-                &session_id,
-                &session,
-                prompt,
-            );
+            run_prompt(reader, out, scenario, &id, &session_id, session, prompt);
             return;
         }
         _ => {
@@ -263,8 +258,6 @@ fn handle_request(
 fn run_prompt(
     reader: &mut BufReader<std::io::StdinLock<'_>>,
     out: &mut std::io::StdoutLock<'_>,
-    state: &mut State,
-    pending: &mut HashMap<RequestId, Result<Value, Value>>,
     scenario: &str,
     id: &RequestId,
     session_id: &str,
@@ -295,51 +288,20 @@ fn run_prompt(
                 }
             }),
         );
-        loop {
-            let Some(line) = read_line(reader) else {
-                return;
-            };
-            let incoming = match decode_line(&line, 8 * 1024 * 1024) {
-                Ok(incoming) => incoming,
-                Err(_) => continue,
-            };
-            match incoming {
-                Incoming::Response {
-                    id: response_id,
-                    result,
-                } if response_id == permission_id => {
-                    let outcome = result.unwrap_or(Value::Null);
-                    record_permission(&outcome);
-                    send_session_update(
-                        out,
-                        session_id,
-                        json!({"sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "mock tool", "status": "completed"}),
-                    );
-                    send_result(
-                        out,
-                        id,
-                        json!({"stopReason": "end_turn", "usage": {"totalTokens": 3, "inputTokens": 2, "outputTokens": 1}}),
-                    );
-                    return;
-                }
-                Incoming::Notification { method, params } if method == "session/cancel" => {
-                    let _ = params;
-                    record_cancel();
-                    send_result(out, id, json!({"stopReason": "cancelled"}));
-                    return;
-                }
-                Incoming::Request {
-                    id: request_id,
-                    method,
-                    ..
-                } if method == "session/close" => {
-                    send_result(out, &request_id, json!({}));
-                    send_result(out, id, json!({"stopReason": "cancelled"}));
-                    return;
-                }
-                _ => {}
-            }
+        if let Some(result) = wait_for_response(reader, out, id, Some(&permission_id), true) {
+            record_permission(&result.unwrap_or(Value::Null));
+            send_session_update(
+                out,
+                session_id,
+                json!({"sessionUpdate": "tool_call", "toolCallId": "call-1", "title": "mock tool", "status": "completed"}),
+            );
+            send_result(
+                out,
+                id,
+                json!({"stopReason": "end_turn", "usage": {"totalTokens": 3, "inputTokens": 2, "outputTokens": 1}}),
+            );
         }
+        return;
     }
     if scenario == "hang" {
         send_session_update(
@@ -347,38 +309,8 @@ fn run_prompt(
             session_id,
             json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "working"}}),
         );
-        loop {
-            let Some(line) = read_line(reader) else {
-                return;
-            };
-            let incoming = match decode_line(&line, 8 * 1024 * 1024) {
-                Ok(incoming) => incoming,
-                Err(_) => continue,
-            };
-            match incoming {
-                Incoming::Notification { method, params } if method == "session/cancel" => {
-                    let _ = params;
-                    record_cancel();
-                    send_result(out, id, json!({"stopReason": "cancelled"}));
-                    return;
-                }
-                Incoming::Response {
-                    id: response_id, ..
-                } => {
-                    pending.insert(response_id, Ok(Value::Null));
-                }
-                Incoming::Request {
-                    id: request_id,
-                    method,
-                    ..
-                } if method == "session/close" => {
-                    send_result(out, &request_id, json!({}));
-                    send_result(out, id, json!({"stopReason": "cancelled"}));
-                    return;
-                }
-                _ => {}
-            }
-        }
+        wait_for_response(reader, out, id, None, true);
+        return;
     }
     if scenario == "server-request" {
         let request_id = RequestId::String("unknown-server-request".into());
@@ -391,38 +323,16 @@ fn run_prompt(
                 "params": {"sessionId": session_id, "path": "C:\\fixture.txt"}
             }),
         );
-        loop {
-            let Some(line) = read_line(reader) else {
-                return;
-            };
-            let incoming = match decode_line(&line, 8 * 1024 * 1024) {
-                Ok(incoming) => incoming,
-                Err(_) => continue,
-            };
-            match incoming {
-                Incoming::Response {
-                    id: response_id,
-                    result,
-                } if response_id == request_id => {
-                    if let Ok(path) = std::env::var("MOCK_SERVER_REQUEST_FILE") {
-                        let recorded = match result {
-                            Ok(value) => value,
-                            Err(error) => json!({
-                                "error": {"code": error.code, "message": error.message}
-                            }),
-                        };
-                        let _ = std::fs::write(path, recorded.to_string());
-                    }
-                    break;
-                }
-                Incoming::Notification { method, params } if method == "session/cancel" => {
-                    let _ = params;
-                    record_cancel();
-                    send_result(out, id, json!({"stopReason": "cancelled"}));
-                    return;
-                }
-                _ => {}
-            }
+        let Some(result) = wait_for_response(reader, out, id, Some(&request_id), false) else {
+            return;
+        };
+        if let Ok(path) = std::env::var("MOCK_SERVER_REQUEST_FILE") {
+            let recorded = result.unwrap_or_else(|error| {
+                json!({
+                    "error": {"code": error.code, "message": error.message}
+                })
+            });
+            let _ = std::fs::write(path, recorded.to_string());
         }
     }
     if scenario == "tool" || scenario == "submit" {
@@ -462,24 +372,44 @@ fn run_prompt(
         result["usage"] = usage;
     }
     send_result(out, id, result);
-    let _ = (state, session);
 }
 
-fn config_options(state: &State, session_id: &str) -> Value {
-    let session = state.sessions.get(session_id);
-    let model = session
-        .map(|session| session.model.clone())
-        .unwrap_or_else(|| "[\"mock\",\"mock-model\"]".into());
-    let effort = session
-        .map(|session| session.effort.clone())
-        .unwrap_or_else(|| "low".into());
+fn wait_for_response(
+    reader: &mut impl BufRead,
+    out: &mut std::io::StdoutLock<'_>,
+    prompt_id: &RequestId,
+    expected: Option<&RequestId>,
+    close_cancels: bool,
+) -> Option<Result<Value, RpcError>> {
+    loop {
+        let line = read_line(reader)?;
+        match decode_line(&line, 8 * 1024 * 1024) {
+            Ok(Incoming::Response { id, result }) if expected == Some(&id) => {
+                return Some(result);
+            }
+            Ok(Incoming::Notification { method, .. }) if method == "session/cancel" => {
+                record_cancel();
+            }
+            Ok(Incoming::Request { id, method, .. })
+                if close_cancels && method == "session/close" =>
+            {
+                send_result(out, &id, json!({}));
+            }
+            _ => continue,
+        }
+        send_result(out, prompt_id, json!({"stopReason": "cancelled"}));
+        return None;
+    }
+}
+
+fn config_options(session: &Session) -> Value {
     json!([
         {
             "id": "model",
             "name": "Model",
             "category": "model",
             "type": "select",
-            "currentValue": model,
+            "currentValue": session.model,
             "options": [{
                 "group": "mock",
                 "name": "Mock",
@@ -494,7 +424,7 @@ fn config_options(state: &State, session_id: &str) -> Value {
             "name": "Reasoning effort",
             "category": "thought_level",
             "type": "select",
-            "currentValue": effort,
+            "currentValue": session.effort,
             "options": [
                 {"value": "", "name": "Provider default"},
                 {"value": "low", "name": "Low"},
@@ -578,8 +508,11 @@ fn spawn_grandchild() {
     let Ok(path) = std::env::var("MOCK_CHILD_PID_FILE") else {
         return;
     };
-    let mut command = Command::new("cmd.exe");
-    command.args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 >NUL"]);
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(executable);
+    command.env("MOCK_SCENARIO", "sleep");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

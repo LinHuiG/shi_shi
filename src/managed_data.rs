@@ -221,41 +221,37 @@ fn inspect_file(root: &Path, name: &str) -> Option<(Problem, Option<String>)> {
         Ok(bytes) => bytes,
         Err(error) => return Some((Problem::Unreadable(error.to_string()), None)),
     };
-    let fingerprint = Some(fingerprint(&bytes));
-    if name == "legacy-state.json" {
-        return Some((Problem::ObsoleteMigration, fingerprint));
-    }
-    let value: Value = match serde_json::from_slice(&bytes) {
-        Ok(value) => value,
-        Err(error) => return Some((Problem::Structural(error.to_string()), fingerprint)),
+    let problem = if name == "legacy-state.json" {
+        Some(Problem::ObsoleteMigration)
+    } else {
+        decode_legacy(&bytes).err()
     };
-    let Some(object) = value.as_object() else {
-        return Some((Problem::Structural("根节点必须是对象".into()), fingerprint));
-    };
-    match object.get("schema_version") {
-        None => return Some((Problem::MissingVersion, fingerprint)),
-        Some(value) => match value.as_u64() {
-            Some(version) if version == u64::from(STATE_SCHEMA_VERSION) => {}
-            Some(version) => return Some((Problem::UnsupportedVersion(version), fingerprint)),
-            None => {
-                return Some((
-                    Problem::Structural("schema_version 必须是正整数".into()),
-                    fingerprint,
-                ))
-            }
-        },
+    problem.map(|problem| (problem, Some(fingerprint(&bytes))))
+}
+
+fn decode_legacy(bytes: &[u8]) -> Result<State, Problem> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|error| Problem::Structural(error.to_string()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| Problem::Structural("根节点必须是对象".into()))?;
+    let version = object
+        .get("schema_version")
+        .ok_or(Problem::MissingVersion)?
+        .as_u64()
+        .ok_or_else(|| Problem::Structural("schema_version 必须是正整数".into()))?;
+    if version != u64::from(STATE_SCHEMA_VERSION) {
+        return Err(Problem::UnsupportedVersion(version));
     }
     if let Some(error) = shape_error(object) {
-        return Some((Problem::Structural(error), fingerprint));
+        return Err(Problem::Structural(error));
     }
-    match decode_state(value) {
-        Ok(state) => state
-            .work_scheduler
-            .validate()
-            .err()
-            .map(|error| (Problem::Structural(error.to_string()), fingerprint)),
-        Err(error) => Some((Problem::Structural(error.to_string()), fingerprint)),
-    }
+    let state = decode_state(value).map_err(Problem::Structural)?;
+    state
+        .work_scheduler
+        .validate()
+        .map_err(|error| Problem::Structural(error.to_string()))?;
+    Ok(state)
 }
 
 /// Validate every explicitly app-owned persisted state artifact, including a
@@ -286,17 +282,26 @@ fn legacy_memory_files(root: &Path) -> Vec<(String, PathBuf)> {
 pub fn inspect(root: &Path) -> Inspection {
     let mut incompatible = Vec::new();
     let mut listed = std::collections::BTreeSet::new();
+    let mut primary_problem = inspect_file(root, "state.json");
+    let primary_valid = state_dir(root).join("state.json").is_file() && primary_problem.is_none();
     for name in MANAGED_STATE_FILES {
         // An unfinished save's temp is irrelevant while the committed state
         // is valid; otherwise it may be the only recoverable copy, so list it.
-        if name == INTERRUPTED_SAVE && committed_state_valid(root) {
+        if name == INTERRUPTED_SAVE && primary_valid {
             continue;
         }
-        let found = inspect_file(root, name).or_else(|| {
-            // A loadable temp is still listed: the next save would overwrite it.
+        let found = if name == "state.json" {
+            primary_problem.take()
+        } else {
+            inspect_file(root, name)
+        }
+        .or_else(|| {
+            // With no valid primary, loadable recovery copies also need explicit cleanup.
+            if name != INTERRUPTED_SAVE && (name != "state.backup.json" || primary_valid) {
+                return None;
+            }
             let bytes = fs::read(state_dir(root).join(name)).ok()?;
-            (name == INTERRUPTED_SAVE)
-                .then(|| (Problem::InterruptedSave, Some(fingerprint(&bytes))))
+            Some((Problem::InterruptedSave, Some(fingerprint(&bytes))))
         });
         if let Some((problem, fingerprint)) = found {
             let relative = format!("data/{name}");
@@ -306,18 +311,6 @@ pub fn inspect(root: &Path) -> Inspection {
                 problem,
                 fingerprint,
             });
-        }
-    }
-    if !committed_state_valid(root) && inspect_file(root, "state.backup.json").is_none() {
-        if let Ok(bytes) = fs::read(state_dir(root).join("state.backup.json")) {
-            let relative = "data/state.backup.json".to_string();
-            if listed.insert(relative.clone()) {
-                incompatible.push(IncompatibleFile {
-                    relative,
-                    problem: Problem::InterruptedSave,
-                    fingerprint: Some(fingerprint(&bytes)),
-                });
-            }
         }
     }
     // The pre-redesign shared memory file is no longer imported. If it exists
@@ -377,41 +370,12 @@ pub(crate) fn load_legacy(directory: &Path) -> Result<State, String> {
         return Ok(State::default());
     }
     let bytes = fs::read(&path).map_err(|e| format!("数据文件无法读取：{e}"))?;
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("数据文件无法解析，保留原文件并停止加载：{e}"))?;
-    let object = value
-        .as_object()
-        .ok_or("数据文件根节点必须是对象，保留原文件并停止加载")?;
-    if let Some(error) = shape_error(object) {
-        return Err(format!(
-            "数据文件结构不兼容（{error}），保留原文件并停止加载；请通过启动清理入口处理 data/state.json"
-        ));
-    }
-    let Some(version) = object.get("schema_version") else {
-        return Err(format!(
-            "数据文件缺少 schema_version，当前版本不迁移旧数据；请通过启动清理入口处理 data/state.json"
-        ));
-    };
-    let version = version
-        .as_u64()
-        .filter(|version| *version > 0)
-        .ok_or("数据文件 schema_version 无效，停止加载")?;
-    if version != u64::from(STATE_SCHEMA_VERSION) {
-        return Err(format!(
-            "数据文件 schema_version {version} 不受支持（当前 {}），停止加载",
-            STATE_SCHEMA_VERSION
-        ));
-    }
-    let state = decode_state(value).map_err(|e| {
+    decode_legacy(&bytes).map_err(|problem| {
         format!(
-            "数据文件结构不兼容，保留原文件并停止加载：{e}；请通过启动清理入口处理 data/state.json"
+            "数据文件不兼容（{}），保留原文件并停止加载；请通过启动清理入口处理 data/state.json",
+            problem.label()
         )
-    })?;
-    state
-        .work_scheduler
-        .validate()
-        .map_err(|e| format!("数据文件嵌套状态版本不兼容，停止加载：{e}"))?;
-    Ok(state)
+    })
 }
 
 fn resolve_managed(root: &Path, relative: &str) -> Result<PathBuf, String> {
@@ -675,31 +639,51 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn missing_version_unsupported_version_and_structure_are_distinct() {
+    fn inspection_and_loading_reject_missing_versions_and_malformed_state() {
         let root = root();
-        write_state(&root, json!({"tasks":[]}));
-        assert_eq!(
-            inspect(&root).incompatible[0].problem,
-            Problem::MissingVersion
-        );
-        write_state(&root, json!({"schema_version":99}));
-        assert_eq!(
-            inspect(&root).incompatible[0].problem,
-            Problem::UnsupportedVersion(99)
-        );
-        write_state(
-            &root,
-            json!({"schema_version":1,"tasks":[{"sources":["old"]}]}),
-        );
-        assert!(matches!(
-            inspect(&root).incompatible[0].problem,
-            Problem::Structural(_)
-        ));
-        write_state(&root, json!({"schema_version":1,"config":[],"tasks":[]}));
-        assert!(matches!(
-            inspect(&root).incompatible[0].problem,
-            Problem::Structural(_)
-        ));
+        let base = json!(State::default());
+        let mut cases = vec![
+            (json!({"tasks":[]}), Problem::MissingVersion),
+            (
+                json!({"schema_version":99}),
+                Problem::UnsupportedVersion(99),
+            ),
+            (json!([]), Problem::Structural("根节点必须是对象".into())),
+        ];
+        for key in [
+            "config",
+            "tasks",
+            "messages",
+            "analysis_memory",
+            "work_scheduler",
+            "tag_state",
+            "audit",
+            "suggestions",
+        ] {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().remove(key);
+            cases.push((value, Problem::Structural(format!("缺少必填段 {key}"))));
+        }
+        for (key, message) in [
+            ("id", "任务记录缺少非空 id"),
+            ("title", "任务记录缺少 title"),
+            ("evidence", "任务记录缺少当前 evidence 结构"),
+            ("tags", "任务记录缺少 tags 数组"),
+        ] {
+            let mut value = base.clone();
+            value["tasks"] = json!([{"id":"t","title":"合成事项","evidence":{},"tags":[]}]);
+            value["tasks"][0].as_object_mut().unwrap().remove(key);
+            cases.push((value, Problem::Structural(message.into())));
+        }
+        let mut invalid = base.clone();
+        invalid["config"] = json!([]);
+        cases.push((invalid, Problem::Structural("config 必须是对象".into())));
+        for (value, expected) in cases {
+            write_state(&root, value);
+            assert_eq!(inspect(&root).incompatible[0].problem, expected);
+            assert!(load_state(&root).err().unwrap().contains(&expected.label()));
+            assert!(root.join("data/state.json").is_file());
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -711,12 +695,7 @@ mod tests {
         state.config.classify_prompt = "保留的自定义提示词".into();
         state.messages.insert(
             "m".into(),
-            crate::model::Message {
-                id: "m".into(),
-                text: "合成消息".into(),
-                time: now(),
-                ..Default::default()
-            },
+            crate::test_support::message("m", "合成消息", now()),
         );
         fs::create_dir_all(root.join("data")).unwrap();
         fs::write(
@@ -821,25 +800,6 @@ mod tests {
     }
 
     #[test]
-    fn required_sections_and_task_ids_are_not_silently_defaulted() {
-        let root = root();
-        write_state(&root, json!({"schema_version":1}));
-        assert!(matches!(
-            inspect(&root).incompatible[0].problem,
-            Problem::Structural(_)
-        ));
-        write_state(
-            &root,
-            json!({"schema_version":1,"config":{},"messages":{},"tasks":[{"title":"无 id"}]}),
-        );
-        assert!(matches!(
-            inspect(&root).incompatible[0].problem,
-            Problem::Structural(_)
-        ));
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn cleanup_rechecks_content_identity_before_deleting() {
         let root = root();
         write_state(&root, json!({"tasks":[]}));
@@ -938,11 +898,20 @@ mod tests {
         assert_eq!(names(&root), vec!["data/state.next.json"]);
         assert!(startup_with(&root, false, |_| false).is_err());
         assert!(root.join("data/state.next.json").exists());
+        fs::write(root.join("data/state.backup.json"), &candidate).unwrap();
+        assert_eq!(
+            names(&root),
+            vec!["data/state.backup.json", "data/state.next.json"]
+        );
         // Invalid primary: both listed; confirming backs both up first.
         fs::write(root.join("data/state.json"), b"not json").unwrap();
         assert_eq!(
             names(&root),
-            vec!["data/state.json", "data/state.next.json"]
+            vec![
+                "data/state.json",
+                "data/state.backup.json",
+                "data/state.next.json"
+            ]
         );
         assert!(startup_with(&root, false, |_| true).is_ok());
         let archived = fs::read_dir(root.join("data/legacy"))
@@ -953,6 +922,10 @@ mod tests {
             .path();
         assert_eq!(
             fs::read(archived.join("state.next.json")).unwrap(),
+            candidate
+        );
+        assert_eq!(
+            fs::read(archived.join("state.backup.json")).unwrap(),
             candidate
         );
         assert_eq!(fs::read(archived.join("state.json")).unwrap(), b"not json");

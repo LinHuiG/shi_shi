@@ -82,7 +82,7 @@ function newModal(text = '', sources = []) {
 function formModal(t) {
   modalTask = structuredClone(t);
   setModal(
-    `<h2>${t.id ? '编辑事项' : '新建事项'}</h2>${t.id ? `<div class="schedule-natural"><label for="edit-instruction">一句话修改</label><textarea id="edit-instruction" maxlength="6000" rows="3" placeholder="例如：问题已定位，现在等测试验证，优先级改为高，截止时间延到明天17点。"></textarea><button data-action="ai-edit-task">AI 分析并更新</button>${help('仅修改当前事项，未涉及的内容保留；下方仍可手动编辑。')}</div>` : ''}<div class="form-group"><label>标题</label><input id="f-title" value="${esc(t.title)}"></div><div class="form-group"><label>描述</label><textarea id="f-description">${esc(t.description)}</textarea></div>${taskTagEditor(t, true)}<div class="cols"><div class="form-group"><label>状态</label><select id="f-status">${['待处理', '已完成', '无需处理', '已取消'].map((p) => `<option ${p === t.status ? 'selected' : ''}>${p}</option>`).join('')}</select></div></div><details class="task-other-settings" ${t.id && (t.due || t.blocker?.trim() || t.waiting_for?.trim()) ? 'open' : ''}><summary>其他设置</summary><div class="form-group"><label>截止时间</label><input id="f-due" type="datetime-local" value="${esc(localDue(t.due))}"></div><div class="form-group"><label>阻塞点</label><input id="f-blocker" value="${esc(t.blocker)}"></div><div class="form-group"><label>等待谁</label><input id="f-wait" value="${esc(t.waiting_for)}"></div></details><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="save-task">保存事项</button></div>`,
+    `<h2>${t.id ? '编辑事项' : '新建事项'}</h2>${t.id ? `<div class="schedule-natural"><label for="edit-instruction">一句话修改</label><textarea id="edit-instruction" maxlength="6000" rows="3" placeholder="例如：问题已定位，现在等测试验证，优先级改为高，截止时间延到明天17点。"></textarea><button data-action="ai-edit-task">AI 分析并更新</button>${help('仅修改当前事项，未涉及的内容保留；下方仍可手动编辑。')}</div>` : ''}<div class="form-group"><label>标题</label><input id="f-title" value="${esc(t.title)}"></div><div class="form-group"><label>描述</label><textarea id="f-description">${esc(t.description)}</textarea></div>${taskTagEditor(t, true)}<div class="form-group"><label>状态</label><input id="f-status" type="hidden" value="${esc(t.status || '待处理')}"><div class="task-status-choices" role="radiogroup" aria-label="状态">${['待处理', '处理中', '已完成', '无需处理', '已取消'].map(p => `<button type="button" role="radio" aria-checked="${p === (t.status || '待处理')}" tabindex="${p === (t.status || '待处理') ? 0 : -1}" data-task-status-value="${p}">${p}</button>`).join('')}</div></div><details class="task-other-settings" ${t.id && (t.due || t.blocker?.trim() || t.waiting_for?.trim()) ? 'open' : ''}><summary>其他设置</summary><div class="form-group"><label>截止时间</label><input id="f-due" type="datetime-local" value="${esc(localDue(t.due))}"></div><div class="form-group"><label>阻塞点</label><input id="f-blocker" value="${esc(t.blocker)}"></div><div class="form-group"><label>等待谁</label><input id="f-wait" value="${esc(t.waiting_for)}"></div></details><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="save-task">保存事项</button></div>`,
   );
 }
 function readTaskForm() {
@@ -138,4 +138,13 @@ document.addEventListener('input', (e) => {
     inboxQuery = e.target.value;
     renderInbox();
   }
+});
+
+document.addEventListener('keydown', e => {
+  const group = e.target.closest('.task-status-choices');
+  if (!group || !['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Home','End'].includes(e.key)) return;
+  e.preventDefault();
+  const buttons = [...group.querySelectorAll('button')], index = buttons.indexOf(e.target);
+  const next = e.key === 'Home' ? 0 : e.key === 'End' ? buttons.length-1 : (index + (['ArrowLeft','ArrowUp'].includes(e.key) ? -1 : 1) + buttons.length) % buttons.length;
+  buttons[next].click(); buttons[next].focus();
 });

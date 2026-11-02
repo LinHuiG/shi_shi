@@ -125,8 +125,6 @@ impl CredentialStore {
                 .get(connection_id)
                 .map(|entry| ResolvedCredential {
                     secret: entry.secret.clone(),
-                    source: CredentialSource::Dpapi,
-                    updated_unix: Some(entry.updated_unix),
                 }))
         })
     }
@@ -190,11 +188,7 @@ impl CredentialStore {
         validate_connection_id(connection_id)?;
         if let Some(name) = env_name {
             validate_env_name(name)?;
-            return Ok(read_environment(name)?.map(|value| ResolvedCredential {
-                secret: value,
-                source: CredentialSource::Environment,
-                updated_unix: None,
-            }));
+            return Ok(read_environment(name)?.map(|value| ResolvedCredential { secret: value }));
         }
         self.get(connection_id)
     }
@@ -362,15 +356,6 @@ pub enum CredentialSource {
     Environment,
 }
 
-impl CredentialSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Dpapi => "dpapi",
-            Self::Environment => "environment",
-        }
-    }
-}
-
 /// Non-secret status suitable for UI or logs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CredentialStatus {
@@ -384,21 +369,11 @@ pub struct CredentialStatus {
 /// point.
 pub struct ResolvedCredential {
     secret: String,
-    source: CredentialSource,
-    updated_unix: Option<u64>,
 }
 
 impl ResolvedCredential {
     pub fn expose_secret(&self) -> &str {
         &self.secret
-    }
-
-    pub fn source(&self) -> CredentialSource {
-        self.source
-    }
-
-    pub fn updated_unix(&self) -> Option<u64> {
-        self.updated_unix
     }
 }
 
@@ -478,13 +453,9 @@ impl CredentialError {
         }
     }
 
+    #[cfg(test)]
     pub fn kind(&self) -> CredentialErrorKind {
         self.kind
-    }
-
-    /// Optional native error code, safe for diagnostics.
-    pub fn os_code(&self) -> Option<u32> {
-        self.os_code
     }
 }
 
@@ -504,18 +475,11 @@ impl fmt::Display for CredentialError {
 
 impl std::error::Error for CredentialError {}
 
-#[derive(Serialize, Deserialize)]
-struct StoreData {
-    version: u32,
-    entries: BTreeMap<String, StoredEntry>,
-}
-
-impl Default for StoreData {
-    fn default() -> Self {
-        Self {
-            version: STORE_VERSION,
-            entries: BTreeMap::new(),
-        }
+shishi_api::default_struct! {
+    #[derive(Serialize, Deserialize)]
+    struct StoreData {
+        version: u32 = STORE_VERSION,
+        entries: BTreeMap<String, StoredEntry>,
     }
 }
 
@@ -783,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_and_status() {
+    fn stored_credentials_roundtrip_without_plaintext_or_public_secret_leaks() {
         let temp = TempDir::new("roundtrip");
         let store = CredentialStore::new(temp.path());
         assert_eq!(
@@ -803,48 +767,6 @@ mod tests {
         assert!(status.configured);
         assert_eq!(status.source, Some(CredentialSource::Dpapi));
         assert!(status.updated_unix.is_some());
-
-        let resolved = store
-            .get("connection-alpha")
-            .expect("read synthetic key")
-            .expect("credential exists");
-        assert_eq!(resolved.expose_secret(), SYNTHETIC_KEY);
-        assert_eq!(resolved.source(), CredentialSource::Dpapi);
-        assert_eq!(resolved.updated_unix(), status.updated_unix);
-
-        assert_eq!(
-            store
-                .status("connection-alpha", None)
-                .expect("status after set"),
-            status
-        );
-        assert!(store.delete("connection-alpha").expect("delete credential"));
-        assert!(store
-            .get("connection-alpha")
-            .expect("read deleted credential")
-            .is_none());
-        assert_eq!(
-            store
-                .status("connection-alpha", None)
-                .expect("status after delete"),
-            CredentialStatus {
-                configured: false,
-                source: None,
-                updated_unix: None,
-            }
-        );
-        assert!(!store
-            .delete("connection-alpha")
-            .expect("delete missing credential"));
-    }
-
-    #[test]
-    fn encrypted_bytes_do_not_contain_plaintext() {
-        let temp = TempDir::new("encrypted");
-        let store = CredentialStore::new(temp.path());
-        store
-            .set("connection-alpha", SYNTHETIC_KEY)
-            .expect("store synthetic key");
 
         let paths = files(temp.path());
         let mut names: Vec<String> = paths
@@ -874,15 +796,47 @@ mod tests {
                 path.display()
             );
         }
-    }
 
-    #[test]
-    fn dpapi_current_user_roundtrip() {
-        let ciphertext = protect(SYNTHETIC_KEY.as_bytes()).expect("DPAPI protect");
-        assert!(!ciphertext.is_empty());
-        assert!(find_bytes(&ciphertext, SYNTHETIC_KEY.as_bytes()).is_none());
-        let plaintext = unprotect(&ciphertext).expect("DPAPI unprotect");
-        assert_eq!(plaintext, SYNTHETIC_KEY.as_bytes());
+        let rendered = format!("{status:?}");
+        assert!(!rendered.contains(SYNTHETIC_KEY));
+
+        let error = store
+            .set("connection-alpha", "")
+            .expect_err("empty secret rejected");
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains(SYNTHETIC_KEY));
+        assert!(!rendered.contains("connection-alpha"));
+
+        let resolved = store
+            .get("connection-alpha")
+            .expect("read synthetic key")
+            .expect("credential exists");
+        assert_eq!(resolved.expose_secret(), SYNTHETIC_KEY);
+
+        assert_eq!(
+            store
+                .status("connection-alpha", None)
+                .expect("status after set"),
+            status
+        );
+        assert!(store.delete("connection-alpha").expect("delete credential"));
+        assert!(store
+            .get("connection-alpha")
+            .expect("read deleted credential")
+            .is_none());
+        assert_eq!(
+            store
+                .status("connection-alpha", None)
+                .expect("status after delete"),
+            CredentialStatus {
+                configured: false,
+                source: None,
+                updated_unix: None,
+            }
+        );
+        assert!(!store
+            .delete("connection-alpha")
+            .expect("delete missing credential"));
     }
 
     #[test]
@@ -912,7 +866,6 @@ mod tests {
             .expect("resolve environment")
             .expect("environment value exists");
         assert_eq!(resolved.expose_secret(), SYNTHETIC_ENV_KEY);
-        assert_eq!(resolved.source(), CredentialSource::Environment);
 
         std::env::remove_var(guard.name());
         let missing_status = store
@@ -952,7 +905,6 @@ mod tests {
             .expect("None selects DPAPI")
             .expect("DPAPI value exists");
         assert_eq!(dpapi_value.expose_secret(), SYNTHETIC_KEY);
-        assert_eq!(dpapi_value.source(), CredentialSource::Dpapi);
 
         // Even an unreadable DPAPI store must not affect an explicitly
         // selected environment. This proves the environment path does not
@@ -1229,24 +1181,6 @@ mod tests {
                 assert_eq!(resolved.expose_secret(), expected);
             }
         }
-    }
-
-    #[test]
-    fn status_and_errors_do_not_expose_secrets() {
-        let temp = TempDir::new("safe-status");
-        let store = CredentialStore::new(temp.path());
-        let status = store
-            .set("connection-theta", SYNTHETIC_KEY)
-            .expect("store synthetic key");
-        let rendered = format!("{status:?}");
-        assert!(!rendered.contains(SYNTHETIC_KEY));
-
-        let error = store
-            .set("connection-theta", "")
-            .expect_err("empty secret rejected");
-        let rendered = format!("{error} {error:?}");
-        assert!(!rendered.contains(SYNTHETIC_KEY));
-        assert!(!rendered.contains("connection-theta"));
     }
 
     fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {

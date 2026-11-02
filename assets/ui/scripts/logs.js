@@ -8,7 +8,7 @@ let logFilter = 'ai',
 let quickView = '';
 const fieldNames = {
   ai_timeout_seconds: 'AI调用超时',
-  deferred_until: '恢复显示时间',
+  deferred_until: '延后至',
   frequency: '重复频率',
   weekdays: '星期',
   time: '生成时间',
@@ -83,6 +83,33 @@ function usageCard(d) {
   const cached = u.cached_input_tokens ?? u.input_tokens_details?.cached_tokens;
   return `<div class="usage-chips">${u.partial ? '<span>已返回部分用量，后续未确认部分仍记为未知</span>' : ''}<span>总计 <b>${(u.input_tokens + u.output_tokens).toLocaleString()}</b></span><span>输入 ${u.input_tokens.toLocaleString()}</span><span>输出 ${u.output_tokens.toLocaleString()}</span>${Number.isFinite(u.reasoning_output_tokens ?? u.output_tokens_details?.reasoning_tokens) ? `<span>其中推理 ${(u.reasoning_output_tokens ?? u.output_tokens_details.reasoning_tokens).toLocaleString()}</span>` : ''}<span>缓存命中 ${cached == null ? '未提供' : cached.toLocaleString()}</span>${speed}</div>`;
 }
+function requestBatchSummary(detail) {
+  const batch=detail.batch;
+  if(!batch || typeof batch!=='object')return '';
+  const count=value=>Number.isSafeInteger(value)&&value>=0,
+    format=value=>value.toLocaleString('zh-CN'),
+    total=batch.total_input_chars ?? detail.input_sizes?.total_input_chars,
+    limit=batch.max_input_chars ?? detail.input_sizes?.max_input_chars,
+    parts=[];
+  // Only captured complete-request measurements may use a limit denominator.
+  // Old message budgets estimate available space; they are not request usage.
+  if(count(total))parts.push(`请求占用 ${format(total)}${count(limit)&&limit>0?'/'+format(limit):''} 字符`);
+  if(count(batch.selected))parts.push(`本批 ${batch.selected}${count(batch.pending)?'/'+batch.pending:''} 条`);
+  if(count(batch.message_chars))parts.push(`消息 ${format(batch.message_chars)} 字符`);
+  const reduced=Array.isArray(batch.reduced_by)?batch.reduced_by:[],reasons=[];
+  if(reduced.includes('reply_context'))reasons.push('精简引用摘录');
+  if(reduced.includes('task_summaries'))reasons.push('精简事项摘要');
+  if(reduced.includes('input_budget'))reasons.push('按完整请求输入上限缩批');
+  let adjustment='';
+  if(reasons.length){
+    const label=reduced.includes('input_budget')
+      ? count(batch.initial_selected)&&count(batch.selected)&&batch.initial_selected>batch.selected
+        ? `缩批 ${batch.initial_selected}→${batch.selected} 条（输入上限）` : '按输入上限缩批'
+      : reasons.length===1?reasons[0]:'精简引用和事项摘要';
+    adjustment=` · <span title="${esc(reasons.join('；'))}">${esc(label)}</span>`;
+  }
+  return (parts.length?' · '+esc(parts.join(' · ')):'')+adjustment;
+}
 function shanghaiLogDay() {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Shanghai',
@@ -120,6 +147,7 @@ async function renderLogs() {
     return;
   }
   if (request !== logRequest || page !== 'logs') return;
+  if(data?.revision){state.activity_day_revision=data.revision;renderedKey=viewKey(state,'logs');}
   const entries = Array.isArray(data?.rows) ? data.rows : [];
   logPage = data?.page || 1;
   renderLogShell(data, data?.day || day);
@@ -157,15 +185,12 @@ async function renderLogs() {
           ? '正在分析'
           : '分析开始 · 尚无结束记录';
       body =
-        (d.messages ? `本批 ${d.messages} 条消息` : '文本整理请求') +
-        ` · ${aiModelLabel(d)} · ${d.reasoning_effort || '默认'} 推理`;
+        (Number.isSafeInteger(d.batch?.selected)&&d.batch.selected>=0 ? '' : (d.messages ? `本批 ${d.messages} 条消息` : '文本整理请求')+' · ') +
+        `${aiModelLabel(d)} · ${d.reasoning_effort || '默认'} 推理`;
     }
     if (a.kind === 'ai_success') {
-      title = 'AI 分析完成';
+      title = d.analysis_degraded ? 'AI 返回降级结果 · 纠正后仍无结论' : d.kind === 'classify' ? 'AI 已返回分析结果' : 'AI 分析完成';
       body = `${aiModelLabel(d)} · ${d.reasoning_effort || '默认'} 推理 · ${Math.round(d.elapsed_ms / 1000)} 秒`;
-    }
-    if (['ai_start', 'ai_success'].includes(a.kind) && d.batch) {
-      body += ` · 本批 ${d.batch.selected}/${d.batch.pending} 条 · 消息体积 ${d.batch.message_chars}/${d.batch.message_budget_chars ?? d.batch.batch_limit_chars ?? '—'} 字符`;
     }
     if (a.kind === 'ai_cancelled') {
       title = 'AI 分析已中断';
@@ -188,13 +213,16 @@ async function renderLogs() {
       bad = true;
     }
     if (a.kind === 'analysis_result') {
-      title = '事项已更新';
+      const unchanged = d.applied === 0,
+        reason = typeof d.no_action_reason === 'string' ? d.no_action_reason.trim() : '';
+      title = d.analysis_degraded ? '分析降级接收 · 无事项变更' : unchanged ? '分析完成 · 无事项变更' : '事项已更新';
       body =
         `分析 ${d.processed} 条消息，新增或更新 ${d.applied} 个事项` +
-        (Number.isFinite(d.remaining) ? ` · 还有 ${d.remaining} 条等待分析` : '');
+        (Number.isFinite(d.remaining) ? ` · 还有 ${d.remaining} 条等待分析` : '') +
+        (unchanged && reason ? ` · ${reason}` : '');
     }
     if (
-      ['error', 'request_error', 'ai_failed', 'ai_rejected', 'generation_failed'].includes(a.kind)
+      ['error', 'request_error', 'ai_failed', 'ai_rejected', 'generation_failed', 'analysis_rejected'].includes(a.kind)
     ) {
       title =
         a.kind === 'ai_rejected'
@@ -203,7 +231,7 @@ async function renderLogs() {
             ? d.response_received
               ? 'AI 已返回 · 结果处理失败'
               : 'AI 分析失败'
-            : '操作未完成';
+            : a.kind === 'analysis_rejected' ? '分析结果未采用 · 消息保留待处理' : '操作未完成';
       body = typeof d === 'string' ? d : d.error || d.message || '请查看详细日志';
       bad = true;
     }
@@ -271,13 +299,14 @@ async function renderLogs() {
       };
       body += ' · 触发：' + (triggers[d.trigger] || d.trigger);
     }
-    const task = state.tasks.find((t) => t.id === (a.task_id || d.task_id));
+    const batch=['ai_start','ai_success','ai_failed','ai_cancelled','ai_rejected'].includes(a.kind)?requestBatchSummary(d):'',
+      task = state.tasks.find((t) => t.id === (a.task_id || d.task_id));
     const tokenLine =
       ['ai_success', 'ai_failed', 'ai_cancelled'].includes(a.kind) || a.kind === 'handling_round'
         ? `<div class="event-description">${a.kind === 'ai_failed' ? esc(aiModelLabel(d) + ' · ' + (d.reasoning_effort || '默认') + ' 推理 · ' + Math.round((d.elapsed_ms || 0) / 1000) + ' 秒') : ''}</div>` +
           usageCard(d)
         : '';
-    return `<article data-event-key="${esc(a.index ?? a.id ?? String(a.time) + ':' + a.kind + ':' + (a.task_id || ''))}" class="event ${bad ? 'event-error' : ''}"><div class="event-dot"></div><div class="event-content"><div class="event-heading"><b>${esc(title)}</b><time>${esc(date(a.time))}</time>${a.audit && ['manual_edit', 'manual_status', 'manual_ai_edit', 'merge'].includes(a.kind) ? `<button class="quiet" data-undo="${a.index}">撤销</button>` : ''}</div>${task ? `<div class="event-task">${a.task_number ? `#${esc(a.task_number)} ` : ''}${esc(task.title)}</div>` : ''}<div class="event-description">${esc(body)}</div>${tokenLine}${d.thread_id && ['codex', 'dsh'].includes(d.source?.driver) ? `<button class="quiet" data-analysis-session="${esc(d.thread_id)}" data-session-driver="${esc(d.source.driver)}">${d.source.driver === 'dsh' ? '在 DSH 查看会话' : '在 Codex 查看'} ↗</button>` : ''}${d.run_id && a.kind.startsWith('tool_call_') ? `<button data-tool-log-run="${esc(d.run_id)}">查看调用详情</button>` : ''}${d.request_id && !a.kind.startsWith('tool_call_') && a.kind !== 'ai_rejected' ? `<button class="quiet" data-trace="${esc(d.request_id)}">查看提示词与输出 ↗</button>` : ''}${a.audit ? changeRows(a) : ''}</div></article>`;
+    return `<article data-event-key="${esc(a.index ?? a.id ?? String(a.time) + ':' + a.kind + ':' + (a.task_id || ''))}" class="event ${bad ? 'event-error' : ''}"><div class="event-dot"></div><div class="event-content"><div class="event-heading"><b>${esc(title)}</b><time>${esc(date(a.time))}</time>${a.audit && ['manual_edit', 'manual_status', 'manual_ai_edit', 'merge'].includes(a.kind) ? `<button class="quiet" data-undo="${a.index}">撤销</button>` : ''}</div>${task ? `<div class="event-task">${a.task_number ? `#${esc(a.task_number)} ` : ''}${esc(task.title)}</div>` : ''}<div class="event-description">${esc(body)}${batch}</div>${tokenLine}${d.thread_id && ['codex', 'dsh'].includes(d.source?.driver) ? `<button class="quiet" data-analysis-session="${esc(d.thread_id)}" data-session-driver="${esc(d.source.driver)}">${d.source.driver === 'dsh' ? '在 DSH 查看会话' : '在 Codex 查看'} ↗</button>` : ''}${d.run_id && a.kind.startsWith('tool_call_') ? `<button data-tool-log-run="${esc(d.run_id)}">查看调用详情</button>` : ''}${d.request_id && !a.kind.startsWith('tool_call_') && a.kind !== 'ai_rejected' ? `<button class="quiet" data-trace="${esc(d.request_id)}">查看提示词与输出 ↗</button>` : ''}${a.audit ? changeRows(a) : ''}</div></article>`;
   }
   setHtml(
     '#log-results',
@@ -285,13 +314,19 @@ async function renderLogs() {
   );
 }
 
+function logUsageContent() {
+  const u=state.usage;
+  return `<div><span>今日尝试调用</span><b>${u.calls}<small> / ${state.config.daily_calls}</small></b></div><div><span>已确认 tokens</span><b>${(u.input_tokens + u.output_tokens).toLocaleString()}</b></div><div><span>输入 / 输出</span><b style="font-size:16px">${u.input_tokens.toLocaleString()} <small>/</small> ${u.output_tokens.toLocaleString()}</b></div><div><span>已返回缓存命中</span><b>${u.cached_reports ? u.cached_input_tokens.toLocaleString() : '—'}</b></div>`;
+}
+function syncLogUsage() {
+  if(page==='logs' && $('.usage-line'))setHtml('.usage-line',logUsageContent());
+}
 function renderLogShell(data, day) {
-  const u = state.usage,
-    pages = data?.pages || 1,
+  const pages = data?.pages || 1,
     total = data?.total || 0;
   setHtml(
     '#view',
-    `<div class="activity-page"><div class="usage-line"><div><span>今日尝试调用</span><b>${u.calls}<small> / ${state.config.daily_calls}</small></b></div><div><span>已确认 tokens</span><b>${(u.input_tokens + u.output_tokens).toLocaleString()}</b></div><div><span>输入 / 输出</span><b style="font-size:16px">${u.input_tokens.toLocaleString()} <small>/</small> ${u.output_tokens.toLocaleString()}</b></div><div><span>已返回缓存命中</span><b>${u.cached_reports ? u.cached_input_tokens.toLocaleString() : '—'}</b></div></div><div class="activity-toolbar"><div class="log-view-controls"><div class="pills">${[
+    `<div class="activity-page"><div class="usage-line">${logUsageContent()}</div><div class="activity-toolbar"><div class="log-view-controls"><div class="pills">${[
       ['ai', 'AI 记录'],
       ['all', '全部记录'],
       ['changes', '事项变更'],

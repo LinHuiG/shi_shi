@@ -1,10 +1,10 @@
-const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-storage-settings-'));
 const model={model:'synthetic-model',displayName:'Synthetic model',supportedReasoningEfforts:[]};
 const fixture={config:{codex:'synthetic-codex.exe',codex_name:'Synthetic Codex',codex_models:[model],model:'synthetic-model',leaders:[],ai_connections:[{id:'dsh',driver:'dsh',name:'Synthetic DSH',executable:'synthetic-dsh.cmd',models:[model]},{id:'api',driver:'api',name:'Synthetic API',base_url:'https://api.example.com/v1',models:[model]}],analysis_workdir:'D:/Synthetic/existing-ai-workspace',interval_minutes:5,analysis_interval_minutes:30,analysis_lookback_hours:24,daily_calls:40,max_input_chars:60000,message_retention_days:90,work_start:'09:00',work_end:'18:00'},root:'D:/Synthetic/app',data_directory:'D:/Synthetic/old-data',tasks:[],schedules:[],messages:[],usage:{},activity:[],audit:[],reports:[],suggestions:[],chat_sources:[],handling:[],tag_state:{groups:[],filters:{}}};
 const mock=`window.fixture=${JSON.stringify(fixture)};window.requests=[];window.picked='D:/Synthetic/new-data';window.failStorage=false;window.ipc={postMessage(raw){const {id,method,params:p}=JSON.parse(raw);requests.push({method,p});setTimeout(()=>{let data=true;if(method==='state')data=fixture;if(method==='pick')data=picked;if(method==='models')data={models:[${JSON.stringify(model)}]};if(method==='settings_patch'){Object.assign(fixture.config,p);data={config:fixture.config};}if(method==='storage_change'&&failStorage){window.receive({id,ok:false,error:'Synthetic directory is occupied'});return;}window.receive({id,ok:true,data});},20)}};`;
 const html=require('../scripts/frontend.cjs').build().replace('<script>','<script>'+mock+'\n');
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{
+withBrowser(async(browser)=>{
  const errors=[];
  async function fresh(){const p=await browser.newPage({viewport:{width:1280,height:940}});p.on('pageerror',e=>errors.push(e.message));await p.setContent(html);await p.waitForFunction(()=>state?.config);await p.evaluate(()=>{page='settings';render();});return p;}
  const p=await fresh();let dialogs=0;p.on('dialog',async d=>{dialogs++;await d.dismiss();});
@@ -49,4 +49,4 @@ const html=require('../scripts/frontend.cjs').build().replace('<script>','<scrip
   await page.locator('[data-ai-cancel]').click();assert.equal(prompts,0,'explicit cancel discards without a prompt');await page.close();
  }
  assert.equal(dialogs,0);assert.deepEqual(errors,[]);console.log('PASS directory copy/switch/cancel, async errors, saved settings, hidden AI workdir, duplicate protection, and real drag selection for Codex/DSH/API. '+out);
-}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1});
+}).catch(e=>{console.error(e);process.exitCode=1});

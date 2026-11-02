@@ -99,9 +99,6 @@ function refreshHandlingAvailability() {
   const note = $('#handling-availability-note');
   if (note) note.hidden = !unavailable;
 }
-function readConnections() {
-  return structuredClone(state.config.ai_connections || []);
-}
 function connectionCard(c) {
   return `<article class="ai-connection" data-ai-connection="${esc(c.id)}"><div class="connection-summary"><b>${esc(c.name)}</b><span class="badge connection-driver" title="${esc(driverLabels[c.driver] || c.driver)}">${esc(driverLabels[c.driver] || c.driver)}</span><div class="connection-actions"><button data-ai-edit="${esc(c.id)}">编辑</button><button class="quiet" data-ai-remove="${esc(c.id)}">删除</button></div></div><div data-connection-editor="${esc(c.id)}"></div></article>`;
 }
@@ -192,10 +189,10 @@ function loadModels() {
     profileCatalogs[kind] = catalog;
     select.innerHTML =
       '<option value="">未配置</option>' +
-      catalog
+      modelLabels(catalog, connection?.name)
         .map(
-          (v) =>
-            `<option value="${esc(v.model)}">${esc(modelLabel({ ...v, providerName: v.providerName || v.provider || connection?.name }, catalog))}</option>`,
+          ({ m, label }) =>
+            `<option value="${esc(m.model)}">${esc(label)}</option>`,
         )
         .join('');
     if (previous && !catalog.some((v) => v.model === previous))
@@ -210,6 +207,5 @@ function loadModels() {
   }
   for (const el of document.querySelectorAll('.model-profile select:not([id$="effort"])'))
     el.title = el.selectedOptions[0]?.textContent || '';
-  modelCatalog = profileCatalogs.analysis || [];
   refreshHandlingAvailability();
 }

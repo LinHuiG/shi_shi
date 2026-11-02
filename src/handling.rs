@@ -1,6 +1,6 @@
 //! User-initiated investigations in durable Codex project conversations.
 use crate::{
-    ai_backend::{self, AgentSession, Connection, ContextTool},
+    ai_backend::{self, AgentEvent, AgentSession, AgentUpdate, Connection, ContextTool},
     context_mcp,
     engine::App,
     model::*,
@@ -9,6 +9,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    borrow::Cow,
     path::Path,
     sync::{Arc, MutexGuard, TryLockError},
     time::{Duration, Instant},
@@ -59,7 +60,7 @@ pub struct Round {
     pub started_at: Option<i64>,
     pub completed_at: Option<i64>,
     pub duration_ms: Option<i64>,
-    pub steps: Vec<Value>,
+    pub steps: crate::shared::Shared<Vec<Value>>,
     pub learned: bool,
     pub learning_fingerprint: String,
     pub learning_status: String,
@@ -109,7 +110,7 @@ pub struct Run {
     pub created: i64,
     pub updated: i64,
     pub synced: i64,
-    pub rounds: Vec<Round>,
+    pub rounds: crate::shared::Shared<Vec<crate::shared::Shared<Round>>>,
     pub requests: Vec<Value>,
     pub usage: Value,
     pub accounted_usage: Value,
@@ -126,25 +127,80 @@ pub struct Run {
 /// A preview is valid only against the durable run version it was derived from.
 pub(crate) struct Preview {
     pub base_updated: i64,
+    pub revision: u64,
+    pub changed_rounds: std::collections::BTreeSet<usize>,
     pub run: Run,
 }
 
-fn business_run(run: &Run) -> Value {
-    let mut value = json!(run);
-    let object = value.as_object_mut().unwrap();
-    for field in ["progress", "synced", "updated"] {
-        object.remove(field);
-    }
-    for round in value["rounds"].as_array_mut().unwrap() {
-        // Only changing text is transient. New items, tool lifecycle, approvals,
-        // conclusions, counters and round state still force an immediate save.
-        for step in round["steps"].as_array_mut().unwrap() {
-            if let Some(object) = step.as_object_mut() {
-                object.remove("text");
-            }
-        }
-    }
-    value
+// Exhaustive destructuring makes a newly added field require an explicit
+// durability decision. Compare borrowed values; never serialize stream text.
+macro_rules! same_fields {
+    ($ty:ident, $left:ident, $right:ident; $($field:ident),*; $($ignored:ident),*) => {{
+        let $ty { $($field: _,)* $($ignored: _,)* } = $left;
+        true $(&& $left.$field == $right.$field)*
+    }};
+}
+fn same_business_run(left: &Run, right: &Run) -> bool {
+    same_fields!(Run, left, right;
+        model_reported, input_revision, transport, requested_model, requested_effort,
+        waiting_on, stop_requested, connection, id, task_id, project_id, project_name,
+        cwd, thread_id, status, error, sync_notice, last_reported_model,
+        last_reported_effort, model, effort, policy_version, initial_prompt,
+        instructions, created, requests, usage, accounted_usage, watching,
+        desktop_control, handoff_at, handoff_turns, desktop_status, desktop_turn_id,
+        rollout_path, context_handoff_prepared;
+        progress, synced, updated, rounds
+    ) && (left.rounds.same_snapshot(&right.rounds)
+        || (left.rounds.len() == right.rounds.len()
+            && left
+                .rounds
+                .iter()
+                .zip(right.rounds.iter())
+                .all(|(left, right)| {
+                    left.same_snapshot(right)
+                        || (same_round_fields(left, right)
+                            && (left.steps.same_snapshot(&right.steps)
+                                || (left.steps.len() == right.steps.len()
+                                    && left.steps.iter().zip(right.steps.iter()).all(
+                                        |(a, b)| match (a.as_object(), b.as_object()) {
+                                            (Some(a), Some(b)) => {
+                                                a.keys().filter(|k| *k != "text").count()
+                                                    == b.keys().filter(|k| *k != "text").count()
+                                                    && a.iter().filter(|(k, _)| *k != "text").all(
+                                                        |(key, value)| b.get(key) == Some(value),
+                                                    )
+                                            }
+                                            _ => a == b,
+                                        },
+                                    ))))
+                })))
+}
+fn same_round_fields(left: &Round, right: &Round) -> bool {
+    same_fields!(Round, left, right;
+        not_submitted, usage, usage_accounted, reserved, supplements,
+        started_at, completed_at, duration_ms, learned,
+        learning_fingerprint, learning_status, id, question, turn_id,
+        status, conclusion, created; steps
+    )
+}
+pub(crate) fn same_round(
+    left: &crate::shared::Shared<Round>,
+    right: &crate::shared::Shared<Round>,
+) -> bool {
+    left.same_snapshot(right)
+        || (same_round_fields(left, right)
+            && (left.steps.same_snapshot(&right.steps) || left.steps == right.steps))
+}
+fn same_stream_text(left: &Run, right: &Run) -> bool {
+    left.progress == right.progress
+        && left.synced == right.synced
+        && left.updated == right.updated
+        && (left.rounds.same_snapshot(&right.rounds)
+            || left
+                .rounds
+                .iter()
+                .zip(right.rounds.iter())
+                .all(|(a, b)| a.steps.same_snapshot(&b.steps) || a.steps == b.steps))
 }
 pub fn initialize(s: &mut State) {
     // Older saves kept the active prompt only in the handling policy. Import
@@ -240,62 +296,29 @@ fn short(text: &str, limit: usize) -> String {
 fn context_note(token: &str) -> String {
     crate::prompt_config::get("handling_frame_context").replace("{context_token}", token)
 }
-fn usage(v: &Value) -> Value {
-    if v["inputTokens"].is_u64() && v["outputTokens"].is_u64() {
-        let mut out = json!({"input_tokens":v["inputTokens"],"output_tokens":v["outputTokens"]});
-        if v["cachedInputTokens"].is_u64() {
-            out["cached_input_tokens"] = v["cachedInputTokens"].clone();
-        }
-        out
-    } else {
-        Value::Null
-    }
-}
-
-fn apply_usage_event(run: &mut Run, event: &ai_backend::UsageEvent) {
-    if !event.usage.is_object() {
+fn apply_usage(run: &mut Run, turn: &str, input: u64, output: u64, cached: Option<u64>) {
+    let Some(round) = run.rounds.iter_mut().find(|r| r.turn_id == turn) else {
         return;
+    };
+    round.usage = json!({"input_tokens":input,"output_tokens":output});
+    if let Some(cached) = cached {
+        round.usage["cached_input_tokens"] = json!(cached);
     }
-    if event.usage["per_turn"] == true {
-        let value = usage(&event.usage["last"]);
-        if !value.is_object() {
-            return;
-        }
-        let Some(round) = run
+    let mut total = json!({});
+    for (raw, normalized) in [
+        ("inputTokens", "input_tokens"),
+        ("outputTokens", "output_tokens"),
+        ("cachedInputTokens", "cached_input_tokens"),
+    ] {
+        let mut values = run
             .rounds
-            .iter_mut()
-            .find(|r| Some(&r.turn_id) == event.turn_id.as_ref())
-        else {
-            return;
-        };
-        round.usage = value;
-        let mut total = json!({});
-        for (raw, normalized) in [
-            ("inputTokens", "input_tokens"),
-            ("outputTokens", "output_tokens"),
-            ("cachedInputTokens", "cached_input_tokens"),
-        ] {
-            let values = run
-                .rounds
-                .iter()
-                .filter_map(|r| r.usage[normalized].as_u64())
-                .collect::<Vec<_>>();
-            if !values.is_empty() {
-                total[raw] = json!(values.into_iter().fold(0u64, u64::saturating_add));
-            }
-        }
-        run.usage = json!({"last":event.usage["last"],"total":total});
-    } else {
-        run.usage = event.usage.clone();
-        if let Some(round) = run
-            .rounds
-            .iter_mut()
-            .rev()
-            .find(|r| event.turn_id.as_ref().is_none_or(|id| r.turn_id == *id))
-        {
-            round.usage = usage(&event.usage["last"]);
+            .iter()
+            .filter_map(|r| r.usage[normalized].as_u64());
+        if let Some(first) = values.next() {
+            total[raw] = json!(values.fold(first, u64::saturating_add));
         }
     }
+    run.usage = json!({"last":{"inputTokens":input,"outputTokens":output,"cachedInputTokens":cached},"total":total});
 }
 pub(crate) fn active(r: &Run) -> bool {
     matches!(
@@ -373,7 +396,7 @@ impl App {
             return Err("Codex 处置由桌面执行，禁止启动独立执行连接".into());
         }
         if run.desktop_control {
-            return self.handling_client(&connection);
+            return self.handling_client(connection);
         }
         let key = format!("run:{}", run.id);
         let mut cached = self.handling_client.lock().unwrap();
@@ -381,7 +404,7 @@ impl App {
             return Ok(c.clone());
         }
         #[cfg(not(test))]
-        let c = ai_backend::backend(&connection)?.agent(&connection)?;
+        let c = ai_backend::backend(connection)?.agent(connection)?;
         #[cfg(test)]
         let c = cached
             .get(&connection.cache_key())
@@ -404,13 +427,18 @@ impl App {
         }
     }
     fn handling_connection(&self) -> Result<Connection, String> {
-        ai_backend::connection(&self.state.lock().unwrap().config.for_kind("handling"))
+        let state = self.state.lock().unwrap();
+        ai_backend::connection_by_id(
+            &state.config,
+            state.config.model_choice("handling").connection_id,
+        )
+        .map(Cow::into_owned)
     }
-    fn run_connection(&self, run: &Run) -> Result<Connection, String> {
+    fn run_connection<'a>(&self, run: &'a Run) -> Result<&'a Connection, String> {
         // Every new run persists its connection snapshot. Never rebind a record
         // that lacks one to a newly selected provider.
         run.connection
-            .clone()
+            .as_ref()
             .ok_or_else(|| "该处置记录缺少连接快照，请重新开始处置".into())
     }
     fn update_run(&self, id: &str, apply: impl FnOnce(&mut Run)) -> Result<(), String> {
@@ -423,36 +451,59 @@ impl App {
         apply: impl FnOnce(&mut Run),
     ) -> Result<bool, String> {
         let mut lock = self.state.lock().unwrap();
-        let durable = lock
+        let position = lock
             .handling
             .runs
             .iter()
-            .find(|r| r.id == id)
+            .position(|r| r.id == id)
             .ok_or("处置记录不存在")?;
+        let durable = &lock.handling.runs[position];
         if durable.stop_requested {
             return Err(STOPPED.into());
         }
         let before = self.preview_run(durable);
         let mut after = before.clone();
         apply(&mut after);
-        if after == before && (preview || after == *durable) {
+        let same_business = same_business_run(&before, &after);
+        if same_business
+            && same_stream_text(&before, &after)
+            && (preview
+                || (same_business_run(&after, durable) && same_stream_text(&after, durable)))
+        {
             return Ok(false);
         }
         after.updated = now().max(durable.updated + 1);
-        if preview && business_run(&before) == business_run(&after) {
-            self.handling_previews.lock().unwrap().insert(
+        if preview && same_business {
+            let mut previews = self.handling_previews.lock().unwrap();
+            let mut changed_rounds = previews
+                .get(id)
+                .filter(|p| {
+                    p.base_updated == durable.updated
+                        && p.run.input_revision == durable.input_revision
+                })
+                .map(|p| p.changed_rounds.clone())
+                .unwrap_or_default();
+            for (index, (old, new)) in before.rounds.iter().zip(after.rounds.iter()).enumerate() {
+                if !same_round(old, new) {
+                    changed_rounds.insert(index);
+                }
+            }
+            let revision = self
+                .handling_preview_revision
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            previews.insert(
                 id.into(),
                 Preview {
                     base_updated: durable.updated,
+                    revision,
+                    changed_rounds,
                     run: after,
                 },
             );
-            self.handling_preview_revision
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Ok(true);
         }
         let mut next = lock.clone();
-        *next.handling.runs.iter_mut().find(|r| r.id == id).unwrap() = after.clone();
         let mut logs = vec![];
         for round in &after.rounds {
             let old = before.rounds.iter().find(|r| r.id == round.id);
@@ -477,9 +528,8 @@ impl App {
         if after.usage["total"]["inputTokens"].is_u64()
             && after.usage["total"]["outputTokens"].is_u64()
         {
-            let r = next.handling.runs.iter_mut().find(|r| r.id == id).unwrap();
-            r.accounted_usage = after.usage["total"].clone();
-            for round in &mut r.rounds {
+            after.accounted_usage = after.usage["total"].clone();
+            for round in &mut after.rounds {
                 if round.usage.is_object() && !round.usage_accounted {
                     round.usage_accounted = true;
                     if next.usage_day == date()
@@ -496,6 +546,7 @@ impl App {
                 }
             }
         }
+        next.handling.runs[position] = after;
         self.save(&next)?;
         *lock = next;
         self.handling_previews.lock().unwrap().remove(id);
@@ -630,9 +681,6 @@ impl App {
         data.retain(|project| seen.insert(str_at(project, "id").to_owned()));
         json!(data)
     }
-    pub fn handling_projects(&self) -> Result<Value, String> {
-        Ok(self.analysis_projects())
-    }
     fn handling_projects_for(&self, connection: &Connection) -> Result<Value, String> {
         let mut data = self.local_handling_projects()?;
         data.extend(self.native_handling_projects(connection)?);
@@ -671,29 +719,26 @@ impl App {
     }
     fn stop_previous_runs(&self, task_id: &str, confirmed: bool) -> Result<(), String> {
         // An explicit stop decision is required before creating another run.
-        let others = self
-            .state
-            .lock()
-            .unwrap()
-            .handling
-            .runs
+        let runs = self.state.lock().unwrap().handling.runs.clone();
+        for old in runs
             .iter()
             .filter(|r| r.task_id == task_id && active(r) && !r.thread_id.is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        for old in others {
-            if is_desktop(&old) {
+        {
+            if is_desktop(old) {
                 return Err("已有 Codex 处置，请先结束本次处置再新建；结束不会停止 Codex".into());
             }
             if !confirmed {
                 return Err("原处置尚未确认停止，请确认停止后重新处置".into());
             }
-            let client = self.run_client(&old)?;
+            let client = self.run_client(old)?;
             let turns = client.history(&old.thread_id)?;
-            for turn in turns["data"].as_array().ok_or("无法核实原处置状态")? {
-                if turn["status"] == "inProgress" {
-                    client.interrupt(&old.thread_id, str_at(turn, "id"))?;
-                }
+            if turns["data"]
+                .as_array()
+                .ok_or("无法核实原处置状态")?
+                .iter()
+                .any(|turn| turn["status"] == "inProgress")
+            {
+                client.interrupt(&old.thread_id)?;
             }
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
             loop {
@@ -850,9 +895,9 @@ impl App {
             }
         }
         self.stop_previous_runs(task_id, p["stop_previous"] == true)?;
-        self.reserve_ai(AiMode::Manual, None)?;
+        self.reserve_ai(AiMode::Manual)?;
         let mut run = Run {
-            connection: Some(connection.clone()),
+            connection: Some(connection.clone().into_owned()),
             id: id(),
             task_id: task.id.clone(),
             project_id: str_at(project, "id").into(),
@@ -882,13 +927,10 @@ impl App {
             run.initial_prompt = prompt.clone();
         }
         let config = context_config(self, &run)?;
-        {
-            let mut lock = self.state.lock().unwrap();
-            let mut next = lock.clone();
-            next.handling.runs.push(run.clone());
-            self.save(&next)?;
-            *lock = next;
-        }
+        self.commit_state(|s| {
+            s.handling.runs.push(run.clone());
+            Ok(())
+        })?;
         if connection.driver == "codex" {
             return self.desktop_start(
                 &run,
@@ -900,7 +942,7 @@ impl App {
         let result = (|| -> Result<Value, String> {
             let c = self.run_client(&run)?;
             self.ensure_run_open(&run.id)?;
-            let started = c.start(&run.cwd, &run.project_id, &config, &cfg)?;
+            let started = c.start(&config, &cfg)?;
             let thread = str_at(&started["thread"], "id");
             if thread.is_empty() {
                 return Err("所选接入未返回正式会话编号，请检查后再操作".into());
@@ -910,12 +952,6 @@ impl App {
                 r.status = "submitting".into();
                 r.model = str_at(&started, "model").into();
             })?;
-            if let Err(e) = c.rename(
-                thread,
-                &format!("拾事 · {}", task.title.chars().take(70).collect::<String>()),
-            ) {
-                self.log("handling_title", json!({"run":run.id,"error":e}));
-            }
             self.submit_turn(c.as_ref(), &run.id, thread, &prompt, &cfg)?;
             Ok(json!({"thread_id":thread,"run_id":run.id}))
         })();
@@ -942,14 +978,17 @@ impl App {
             r.status = "submitting".into();
             r.watching = true;
             r.error.clear();
-            r.rounds.push(Round {
-                id: round.clone(),
-                question: text.into(),
-                reserved: true,
-                created: now(),
-                status: "submitting".into(),
-                ..Default::default()
-            });
+            r.rounds.push(
+                Round {
+                    id: round.clone(),
+                    question: text.into(),
+                    reserved: true,
+                    created: now(),
+                    status: "submitting".into(),
+                    ..Default::default()
+                }
+                .into(),
+            );
         })?;
         let turn = match c.submit(thread, text, cfg, &round) {
             Ok(turn) => turn,
@@ -1046,38 +1085,15 @@ impl App {
         let c = self.run_client(&run)?;
         let turns = c.history(&run.thread_id)?;
         self.followup_target(&run)?;
-        if let Some(turn) = turns["data"]
+        if turns["data"]
             .as_array()
-            .and_then(|v| v.iter().find(|t| t["status"] == "inProgress"))
+            .is_some_and(|v| v.iter().any(|t| t["status"] == "inProgress"))
         {
-            let tid = str_at(turn, "id");
-            let input_id = id();
-            self.update_run(&run.id, |r| {
-                if let Some(round) = r.rounds.iter_mut().find(|v| v.turn_id == tid) {
-                    round.supplements.push(Supplement {
-                        id: input_id.clone(),
-                        text: text.into(),
-                        accepted: false,
-                        not_submitted: false,
-                    });
-                }
-            })?;
-            // Never retry an ambiguous steer as a new turn: it may already have been accepted.
-            c.steer(&run.thread_id, tid, text, &input_id)?;
-            self.update_run(&run.id, |r| {
-                if let Some(round) = r.rounds.iter_mut().find(|v| v.turn_id == tid) {
-                    if let Some(input) = round.supplements.iter_mut().find(|v| v.id == input_id) {
-                        input.accepted = true;
-                    }
-                }
-                r.watching = true;
-            })?;
-            self.log("handling_steer",json!({"task_id":run.task_id,"thread_id":run.thread_id,"turn_id":tid,"text":short(text,600)}));
-            return Ok(json!({"steered":true}));
+            return Err("Harness ACP 不支持运行中追加；请中断后发送后续说明".into());
         }
         let config = context_config(self, &run)?;
         c.resume(&run.thread_id, &config)?;
-        let mut cfg = self.reserve_ai(AiMode::Manual, None)?.for_kind("handling");
+        let mut cfg = self.reserve_ai(AiMode::Manual)?.for_kind("handling");
         let saved_connection = self.run_connection(&run)?;
         if ai_backend::connection(&cfg).ok().map(|c| c.cache_key())
             != Some(saved_connection.cache_key())
@@ -1103,21 +1119,14 @@ impl App {
         Ok(json!({"steered":false}))
     }
     pub fn handling_open(&self, thread: &str) -> Result<(), String> {
-        let run = self
-            .state
-            .lock()
-            .unwrap()
-            .handling
-            .runs
+        let runs = self.state.lock().unwrap().handling.runs.clone();
+        let run = runs
             .iter()
             .find(|r| r.thread_id == thread)
-            .cloned();
-        let connection = match run {
-            Some(run) => self.run_connection(&run)?,
-            None => return Err("该会话没有本地处置记录，无法确定连接快照".into()),
-        };
-        ai_backend::backend(&connection)?.open_session(thread)
+            .ok_or("该会话没有本地处置记录，无法确定连接快照")?;
+        ai_backend::backend(self.run_connection(run)?)?.open_session(thread)
     }
+
     pub fn handling_stream(&self) -> Result<bool, String> {
         if !self.handling_followups.lock().unwrap().is_empty() {
             return Ok(false);
@@ -1144,11 +1153,7 @@ impl App {
             }
             self.update_run_inner(&run.id, true, |r| {
                 for event in &events {
-                    if event.thread_id != r.thread_id {
-                        continue;
-                    }
-                    apply_notification(r, &event.notification);
-                    apply_usage_event(r, event);
+                    apply_event(r, event);
                 }
                 r.requests = requests;
                 r.synced = now();
@@ -1179,23 +1184,14 @@ impl App {
             .handling_action
             .try_lock()
             .map_err(|_| "正在同步或提交处置，请稍后再试")?;
-        let runs = self
-            .state
-            .lock()
-            .unwrap()
-            .handling
-            .runs
-            .iter()
-            .filter(|r| {
-                !r.stop_requested
-                    && !is_desktop(r)
-                    && (r.watching || task.is_some_and(|t| t == r.task_id))
-                    && !r.thread_id.is_empty()
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        for run in runs {
-            let c = match self.run_client(&run) {
+        let runs = self.state.lock().unwrap().handling.runs.clone();
+        for run in runs.iter().filter(|r| {
+            !r.stop_requested
+                && !is_desktop(r)
+                && (r.watching || task.is_some_and(|t| t == r.task_id))
+                && !r.thread_id.is_empty()
+        }) {
+            let c = match self.run_client(run) {
                 Ok(c) => c,
                 Err(error) => {
                     self.update_run(&run.id, |r| {
@@ -1211,34 +1207,16 @@ impl App {
                 let meta = c.read(&run.thread_id)?;
                 let turns = c.history(&run.thread_id)?;
                 let events = c.events();
-                let mut requests = c.requests(&run.thread_id);
-                enrich_requests(&mut requests, &turns["data"]);
+                let requests = c.requests(&run.thread_id);
                 self.update_run(&run.id, |r| {
                     r.requests = requests;
                     r.error.clear();
                     r.synced = now();
-                    for event in events
-                        .iter()
-                        .filter(|event| event.thread_id == run.thread_id)
-                    {
-                        apply_notification(r, &event.notification);
-                        apply_usage_event(r, event);
+                    for event in &events {
+                        apply_event(r, event);
                     }
                     apply_history(r, &turns["data"], &meta["thread"]);
                 })?;
-                let updated = self
-                    .state
-                    .lock()
-                    .unwrap()
-                    .handling
-                    .runs
-                    .iter()
-                    .find(|r| r.id == run.id)
-                    .cloned()
-                    .ok_or("处置记录不存在")?;
-                if !active(&updated) && updated.requests.is_empty() {
-                    let _ = c.unsubscribe(&run.thread_id);
-                }
                 Ok(())
             })();
             if let Err(error) = result {
@@ -1269,28 +1247,6 @@ impl App {
         }
         Self::ensure_local_control(&run)?;
         let c = self.run_client(&run)?;
-        let is_dsh = self.run_connection(&run)?.driver == "dsh";
-        // ACP resumes the persisted session id with its saved cwd. It cannot
-        // read an unloaded session before resume as Codex can.
-        let meta = if is_dsh {
-            json!({})
-        } else {
-            c.read(&run.thread_id)?
-        };
-        let same_project = if is_dsh {
-            true
-        } else if run.project_id.starts_with("local:") {
-            Path::new(str_at(&meta["thread"], "cwd"))
-                .canonicalize()
-                .ok()
-                .zip(Path::new(&run.cwd).canonicalize().ok())
-                .is_some_and(|(a, b)| a == b)
-        } else {
-            meta["thread"]["projectId"] == run.project_id
-        };
-        if !same_project {
-            return Err("该会话不属于本次选定的项目".into());
-        }
         let config = context_config(self, &run)?;
         let response = c.resume(&run.thread_id, &config)?;
         let turns = c.history(&run.thread_id)?;
@@ -1367,49 +1323,13 @@ impl App {
         let key = str_at(p, "request_id");
         let requests = c.requests(&run.thread_id);
         if str_at(p, "action") == "acceptAll" {
-            let ids = p["request_ids"]
-                .as_array()
-                .filter(|v| !v.is_empty() && v.len() <= 100)
-                .ok_or("缺少待批准请求清单")?;
-            let mut selected = Vec::new();
-            let mut seen = std::collections::BTreeSet::new();
-            for id in ids {
-                let key = id.as_str().ok_or("请求编号无效")?;
-                if !seen.insert(key) {
-                    return Err("请求清单包含重复项".into());
-                }
-                let request = requests
-                    .iter()
-                    .find(|v| v["id"].to_string() == key)
-                    .ok_or("请求已变化，请重新核对")?;
-                if ![
-                    "item/commandExecution/requestApproval",
-                    "item/fileChange/requestApproval",
-                    "item/permissions/requestApproval",
-                ]
-                .contains(&str_at(request, "method"))
-                {
-                    return Err("补充问题和外部服务请求不能批量批准".into());
-                }
-                crate::ai_backend::agent_approval::approval_result(
-                    request,
-                    &json!({"action":"accept"}),
-                )?;
-                selected.push((key, request));
-            }
-            for (key, request) in selected {
-                c.respond(&run.thread_id, key, request, &json!({"action":"accept"}))
-                    .map_err(|e| format!("批量批准未全部完成，请同步后核对剩余请求：{e}"))?;
-                self.log("handling_approval",json!({"run":run.id,"request":key,"method":request["method"],"action":"accept","batch":true}));
-            }
-            self.update_run(&run.id, |r| r.requests = c.requests(&run.thread_id))?;
-            return Ok(json!(true));
+            return Err("Harness 请求须逐项选择本次提供的授权选项".into());
         }
         let req = requests
             .iter()
             .find(|v| v["id"].to_string() == key)
             .ok_or("审批请求已失效，请同步")?;
-        c.respond(&run.thread_id, key, req, p)?;
+        c.respond(&run.thread_id, key, p)?;
         self.update_run(&run.id, |r| {
             r.requests.retain(|x| x["id"].to_string() != key);
             r.status = "inProgress".into();
@@ -1533,50 +1453,43 @@ impl App {
     }
 
     pub fn handling_adopt(&self, p: &Value) -> Result<Value, String> {
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        let base = crate::prompts::current(&s, "handling").unwrap().id.clone();
-        let proposal = s
-            .handling
-            .proposals
-            .iter_mut()
-            .find(|v| v.id == str_at(p, "id"))
-            .ok_or("建议不存在")?;
-        if proposal.base != base
-            || str_at(p, "expected") != base
-            || proposal.adopted
-            || proposal.rejected
-            || proposal.archived_at > 0
-            || proposal.prompt.trim().is_empty()
-        {
-            return Err("建议已失效，请重新生成或刷新后再采用".into());
-        }
-        let text = str_at(p, "prompt").trim();
-        if text.is_empty() || text.chars().count() > 20000 {
-            return Err("提示词应为 1–20000 字".into());
-        }
-        proposal.adopted = true;
-        let reason = proposal.reason.clone();
-        s.config.handling_prompt = text.into();
-        let version = crate::prompts::record(&mut s, "handling", text.into(), "adopt", &reason);
-        self.save(&s)?;
-        *lock = s;
-        Ok(json!(version))
+        self.commit_state(|s| {
+            let base = crate::prompts::current(s, "handling").unwrap().id.clone();
+            let proposal = s
+                .handling
+                .proposals
+                .iter_mut()
+                .find(|v| v.id == str_at(p, "id"))
+                .ok_or("建议不存在")?;
+            if proposal.base != base
+                || str_at(p, "expected") != base
+                || proposal.adopted
+                || proposal.rejected
+                || proposal.archived_at > 0
+                || proposal.prompt.trim().is_empty()
+            {
+                return Err("建议已失效，请重新生成或刷新后再采用".into());
+            }
+            let text = str_at(p, "prompt").trim();
+            if text.is_empty() || text.chars().count() > 20000 {
+                return Err("提示词应为 1–20000 字".into());
+            }
+            proposal.adopted = true;
+            let reason = proposal.reason.clone();
+            s.config.handling_prompt = text.into();
+            let version = crate::prompts::record(s, "handling", text.into(), "adopt", &reason);
+            Ok(json!(version))
+        })
     }
     pub fn handling_learn(&self) -> Result<Value, String> {
         let batch = learning_batch(&self.state.lock().unwrap());
-        if batch.evidence.is_empty() {
+        if batch.entries.is_empty() {
             return Ok(
                 json!({"unchanged":true,"reason":"没有可学习的结论或已接收纠正，不调用 AI；未完成材料保留，补全后可手动生成建议"}),
             );
         }
         let result = self.ask_ai("handling_learning", &batch.payload())?;
-        let mut lock = self.state.lock().unwrap();
-        let mut s = lock.clone();
-        let response = apply_learning(&mut s, &batch, &result)?;
-        self.save(&s)?;
-        *lock = s;
-        Ok(response)
+        self.commit_state(|s| apply_learning(s, &batch, &result))
     }
     pub fn handling_audit(&self, task: &str) -> Result<Value, String> {
         let r = self.run(task)?;
@@ -1594,16 +1507,14 @@ impl App {
     }
 }
 
-#[derive(Clone)]
-pub struct LearningBatch {
-    pub base: crate::model::PromptVersion,
-    pub evidence: Vec<Value>,
-    pub rounds: Vec<(String, String)>,
-    pub fingerprints: Vec<String>,
+struct LearningBatch {
+    base: crate::model::PromptVersion,
+    // The material contains its run/round ids; keep its version in the same entry.
+    entries: Vec<(Value, String)>,
 }
 impl LearningBatch {
-    pub fn payload(&self) -> Value {
-        json!({"current_prompt":self.base.content,"evidence":self.evidence,"note":"只含有实际结论或已接收纠正的已结束轮次；结论是 AI 调查意见，不等于人工确认。truncated_fields 列出实际截断的字段，missing_fields 列出缺失内容。只读所给材料，不提供补查工具。"})
+    fn payload(&self) -> Value {
+        json!({"current_prompt":self.base.content,"evidence":self.entries.iter().map(|(row, _)| row).collect::<Vec<_>>(),"note":"只含有实际结论或已接收纠正的已结束轮次；结论是 AI 调查意见，不等于人工确认。truncated_fields 列出实际截断的字段，missing_fields 列出缺失内容。只读所给材料，不提供补查工具。"})
     }
 }
 fn learning_material(s: &State, r: &Run, v: &Round) -> Option<(Value, String)> {
@@ -1662,12 +1573,10 @@ fn learning_material(s: &State, r: &Run, v: &Round) -> Option<(Value, String)> {
     Some((row, fingerprint))
 }
 
-pub fn learning_batch(s: &State) -> LearningBatch {
+fn learning_batch(s: &State) -> LearningBatch {
     let mut batch = LearningBatch {
         base: crate::prompts::current(s, "handling").unwrap().clone(),
-        evidence: vec![],
-        rounds: vec![],
-        fingerprints: vec![],
+        entries: vec![],
     };
     let mut candidates = s
         .handling
@@ -1681,7 +1590,7 @@ pub fn learning_batch(s: &State) -> LearningBatch {
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, v)| v.created);
-    let mut chars = 0;
+    let mut chars = 2;
     for (r, v) in candidates {
         let Some((row, fingerprint)) = learning_material(s, r, v) else {
             continue;
@@ -1690,22 +1599,16 @@ pub fn learning_batch(s: &State) -> LearningBatch {
         {
             continue;
         }
-        let n = row.to_string().chars().count();
-        if batch.evidence.len() >= 4 || chars + n > 6000 {
+        let n = json_chars(&row) + usize::from(!batch.entries.is_empty());
+        if chars + n > 6000 {
             break;
         }
         chars += n;
-        batch.evidence.push(row);
-        batch.rounds.push((r.id.clone(), v.id.clone()));
-        batch.fingerprints.push(fingerprint);
+        batch.entries.push((row, fingerprint));
     }
     batch
 }
-pub fn apply_learning(
-    s: &mut State,
-    batch: &LearningBatch,
-    result: &Value,
-) -> Result<Value, String> {
+fn apply_learning(s: &mut State, batch: &LearningBatch, result: &Value) -> Result<Value, String> {
     if crate::prompts::current(s, "handling").map(|v| &v.id) != Some(&batch.base.id) {
         return Err("处置提示词已改变，本批学习结果未应用".into());
     }
@@ -1722,33 +1625,36 @@ pub fn apply_learning(
     {
         return Err("学习结论说明无效".into());
     }
-    if batch.rounds.len() != batch.fingerprints.len() || batch.rounds.len() != batch.evidence.len()
-    {
-        return Err("学习材料版本记录无效".into());
-    }
-    for ((run, round), fingerprint) in batch.rounds.iter().zip(&batch.fingerprints) {
-        let current = s.handling.runs.iter().find(|r| &r.id == run).and_then(|r| {
-            r.rounds
+    let positions = batch
+        .entries
+        .iter()
+        .map(|(row, fingerprint)| {
+            let run = s
+                .handling
+                .runs
                 .iter()
-                .find(|v| &v.id == round)
-                .and_then(|v| learning_material(s, r, v))
-        });
-        if current.as_ref().map(|(_, fp)| fp) != Some(fingerprint) {
-            return Err("处置学习材料已变化，本次结果未应用".into());
-        }
-    }
+                .position(|r| r.id == str_at(row, "run_id"))?;
+            let current = &s.handling.runs[run];
+            let round = current
+                .rounds
+                .iter()
+                .position(|v| v.id == str_at(row, "id"))?;
+            let (_, current_fingerprint) = learning_material(s, current, &current.rounds[round])?;
+            (current_fingerprint == *fingerprint).then_some((run, round))
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or("处置学习材料已变化，本次结果未应用")?;
     let mut out = json!({"unchanged":true,"reason":result["reason"]});
     if improved {
         let prompt = str_at(result, "proposed_prompt").trim();
         if prompt.is_empty() || prompt.chars().count() > 20000 {
             return Err("建议提示词应为 1–20000 字".into());
         }
-        let evidence: Vec<String> =
-            serde_json::from_value(result["evidence_ids"].clone()).map_err(|e| e.to_string())?;
+        let evidence: Vec<String> = from_json(&result["evidence_ids"])?;
         if evidence.is_empty()
             || evidence
                 .iter()
-                .any(|id| !batch.evidence.iter().any(|e| e["id"] == *id))
+                .any(|id| !batch.entries.iter().any(|(e, _)| e["id"] == *id))
         {
             return Err("建议缺少有效处置依据".into());
         }
@@ -1767,99 +1673,47 @@ pub fn apply_learning(
         out = json!(proposal);
         s.handling.proposals.push(proposal);
     }
-    for ((run, round), fingerprint) in batch.rounds.iter().zip(&batch.fingerprints) {
-        if let Some(v) = s
-            .handling
-            .runs
-            .iter_mut()
-            .find(|r| &r.id == run)
-            .and_then(|r| r.rounds.iter_mut().find(|v| &v.id == round))
-        {
-            v.learned = true;
-            v.learning_fingerprint = fingerprint.clone();
-            v.learning_status = if !sufficient {
-                "insufficient"
-            } else if improved {
-                "suggested"
-            } else {
-                "unchanged"
-            }
-            .into();
+    for ((run, round), (_, fingerprint)) in positions.into_iter().zip(&batch.entries) {
+        let v = &mut s.handling.runs[run].rounds[round];
+        v.learned = true;
+        v.learning_fingerprint = fingerprint.clone();
+        v.learning_status = if !sufficient {
+            "insufficient"
+        } else if improved {
+            "suggested"
+        } else {
+            "unchanged"
         }
+        .into();
     }
     Ok(out)
 }
 
-fn apply_notification(run: &mut Run, event: &Value) {
-    if run.stop_requested {
+fn apply_event(run: &mut Run, event: &AgentEvent) {
+    if run.stop_requested || event.thread_id != run.thread_id {
         return;
     }
-    let p = &event["params"];
-    match str_at(event, "method") {
-        "item/agentMessage/delta" => {
-            let delta = str_at(p, "delta");
-            run.progress = short(&format!("{}{delta}", run.progress), 12000);
-            if let Some(round) = run
-                .rounds
-                .iter_mut()
-                .find(|r| r.turn_id == str_at(p, "turnId"))
-                .filter(|_| p["itemId"].is_string())
-            {
-                let item_id = p["itemId"].as_str().unwrap_or("agent-message");
-                if let Some(step) = round.steps.iter_mut().find(|s| s["id"] == item_id) {
-                    let text = short(&format!("{}{delta}", str_at(step, "text")), 12000);
+    match &event.update {
+        AgentUpdate::MessageDelta { item_id, text } => {
+            run.progress = short(&format!("{}{text}", run.progress), 12000);
+            if let Some(round) = run.rounds.iter_mut().find(|r| r.turn_id == event.turn_id) {
+                if let Some(step) = round.steps.iter_mut().find(|s| s["id"] == *item_id) {
+                    let text = short(&format!("{}{text}", str_at(step, "text")), 12000);
                     step["text"] = json!(text);
                     run.progress = text;
                 } else if round.steps.len() < 200 {
-                    round.steps.push(json!({"id":item_id,"kind":"agentMessage","status":"inProgress","text":delta}));
-                    run.progress = delta.into();
+                    round.steps.push(json!({"id":item_id,"kind":"agentMessage","status":"inProgress","text":text}));
+                    run.progress = text.clone();
                 }
             }
         }
-        "item/commandExecution/outputDelta" => {
-            if let Some(step) = run
-                .rounds
-                .iter_mut()
-                .find(|r| r.turn_id == str_at(p, "turnId"))
-                .and_then(|r| r.steps.iter_mut().find(|s| s["id"] == p["itemId"]))
-            {
-                let text = short(
-                    &format!("{}{}", str_at(step, "text"), str_at(p, "delta")),
-                    12000,
-                );
-                step["text"] = json!(text);
-                run.progress = text;
-            }
+        AgentUpdate::Completed(turn) => {
+            apply_turns(run, std::slice::from_ref(turn), &Value::Null, true);
         }
-        "turn/started" | "turn/completed" => {
-            let mut turn = p["turn"].clone();
-            if let Some(old) = run.rounds.iter().find(|r| r.turn_id == str_at(&turn, "id")) {
-                if turn["items"].as_array().is_none_or(|a| a.is_empty()) {
-                    // Preserve streamed visible steps when completion omits item bodies.
-                    turn["items"] = json!([]);
-                    let steps = old.steps.clone();
-                    let conclusion = old.conclusion.clone();
-                    apply_history(run, &json!([turn]), &Value::Null);
-                    if let Some(last) = run.rounds.last_mut() {
-                        last.steps = steps;
-                        last.conclusion = conclusion;
-                    }
-                    return;
-                }
-            }
-            apply_history(run, &json!([turn]), &Value::Null);
-        }
-        "item/started" | "item/completed" => {
-            if let Some(mut step) = process_step(&p["item"]) {
+        AgentUpdate::Item(item) => {
+            if let Some(mut step) = process_step(item) {
                 run.progress = step["text"].as_str().unwrap_or("").into();
-                if let Some(round) = run
-                    .rounds
-                    .iter_mut()
-                    .find(|r| r.turn_id == str_at(p, "turnId"))
-                {
-                    if p["item"]["type"] == "agentMessage" && p["item"]["phase"] == "final_answer" {
-                        round.conclusion = str_at(&p["item"], "text").into();
-                    }
+                if let Some(round) = run.rounds.iter_mut().find(|r| r.turn_id == event.turn_id) {
                     if let Some(old) = round.steps.iter_mut().find(|s| s["id"] == step["id"]) {
                         if str_at(&step, "text").is_empty() {
                             step["text"] = old["text"].clone();
@@ -1871,25 +1725,20 @@ fn apply_notification(run: &mut Run, event: &Value) {
                 }
             }
         }
-        "thread/status/changed" => {
-            if p["status"]["type"] == "active" {
-                run.status = "inProgress".into();
-            }
+        AgentUpdate::Usage {
+            input,
+            output,
+            cached,
+        } => {
+            apply_usage(run, &event.turn_id, *input, *output, *cached);
         }
-        _ => {}
     }
 }
 fn process_step(item: &Value) -> Option<Value> {
     let kind = str_at(item, "type");
     let text = match kind {
         "agentMessage" => str_at(item, "text").to_owned(),
-        "userMessage" => item["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|p| p["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        "userMessage" => user_text(item),
         "functionCall" => format!(
             "{}\n{}",
             str_at(item, "name"),
@@ -1929,24 +1778,37 @@ fn process_step(item: &Value) -> Option<Value> {
         json!({"id":item["id"],"kind":kind,"status":item["status"],"text":short(&text,6000),"duration_ms":item["durationMs"]}),
     )
 }
-fn enrich_requests(requests: &mut [Value], turns: &Value) {
-    for request in requests {
-        let p = &mut request["params"];
-        if let Some(item) = turns
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|t| t["id"] == p["turnId"])
-            .flat_map(|t| t["items"].as_array().into_iter().flatten())
-            .find(|i| i["id"] == p["itemId"])
-        {
-            for key in ["command", "cwd", "changes"] {
-                if p[key].is_null() && !item[key].is_null() {
-                    p[key] = item[key].clone();
-                }
+fn user_text(item: &Value) -> String {
+    item["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn history_item(item: &Value, desktop: bool) -> Cow<'_, Value> {
+    // Delegation is a visible input only in the desktop history. Borrow all
+    // other items instead of copying every turn to replace a few messages.
+    if desktop && item["type"] == "functionCallOutput" {
+        let raw = item["output"]
+            .as_str()
+            .or_else(|| item["output"]["text"].as_str())
+            .unwrap_or("");
+        if raw.starts_with("<codex_delegation>") {
+            if let Some(text) = raw
+                .find("<input>")
+                .zip(raw.rfind("</input>"))
+                .and_then(|(start, end)| raw.get(start + 7..end))
+            {
+                return Cow::Owned(
+                    json!({"type":"userMessage","id":item["id"],"origin":"delegation","content":[{"type":"text","text":text}]}),
+                );
             }
         }
     }
+    Cow::Borrowed(item)
 }
 fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
     if run.stop_requested {
@@ -1956,17 +1818,29 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
         run.error = "所选接入未返回轮次记录".into();
         return;
     };
-    // An adapter that only keeps history in memory returns no rows after a
-    // restart. In that case the application's persisted rounds are authoritative;
-    // never overwrite them with an empty adapter view.
-    if turns.is_empty() {
+    apply_turns(run, turns, thread, false);
+}
+
+fn apply_turns(run: &mut Run, turns: &[Value], thread: &Value, notification: bool) {
+    // An empty in-memory adapter history cannot erase persisted rounds.
+    let Some(latest) = turns.first() else {
         return;
-    }
+    };
     for turn in turns.iter().rev() {
         let tid = str_at(turn, "id");
         if tid.is_empty() {
             continue;
         }
+        let items = turn["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| history_item(item, is_desktop(run)))
+            .collect::<Vec<_>>();
+        let users = items
+            .iter()
+            .filter(|item| item["type"] == "userMessage")
+            .collect::<Vec<_>>();
         let known = run
             .rounds
             .iter()
@@ -1974,19 +1848,12 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                 r.turn_id == tid
                     || (r.turn_id.is_empty()
                         && !r.not_submitted
-                        && turn["items"].as_array().is_some_and(|items| {
-                            items.iter().any(|item| {
-                                item["type"] == "userMessage"
-                                    && item["content"].as_array().is_some_and(|parts| {
-                                        parts.iter().any(|part| part["text"] == r.question)
-                                    })
+                        && users.iter().any(|item| {
+                            item["content"].as_array().is_some_and(|parts| {
+                                parts.iter().any(|part| part["text"] == r.question)
                             })
                         }))
-                    || turn["items"].as_array().is_some_and(|items| {
-                        items
-                            .iter()
-                            .any(|item| item["type"] == "userMessage" && item["clientId"] == r.id)
-                    })
+                    || users.iter().any(|item| item["clientId"] == r.id)
             })
             .or_else(|| {
                 run.rounds.iter().rposition(|r| {
@@ -1997,16 +1864,22 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
         let index = if let Some(i) = known {
             i
         } else {
-            run.rounds.push(Round {
-                id: id(),
-                turn_id: tid.into(),
-                created: turn["startedAt"].as_i64().unwrap_or(0) * 1000,
-                ..Default::default()
-            });
+            run.rounds.push(
+                Round {
+                    id: id(),
+                    turn_id: tid.into(),
+                    created: turn["startedAt"].as_i64().unwrap_or(0) * 1000,
+                    ..Default::default()
+                }
+                .into(),
+            );
             run.rounds.len() - 1
         };
         let r = &mut run.rounds[index];
-        let previous_material = json!([r.question, r.conclusion, r.supplements]);
+        // A lifecycle notification may omit bodies already streamed for this
+        // exact turn. Preserve that turn, including when later turns exist.
+        let preserve = notification && items.is_empty() && known.is_some() && r.turn_id == tid;
+        let mut material_changed = false;
         r.turn_id = tid.into();
         r.status = str_at(turn, "status").into();
         r.started_at = turn["startedAt"]
@@ -2023,48 +1896,44 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                 .and_then(|(end, start)| end.checked_sub(start))
                 .filter(|v| *v >= 0)
         });
-        let previous_steps = std::mem::take(&mut r.steps);
-        let previous_ids: Vec<Value> = previous_steps.iter().map(|s| s["id"].clone()).collect();
-        r.steps = turn["items"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(process_step)
+        let mut steps = items
+            .iter()
+            .filter_map(|item| process_step(item))
             .take(200)
-            .collect();
+            .collect::<Vec<_>>();
         if r.status == "inProgress" || turn["_shishi_partial"] == true {
-            for previous in previous_steps {
-                if let Some(step) = r.steps.iter_mut().find(|s| s["id"] == previous["id"]) {
+            for previous in r.steps.iter() {
+                if let Some(step) = steps.iter_mut().find(|s| s["id"] == previous["id"]) {
                     let old = str_at(&previous, "text");
                     let next = str_at(step, "text");
                     if old.len() > next.len() && old.starts_with(next) {
                         step["text"] = json!(old);
                     }
-                } else if r.steps.len() < 200 {
-                    r.steps.push(previous);
+                } else if steps.len() < 200 {
+                    steps.push(previous.clone());
                 }
             }
         }
         if turn["_shishi_partial"] == true {
-            r.steps.sort_by_key(|s| {
-                previous_ids
+            steps.sort_by_cached_key(|s| {
+                r.steps
                     .iter()
-                    .position(|id| *id == s["id"])
+                    .position(|old| old["id"] == s["id"])
                     .unwrap_or(usize::MAX)
             });
         }
-        if r.status != "completed" {
+        if !preserve && *r.steps != steps {
+            r.steps = steps.into();
+        }
+        if preserve {
+            run.progress.clear();
+        } else if r.status != "completed" {
+            material_changed = !r.conclusion.is_empty();
             r.conclusion.clear();
         }
-        if let Some(items) = turn["items"].as_array() {
-            for item in items.iter().filter(|i| i["type"] == "userMessage").skip(1) {
-                let text = item["content"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|i| i["text"].as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n");
+        if turn["items"].is_array() {
+            for item in users.iter().skip(1) {
+                let text = user_text(item);
                 if text.is_empty() {
                     continue;
                 }
@@ -2078,8 +1947,10 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                     .iter_mut()
                     .find(|v| v.id == iid || v.text == text)
                 {
+                    material_changed |= !input.accepted;
                     input.accepted = true;
-                } else if !r.supplements.iter().any(|v| v.text == text) {
+                } else {
+                    material_changed = true;
                     r.supplements.push(Supplement {
                         id: iid,
                         text,
@@ -2089,15 +1960,15 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                 }
             }
             if r.question.is_empty() {
-                r.question = items
+                r.question = users
                     .iter()
-                    .filter(|i| i["type"] == "userMessage")
                     .flat_map(|i| i["content"].as_array().into_iter().flatten())
                     .filter_map(|i| i["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n");
+                material_changed |= !r.question.is_empty();
             }
-            if r.status == "completed" {
+            if r.status == "completed" && !preserve {
                 let conclusion = items
                     .iter()
                     .filter(|i| i["type"] == "agentMessage" && i["phase"] != "commentary")
@@ -2108,44 +1979,39 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
                     || !r.conclusion.starts_with(&conclusion)
                     || conclusion.len() >= r.conclusion.len()
                 {
+                    material_changed |= r.conclusion != conclusion;
                     r.conclusion = conclusion;
                 }
             }
         }
-        if r.learning_fingerprint.is_empty()
-            && previous_material != json!([r.question, r.conclusion, r.supplements])
-        {
+        if r.learning_fingerprint.is_empty() && material_changed {
             r.learned = false;
         }
     }
-    if let Some(latest) = turns.first() {
-        run.status = str_at(latest, "status").into();
-        run.error = latest["error"]["message"].as_str().unwrap_or("").into();
-        if let Some(items) = latest["items"].as_array() {
-            run.progress = items
-                .iter()
-                .rev()
-                .find_map(|i| match str_at(i, "type") {
-                    "agentMessage" if i["phase"] == "commentary" => {
-                        i["text"].as_str().map(|s| s.chars().take(1500).collect())
-                    }
-                    "commandExecution" => Some(format!(
-                        "{}：{}",
-                        str_at(i, "status"),
-                        str_at(i, "command").chars().take(500).collect::<String>()
-                    )),
-                    "mcpToolCall" => Some(format!(
-                        "{}：{} / {}",
-                        str_at(i, "status"),
-                        str_at(i, "server"),
-                        str_at(i, "tool")
-                    )),
-                    _ => None,
-                })
-                .unwrap_or_default();
-        }
-    } else if run.status != "starting" && run.status != "uncertain" {
-        run.status = "idle".into();
+    run.status = str_at(latest, "status").into();
+    run.error = latest["error"]["message"].as_str().unwrap_or("").into();
+    if let Some(items) = latest["items"].as_array() {
+        run.progress = items
+            .iter()
+            .rev()
+            .find_map(|i| match str_at(i, "type") {
+                "agentMessage" if i["phase"] == "commentary" => {
+                    i["text"].as_str().map(|s| s.chars().take(1500).collect())
+                }
+                "commandExecution" => Some(format!(
+                    "{}：{}",
+                    str_at(i, "status"),
+                    str_at(i, "command").chars().take(500).collect::<String>()
+                )),
+                "mcpToolCall" => Some(format!(
+                    "{}：{} / {}",
+                    str_at(i, "status"),
+                    str_at(i, "server"),
+                    str_at(i, "tool")
+                )),
+                _ => None,
+            })
+            .unwrap_or_default();
     }
     if thread["status"]["type"] == "active" {
         run.status = "inProgress".into();
@@ -2168,7 +2034,6 @@ fn apply_history(run: &mut Run, data: &Value, thread: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai_backend::agent_approval::approval_result;
     #[test]
     fn legacy_desktop_owner_does_not_display_the_old_handoff_interrupt() {
         let mut state = State::default();
@@ -2180,7 +2045,9 @@ mod tests {
                 turn_id: "old".into(),
                 status: "interrupted".into(),
                 ..Default::default()
-            }],
+            }
+            .into()]
+            .into(),
             ..Default::default()
         });
         initialize(&mut state);
@@ -2191,8 +2058,7 @@ mod tests {
     }
     #[test]
     fn switching_sources_restores_each_original_conversation() {
-        let root = std::env::temp_dir().join(format!("shishi-source-switch-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-source-switch");
         let codex = Connection {
             id: "codex-fixture".into(),
             ..Connection::default()
@@ -2227,8 +2093,6 @@ mod tests {
         app.state.lock().unwrap().config.selected_connection = codex.id;
         assert_eq!(app.run("task").unwrap().thread_id, "codex-session");
         assert_eq!(app.state.lock().unwrap().handling.runs.len(), 2);
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn known_pre_submission_failure_is_restartable_but_unknown_submission_is_not() {
@@ -2237,11 +2101,14 @@ mod tests {
             ..Default::default()
         };
         assert!(can_restart(&run));
-        run.rounds.push(Round {
-            status: "failed".into(),
-            not_submitted: true,
-            ..Default::default()
-        });
+        run.rounds.push(
+            Round {
+                status: "failed".into(),
+                not_submitted: true,
+                ..Default::default()
+            }
+            .into(),
+        );
         assert!(can_restart(&run));
         run.rounds[0].not_submitted = false;
         assert!(!can_restart(&run));
@@ -2250,8 +2117,7 @@ mod tests {
     }
     #[test]
     fn dsh_default_workdir_selection_does_not_launch_or_create_a_directory() {
-        let root = std::env::temp_dir().join(format!("shishi-project-default-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("shishi-project-default");
         let connection = Connection {
             driver: "dsh".into(),
             executable: "missing-launcher.cmd".into(),
@@ -2261,8 +2127,6 @@ mod tests {
         assert_eq!(rows[0]["id"], "local:ai-workdir");
         assert_eq!(rows[0]["default"], true);
         assert!(!root.join("data/ai-work").exists());
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn per_turn_usage_survives_restart_and_duplicate_events_without_double_counting() {
@@ -2272,26 +2136,47 @@ mod tests {
                     turn_id: "old".into(),
                     usage: json!({"input_tokens":10,"output_tokens":2}),
                     ..Default::default()
-                },
+                }
+                .into(),
                 Round {
                     turn_id: "new".into(),
                     ..Default::default()
-                },
-            ],
+                }
+                .into(),
+            ]
+            .into(),
             ..Default::default()
         };
-        let event = ai_backend::UsageEvent {
-            notification: Value::Null,
-            thread_id: "thread".into(),
-            turn_id: Some("new".into()),
-            usage: json!({"per_turn":true,"last":{"inputTokens":20,"outputTokens":4,"cachedInputTokens":3}}),
+        let mut event = AgentEvent {
+            thread_id: run.thread_id.clone(),
+            turn_id: "new".into(),
+            update: AgentUpdate::Usage {
+                input: 20,
+                output: 4,
+                cached: Some(3),
+            },
         };
-        apply_usage_event(&mut run, &event);
-        apply_usage_event(&mut run, &event);
+        apply_event(&mut run, &event);
+        apply_event(&mut run, &event);
         assert_eq!(run.usage["total"]["inputTokens"], 30);
         assert_eq!(run.usage["total"]["outputTokens"], 6);
         assert_eq!(run.rounds[1].usage["input_tokens"], 20);
         assert_eq!(run.usage["total"]["cachedInputTokens"], 3);
+        event.update = AgentUpdate::Usage {
+            input: 20,
+            output: 4,
+            cached: None,
+        };
+        apply_event(&mut run, &event);
+        assert!(run.rounds[1].usage.get("cached_input_tokens").is_none());
+        assert!(run.usage["total"].get("cachedInputTokens").is_none());
+        let before = json!(run);
+        event.turn_id = "unknown".into();
+        apply_event(&mut run, &event);
+        event.turn_id = "new".into();
+        event.thread_id = "another-thread".into();
+        apply_event(&mut run, &event);
+        assert_eq!(json!(run), before);
     }
 
     #[test]
@@ -2331,27 +2216,31 @@ mod tests {
                 conclusion: "已核对合成证据".into(),
                 status: "completed".into(),
                 ..Default::default()
-            }],
+            }
+            .into()]
+            .into(),
             ..Default::default()
         });
         let batch = learning_batch(&s);
-        assert_eq!(batch.evidence.len(), 1);
-        assert!(batch.evidence[0]["question"]
+        assert_eq!(batch.entries.len(), 1);
+        assert!(batch.entries[0].0["question"]
             .as_str()
             .unwrap()
             .contains("合成事项摘要"));
         assert!(!batch.payload().to_string().contains("协议正文不应重复发送"));
-        assert_eq!(batch.evidence[0]["truncated"], false);
+        assert_eq!(batch.entries[0].0["truncated"], false);
         s.handling.runs[0].rounds[0].conclusion = "证".repeat(1500);
         let batch = learning_batch(&s);
-        assert_eq!(batch.evidence[0]["truncated"], true);
-        assert_eq!(batch.evidence[0]["truncated_fields"], json!(["conclusion"]));
+        assert_eq!(batch.entries[0].0["truncated"], true);
+        assert_eq!(
+            batch.entries[0].0["truncated_fields"],
+            json!(["conclusion"])
+        );
     }
 
     #[test]
     fn learning_skips_empty_interruptions_and_rechecks_changed_material_only() {
-        let root = std::env::temp_dir().join(format!("shishi-learning-empty-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (_root, app) = crate::test_support::scoped_app("shishi-learning-empty");
         {
             let mut s = app.state.lock().unwrap();
             s.handling.runs.push(Run {
@@ -2361,7 +2250,9 @@ mod tests {
                     status: "interrupted".into(),
                     question: "只有问题".into(),
                     ..Default::default()
-                }],
+                }
+                .into()]
+                .into(),
                 ..Default::default()
             });
         }
@@ -2374,7 +2265,7 @@ mod tests {
             ..Default::default()
         });
         let batch = learning_batch(&s);
-        assert_eq!(batch.evidence.len(), 1);
+        assert_eq!(batch.entries.len(), 1);
         apply_learning(
             &mut s,
             &batch,
@@ -2382,10 +2273,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.handling.runs[0].rounds[0].learning_status, "insufficient");
-        assert!(learning_batch(&s).evidence.is_empty());
+        assert!(learning_batch(&s).entries.is_empty());
         s.handling.runs[0].rounds[0].conclusion = "补全的实际结论".into();
         let next = learning_batch(&s);
-        assert_eq!(next.evidence.len(), 1);
+        assert_eq!(next.entries.len(), 1);
         assert!(apply_learning(
             &mut s,
             &batch,
@@ -2399,10 +2290,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.handling.runs[0].rounds[0].learning_status, "unchanged");
-        assert!(learning_batch(&s).evidence.is_empty());
+        assert!(learning_batch(&s).entries.is_empty());
         drop(s);
-        drop(app);
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2418,7 +2307,9 @@ mod tests {
                 status: "completed".into(),
                 conclusion: "合成结论".into(),
                 ..Default::default()
-            }],
+            }
+            .into()]
+            .into(),
             ..Default::default()
         });
         let batch = learning_batch(&s);
@@ -2446,20 +2337,26 @@ mod tests {
             ..Default::default()
         };
         for i in 0..1000 {
-            run.rounds.push(Round {
-                id: format!("round-{i}"),
-                created: i,
-                status: if i == 0 { "inProgress" } else { "completed" }.into(),
-                question: "q".repeat(12000),
-                conclusion: "a".repeat(12000),
-                ..Default::default()
-            });
+            run.rounds.push(
+                Round {
+                    id: format!("round-{i}"),
+                    created: i,
+                    status: if i == 0 { "inProgress" } else { "completed" }.into(),
+                    question: "q".repeat(12000),
+                    conclusion: "a".repeat(12000),
+                    ..Default::default()
+                }
+                .into(),
+            );
         }
         s.handling.runs.push(run);
         let batch = learning_batch(&s);
-        assert!(batch.evidence.len() <= 4);
-        assert!(json!(batch.evidence).to_string().chars().count() < 6100);
-        assert!(batch.evidence.iter().all(|v| v["status"] == "completed"));
+        assert!(!batch.entries.is_empty());
+        assert!(json_chars(&batch.payload()["evidence"]) <= 6000);
+        assert!(batch
+            .entries
+            .iter()
+            .all(|(v, _)| v["status"] == "completed"));
         apply_learning(
             &mut s,
             &batch,
@@ -2467,7 +2364,17 @@ mod tests {
         )
         .unwrap();
         let next = learning_batch(&s);
-        assert!(next.rounds.iter().all(|v| !batch.rounds.contains(v)));
+        assert!(next.entries.iter().all(|(row, _)| !batch
+            .entries
+            .iter()
+            .any(|(previous, _)| row["id"] == previous["id"])));
+        for round in &mut s.handling.runs[0].rounds {
+            round.question = "short question".into();
+            round.conclusion = "short conclusion".into();
+        }
+        let short = learning_batch(&s);
+        assert!(short.entries.len() > 4);
+        assert!(json_chars(&short.payload()["evidence"]) <= 6000);
     }
     #[test]
     fn old_routes_are_inert_and_prompt_adoption_uses_normal_versions_atomically() {
@@ -2541,20 +2448,17 @@ mod tests {
 
     #[test]
     fn full_project_selector_keeps_the_default_without_dropping_valid_projects() {
-        let root = std::env::temp_dir().join(format!("ss-project-catalog-{}", id()));
-        let app = App::load(root.clone()).unwrap();
+        let (root, app) = crate::test_support::scoped_app("ss-project-catalog");
         {
             let mut state = app.state.lock().unwrap();
-            state.handling.local_projects = (0..80).map(|i| json!({"id":format!("local:{i:03}"),"name":format!("Synthetic {i}"),"cwd":root})).collect();
+            state.handling.local_projects = (0..80).map(|i| json!({"id":format!("local:{i:03}"),"name":format!("Synthetic {i}"),"cwd":root.as_path()})).collect();
             let duplicate = state.handling.local_projects[0].clone();
             state.handling.local_projects.push(duplicate);
         }
-        let projects = app.handling_projects().unwrap();
+        let projects = app.analysis_projects();
         assert_eq!(projects.as_array().unwrap().len(), 81);
         assert_eq!(projects[0]["id"], "local:ai-workdir");
         assert_eq!(projects[80]["id"], "local:079");
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn conclusion_requires_completed_turn() {
@@ -2570,74 +2474,68 @@ mod tests {
         assert_eq!(r.rounds[0].conclusion, "actual finding");
         assert_eq!(r.status, "completed");
     }
-    #[test]
-    fn approvals_do_not_add_permissions() {
-        let req = json!({"method":"item/permissions/requestApproval","params":{"permissions":{"network":{"enabled":true}}}});
-        assert_eq!(
-            approval_result(&req, &json!({"action":"decline"})).unwrap()["permissions"],
-            json!({})
-        );
-        assert_eq!(
-            approval_result(&req, &json!({"action":"accept"})).unwrap()["scope"],
-            "turn"
-        );
-        let req = json!({"method":"item/commandExecution/requestApproval"});
-        assert_eq!(
-            approval_result(&req, &json!({"action":"acceptForSession"})).unwrap()["decision"],
-            "acceptForSession"
-        );
-        assert!(approval_result(&req, &json!({"action":"acceptSimilar"})).is_err());
-        let req = json!({"method":"item/commandExecution/requestApproval","params":{"proposedExecpolicyAmendment":["git","status"],"availableDecisions":["accept","decline"]}});
-        assert!(approval_result(&req, &json!({"action":"acceptForSession"})).is_err());
-        assert!(approval_result(&req, &json!({"action":"acceptSimilar"})).is_err());
-        let req = json!({"method":"item/commandExecution/requestApproval","params":{"proposedExecpolicyAmendment":["git","status"]}});
-        assert_eq!(
-            approval_result(
-                &req,
-                &json!({"action":"acceptSimilar","execpolicy_amendment":["anything"]})
-            )
-            .unwrap()["decision"]["acceptWithExecpolicyAmendment"]["execpolicy_amendment"],
-            json!(["git", "status"])
-        );
+    fn delta(item: &str, text: impl Into<String>) -> AgentUpdate {
+        AgentUpdate::MessageDelta {
+            item_id: item.into(),
+            text: text.into(),
+        }
     }
-
+    fn event(turn: &str, update: AgentUpdate) -> AgentEvent {
+        AgentEvent {
+            thread_id: "thread".into(),
+            turn_id: turn.into(),
+            update,
+        }
+    }
     #[test]
     fn visible_events_preserve_process_and_measured_duration() {
         let mut run = Run {
             thread_id: "thread".into(),
-            rounds: vec![Round {
-                turn_id: "turn".into(),
-                ..Default::default()
-            }],
             ..Default::default()
         };
-        apply_notification(
+        apply_history(
             &mut run,
-            &json!({"method":"turn/started","params":{"turn":{"id":"turn","status":"inProgress","startedAt":100}}}),
+            &json!([{"id":"turn","status":"inProgress","startedAt":100}]),
+            &Value::Null,
         );
-        apply_notification(
-            &mut run,
-            &json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","delta":"**Checking**"}}),
-        );
+        apply_event(&mut run, &event("turn", delta("answer", "**Checking**")));
         assert_eq!(run.progress, "**Checking**");
-        apply_notification(
+        apply_event(
             &mut run,
-            &json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn","item":{"id":"item","type":"agentMessage","phase":"final_answer","text":"Done"}}}),
-        );
-        apply_notification(
-            &mut run,
-            &json!({"method":"turn/completed","params":{"turn":{"id":"turn","status":"completed","startedAt":100,"completedAt":103,"durationMs":3000}}}),
+            &event(
+                "turn",
+                AgentUpdate::Completed(
+                    json!({"id":"turn","status":"completed","startedAt":100,"completedAt":103,"durationMs":3000,"items":[{"id":"answer","type":"agentMessage","phase":"final_answer","text":"Done"}]}),
+                ),
+            ),
         );
         assert_eq!(run.rounds[0].duration_ms, Some(3000));
         assert_eq!(run.rounds[0].conclusion, "Done");
         assert_eq!(run.rounds[0].steps.len(), 1);
         assert!(process_step(&json!({"type":"reasoning","text":"private"})).is_none());
-        let mut requests = vec![json!({"params":{"turnId":"turn","itemId":"file"}})];
-        enrich_requests(
-            &mut requests,
-            &json!([{"id":"other","items":[{"id":"file","changes":["wrong"]}]},{"id":"turn","items":[{"id":"file","changes":["right"]}]}]),
+
+        // A late lifecycle event for an older turn must not clear its content
+        // or copy that content into the current turn.
+        run.rounds[0].learned = true;
+        let completed = run.rounds[0].clone();
+        let later: crate::shared::Shared<Round> = Round {
+            turn_id: "later".into(),
+            status: "inProgress".into(),
+            steps: vec![json!({"id":"later-step","text":"Later progress"})].into(),
+            ..Default::default()
+        }
+        .into();
+        run.rounds.push(later.clone());
+        apply_event(
+            &mut run,
+            &event(
+                "turn",
+                AgentUpdate::Completed(json!({"id":"turn","status":"completed"})),
+            ),
         );
-        assert_eq!(requests[0]["params"]["changes"], json!(["right"]));
+        assert!(run.rounds[0] == completed);
+        assert!(run.rounds[1] == later);
+        assert!(run.rounds[0].steps.same_snapshot(&completed.steps));
     }
 
     #[test]
@@ -2648,14 +2546,14 @@ mod tests {
                 turn_id: "turn".into(),
                 status: "inProgress".into(),
                 ..Default::default()
-            }],
+            }
+            .into()]
+            .into(),
             ..Default::default()
         };
         let text = "中文路径 D:/合成资料/文件.txt 🚀🙂";
         for ch in text.chars() {
-            let bytes = serde_json::to_vec(&json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"answer","delta":ch.to_string()}})).unwrap();
-            let event = serde_json::from_slice(&bytes).unwrap();
-            apply_notification(&mut run, &event);
+            apply_event(&mut run, &event("turn", delta("answer", ch.to_string())));
         }
         assert_eq!(run.progress, text);
         assert_eq!(run.rounds[0].steps[0]["text"], text);
@@ -2665,23 +2563,24 @@ mod tests {
             &Value::Null,
         );
         assert_eq!(run.rounds[0].steps[0]["text"], text);
-        apply_notification(
-            &mut run,
-            &json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"next","delta":"下一段"}}),
-        );
+        apply_event(&mut run, &event("turn", delta("next", "下一段")));
         assert_eq!(run.progress, "下一段");
         assert_eq!(run.rounds[0].steps.len(), 2);
-        apply_notification(
-            &mut run,
-            &json!({"method":"item/started","params":{"turnId":"turn","item":{"id":"command","type":"commandExecution","command":"synthetic-read","status":"inProgress"}}}),
-        );
-        apply_notification(
-            &mut run,
-            &json!({"method":"item/commandExecution/outputDelta","params":{"turnId":"turn","itemId":"command","delta":"中文输出 🚀"}}),
-        );
+        for (status, output) in [("inProgress", ""), ("completed", "中文输出 🚀")] {
+            apply_event(
+                &mut run,
+                &event(
+                    "turn",
+                    AgentUpdate::Item(
+                        json!({"id":"command","type":"mcpToolCall","tool":"synthetic-read","status":status,"result":output}),
+                    ),
+                ),
+            );
+        }
+        assert_eq!(run.rounds[0].steps.len(), 3);
         assert!(run.rounds[0].steps[2]["text"]
             .as_str()
             .unwrap()
-            .ends_with("中文输出 🚀"));
+            .contains("中文输出 🚀"));
     }
 }

@@ -21,23 +21,20 @@ async function renderMemory() {
   drawMemory();
 }
 function memoryTextCount() {
-  if (!memoryEditor) return 0;
-  return [
-    ...(memoryEditor.kind === 'temporary'
-      ? memoryEditor.text
-      : memoryEditor.entries
-          .filter((e) => e.key || e.text)
-          .map((e) => `- ${e.key}：${e.text}`)
-          .join('\n')),
-  ].length;
+  return [...(memoryEditor?.text || '')].length;
 }
 function drawMemory() {
   const edit = memoryEditor,
     kind = edit?.kind;
   const card = (k) => {
     const data = memoryData[k],
-      editing = kind === k;
-    return `<section class="box memory-card"><div class="row memory-card-head"><div class="memory-heading"><h2>${k === 'temporary' ? '临时记忆' : '归档记忆'}</h2><span class="memory-caption" title="${k === 'temporary' ? '保留本轮分析笔记，供下一轮参考' : '从操作记录中积累的长期经验和偏好'}">${k === 'temporary' ? '保留本轮分析笔记，供下一轮参考' : '从操作记录中积累的长期经验和偏好'}</span></div>${!editing ? `<button data-memory-edit="${k}">编辑记忆</button>` : ''}</div>${editing ? `<div class="memory-editor">${k === 'temporary' ? `<label for="memory-temporary">记忆正文</label><textarea id="memory-temporary" rows="9" data-memory-text>${esc(edit.text)}</textarea>` : `<div id="memory-entries">${edit.entries.map((e, i) => `<div class="memory-entry" data-memory-index="${i}"><label>主题<input data-memory-key value="${esc(e.key)}" maxlength="80"></label><label>记忆内容<textarea data-memory-body rows="3">${esc(e.text)}</textarea></label><button class="quiet" data-memory-remove="${i}">删除此条</button></div>`).join('')}</div><button data-memory-add>＋ 添加记忆</button>`}<div class="memory-editor-foot"><span id="memory-count" class="helper">${memoryTextCount()} / ${data.max_chars} 字符</span><div class="row"><button data-memory-cancel>取消</button><button class="primary" data-memory-save>保存记忆</button></div></div><div id="memory-error" class="error-box" role="status"></div></div>` : k === 'temporary' ? `<p class="memory-prose">${esc(data.text || '还没有临时记忆，AI 会在分析时按需记录。')}</p>` : `${(data.entries || []).map((e) => `<article class="memory-record"><h3>${esc(e.key)}</h3><p class="memory-prose">${esc(e.text)}</p></article>`).join('') || '<p class="helper">还没有归档记忆。</p>'}`}</section>`;
+      editing = kind === k,
+      caption = k === 'temporary' ? '保留本轮分析笔记，供下一轮参考' : '归档时结合操作记录，统一整理长期经验和偏好',
+      text = editing ? edit.text : data.text || '',
+      count = [...text].length,
+      countLabel = `${count} / ${data.max_chars} 字符`,
+      overLimit = count > data.max_chars;
+    return `<section class="box memory-card"><div class="row memory-card-head"><div class="memory-heading"><h2>${k === 'temporary' ? '临时记忆' : '归档记忆'}</h2><span class="memory-caption" title="${caption}">${caption}</span></div>${!editing ? `<button data-memory-edit="${k}">编辑记忆</button>` : ''}</div>${editing ? `<div class="memory-editor"><label for="memory-${k}">记忆正文</label><textarea id="memory-${k}" rows="9" data-memory-text>${esc(text)}</textarea><div class="memory-editor-foot"><span id="memory-count" class="helper${overLimit ? ' memory-over-limit' : ''}">${countLabel}</span><div class="row"><button data-memory-cancel>取消</button><button class="primary" data-memory-save>保存记忆</button></div></div><p id="memory-limit" class="helper memory-over-limit"${overLimit ? '' : ' hidden'}>原内容已完整保留，请精简到 ${data.max_chars} 字符以内再保存。</p><div id="memory-error" class="error-box" role="status"></div></div>` : `<p class="memory-prose">${esc(text || (k === 'temporary' ? '还没有临时记忆，AI 会在分析时按需记录。' : '还没有归档记忆。'))}</p><p class="helper${overLimit ? ' memory-over-limit' : ''}">${countLabel}${overLimit ? ' · 原内容已完整保留，后续保存需精简。' : ''}</p>`}</section>`;
   };
   setHtml(
     '#view',
@@ -48,14 +45,7 @@ function drawMemory() {
 }
 function readMemoryDraft() {
   if (!memoryEditor) return;
-  if (memoryEditor.kind === 'temporary')
-    memoryEditor.text = $('#memory-temporary')?.value ?? memoryEditor.text;
-  else
-    memoryEditor.entries = [...document.querySelectorAll('[data-memory-index]')].map((el) => ({
-      ...memoryEditor.entries[Number(el.dataset.memoryIndex)],
-      key: el.querySelector('[data-memory-key]').value,
-      text: el.querySelector('[data-memory-body]').value,
-    }));
+  memoryEditor.text = $('[data-memory-text]')?.value ?? memoryEditor.text;
 }
 function leaveMemory() {
   if (!memoryEditor) return true;
@@ -71,12 +61,11 @@ function leaveMemory() {
 document.addEventListener('input', (e) => {
   if (!e.target.closest('.memory-editor')) return;
   readMemoryDraft();
-  const count = memoryTextCount();
-  $('#memory-count').textContent = `${count} / ${memoryData[memoryEditor.kind].max_chars} 字符`;
-  $('#memory-count').classList.toggle(
-    'memory-over-limit',
-    count > memoryData[memoryEditor.kind].max_chars,
-  );
+  const count = memoryTextCount(),
+    limit = memoryData[memoryEditor.kind].max_chars;
+  $('#memory-count').textContent = `${count} / ${limit} 字符`;
+  $('#memory-count').classList.toggle('memory-over-limit', count > limit);
+  $('#memory-limit').hidden = count <= limit;
 });
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
@@ -90,7 +79,6 @@ document.addEventListener('click', async (e) => {
         kind,
         expected: data.revision,
         text: data.text || '',
-        entries: structuredClone(data.entries || []),
       };
       drawMemory();
       return;
@@ -106,24 +94,17 @@ document.addEventListener('click', async (e) => {
       return;
     }
     readMemoryDraft();
-    if (b.hasAttribute('data-memory-add')) {
-      memoryEditor.entries.push({ id: '', key: '', text: '' });
-      drawMemory();
-      return;
-    }
-    if (b.hasAttribute('data-memory-remove')) {
-      memoryEditor.entries.splice(Number(b.dataset.memoryRemove), 1);
-      drawMemory();
-      return;
-    }
     if (b.hasAttribute('data-memory-save')) {
       if (memoryEditor.saving) return;
+      const limit = memoryData[memoryEditor.kind].max_chars;
+      if (memoryTextCount() > limit) return;
       memoryEditor.saving = true;
       document
         .querySelectorAll('.memory-page button,.memory-page input,.memory-page textarea')
         .forEach((el) => (el.disabled = true));
       try {
-        const result = await rpc('memory_save', memoryEditor);
+        const { kind, expected, text } = memoryEditor,
+          result = await rpc('memory_save', { kind, expected, text });
         memoryData = result;
         memoryEditor = null;
         drawMemory();

@@ -37,8 +37,14 @@ pub(crate) fn attach_result(value: &mut Value, snapshot: &Value, meter: &Meter) 
         Ok(None) => {}
         Err(error) => value["_memory_error"] = json!(error),
     }
+    match analysis_context::archived_memory_update(snapshot, meter, value) {
+        Ok(Some(update)) => value["_archived_memory_update"] = update,
+        Ok(None) => {}
+        Err(error) => value["_archived_memory_error"] = json!(error),
+    }
     if let Some(map) = value.as_object_mut() {
         map.remove("memory_update");
+        map.remove("archived_memory");
         map.remove("image_notes");
     }
 }
@@ -46,29 +52,123 @@ pub(crate) fn attach_result(value: &mut Value, snapshot: &Value, meter: &Meter) 
 struct ApiTools<'a, 'r> {
     request: &'a AnalysisRequest<'r>,
     meter: &'a mut Meter,
+    degraded: bool,
 }
-impl ToolHandler for ApiTools<'_, '_> {
-    fn invoke(&mut self, call: &ToolInvocation<'_>) -> Result<ToolResult, ToolFailure> {
+impl ApiTools<'_, '_> {
+    fn query_tool(
+        &mut self,
+        call: &ToolInvocation<'_>,
+        result_budget: Option<usize>,
+    ) -> Result<ToolResult, ToolFailure> {
         let r = self.request;
         if r.cancel.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(ToolFailure::new(ToolFailureKind::Failed));
         }
         let snapshot = &r.payload["_local_context"];
+        let mut meter = self.meter.clone();
+        let content_budget = result_budget.map(|remaining| {
+            let empty = json!({"role":"tool","tool_call_id":call.call_id(),"content":""});
+            remaining.saturating_sub(shishi_api::openai::message_input_chars(&empty) + 1)
+        });
         let result = match call.name() {
-            "read_context" => analysis_context::query(snapshot, self.meter, call.arguments())
-                .map(|text| json!({"content":[{"type":"text","text":text}]})),
-            "read_image" => crate::images::read(snapshot, self.meter, call.arguments()),
+            "read_context" => ToolResult::Text(analysis_context::query_with_limit(
+                snapshot,
+                &mut meter,
+                call.arguments(),
+                content_budget,
+            )),
+            "read_image" => ToolResult::from_mcp(
+                &crate::images::read(snapshot, &mut meter, call.arguments()).map_err(|error| {
+                    ToolFailure::with_message(ToolFailureKind::Unavailable, error)
+                })?,
+            )?,
             _ => return Err(ToolFailure::new(ToolFailureKind::Denied)),
         };
-        ToolResult::from_mcp(&result.unwrap_or_else(
-            |error| json!({"isError":true,"content":[{"type":"text","text":error}]}),
-        ))
+        let (message, images) = result
+            .clone()
+            .messages(call.call_id())
+            .map_err(|_| ToolFailure::new(ToolFailureKind::Failed))?;
+        let chars = shishi_api::openai::message_input_chars(&message)
+            + 1
+            + if images.is_empty() {
+                0
+            } else {
+                shishi_api::openai::message_input_chars(&json!({"role":"user","content":images}))
+                    + 1
+            };
+        if meter.exhausted || result_budget.is_some_and(|remaining| chars > remaining) {
+            self.meter.exhausted = true;
+            return Err(ToolFailure::with_message(
+                ToolFailureKind::BudgetExhausted,
+                "本次续轮额度已用尽，未交付新的补查内容；请依据已读资料完成，并说明仍缺少的证据。",
+            ));
+        }
+        // Only a response that fits the shared allowance counts as read.
+        *self.meter = meter;
+        Ok(result)
     }
-    fn allows_repeated_arguments(&self) -> bool {
-        self.request.registered_tools.is_some()
+}
+impl ToolHandler for ApiTools<'_, '_> {
+    fn validate_output(
+        &mut self,
+        value: &mut Value,
+        corrected: bool,
+    ) -> Result<(), shishi_api::schema_validate::ValidationError> {
+        if self.request.kind == "classify" && crate::ai::empty_analysis_without_reason(value) {
+            if corrected {
+                value["no_action_reason"] = json!(crate::ai::DEGRADED_ANALYSIS_REASON);
+                self.degraded = true;
+                return Ok(());
+            }
+            return Err(shishi_api::schema_validate::ValidationError::new(
+                "$.no_action_reason",
+                "must be non-blank when actions is empty; explain the no-action conclusion from the supplied evidence, without inventing actions",
+            ));
+        }
+        Ok(())
+    }
+    fn invoke(&mut self, call: &ToolInvocation<'_>) -> Result<ToolResult, ToolFailure> {
+        self.query_tool(call, None)
+    }
+    fn allows_repeated_arguments(&self, name: &str) -> bool {
+        self.request
+            .registered_tools
+            .is_some_and(|session| session.contains(name))
     }
     fn input_char_limit(&self) -> Option<usize> {
         Some(self.request.config.max_input_chars)
+    }
+    fn continuation_char_limit(&self) -> Option<usize> {
+        Some(self.request.config.retrieval_budget_chars)
+    }
+    fn query_progress(&self, name: &str) -> Option<usize> {
+        matches!(name, "read_context" | "read_image").then_some(
+            self.meter.pages.len()
+                + self.meter.image_hashes.len()
+                + usize::from(self.meter.exhausted),
+        )
+    }
+    fn input_chars(&self, body: &Value, serialized_chars: usize) -> usize {
+        if connection(self.request.config)
+            .is_ok_and(|c| matches!(c.driver.as_str(), "codex" | "dsh"))
+        {
+            super::model_api::body_input_chars(self.request.schema, body)
+        } else {
+            // Query image messages are fully credited by the API loop. Their
+            // pixels are bounded separately and never use the text allowance.
+            let pixels = body["messages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|m| m["content"].as_array())
+                .flatten()
+                .filter(|p| p["type"] == "image_url")
+                .filter_map(|p| p["image_url"]["url"].as_str())
+                .filter_map(|u| u.strip_prefix("data:")?.split_once(";base64,"))
+                .map(|(_, data)| data.len())
+                .sum::<usize>();
+            serialized_chars.saturating_sub(pixels)
+        }
     }
     fn validate_batch(&mut self, calls: &[ToolInvocation<'_>]) -> Result<(), ToolFailure> {
         if let Some(session) = self.request.registered_tools {
@@ -86,21 +186,23 @@ impl ToolHandler for ApiTools<'_, '_> {
         call: &ToolInvocation<'_>,
         cancel: &std::sync::atomic::AtomicBool,
         deadline: std::time::Instant,
+        result_budget: Option<usize>,
     ) -> Result<ToolResult, ToolFailure> {
         if let Some(session) = self
             .request
             .registered_tools
             .filter(|session| session.contains(call.name()))
         {
-            session.execute(
+            session.execute_with_result_budget(
                 call.name(),
                 call.call_id(),
                 call.arguments(),
                 cancel,
                 deadline,
+                result_budget,
             )
         } else {
-            self.invoke(call)
+            self.query_tool(call, result_budget)
         }
     }
 }
@@ -114,6 +216,21 @@ pub(crate) fn analyze_client(
     stream: bool,
     native_stream_events: bool,
 ) -> Result<(Value, Value), String> {
+    analyze_with(r, event, secret, native_stream_events, |request, event| {
+        client.analyze_with_events(request, stream, event)
+    })
+}
+
+pub(crate) fn analyze_with(
+    r: &AnalysisRequest<'_>,
+    event: &mut dyn FnMut(AnalysisEvent),
+    secret: &str,
+    native_stream_events: bool,
+    run: impl FnOnce(
+        AnalyzeRequest<'_, '_>,
+        &mut dyn FnMut(ApiEvent),
+    ) -> Result<shishi_api::AnalysisOutput, shishi_api::ApiError>,
+) -> Result<(Value, Value), String> {
     let snapshot = &r.payload["_local_context"];
     // Use the exact declarations that were measured by the application.
     // Never rebuild a different tool list here.
@@ -125,9 +242,9 @@ pub(crate) fn analyze_client(
     let mut handler = ApiTools {
         request: r,
         meter: &mut meter,
+        degraded: false,
     };
-    let output = client
-            .analyze_with_events(AnalyzeRequest {
+    let output = run(AnalyzeRequest {
                 model: &r.config.model,
                 reasoning_effort: (!r.config.reasoning_effort.is_empty())
                     .then_some(r.config.reasoning_effort.as_str()),
@@ -138,7 +255,7 @@ pub(crate) fn analyze_client(
                 timeout: Duration::from_secs(r.config.ai_timeout_seconds),
                 tools: &tools,
                 tool_handler: Some(&mut handler),
-            }, stream, &mut |e| match e {
+            }, &mut |e| match e {
                 ApiEvent::Phase(phase) => event(AnalysisEvent::Stream{kind:"phase".into(),text:phase.into(),append:false}),
                 ApiEvent::Text{kind,text,append} if native_stream_events => event(AnalysisEvent::Stream{kind:kind.into(),text,append}),
                 ApiEvent::OutputTokens(count) if native_stream_events => event(AnalysisEvent::OutputTokens(count)),
@@ -153,13 +270,16 @@ pub(crate) fn analyze_client(
                 _ => {},
             })
             .map_err(|e| {
+                if matches!(e.kind(), shishi_api::ApiErrorKind::InvalidJson | shishi_api::ApiErrorKind::SchemaInvalid) {
+                    event(AnalysisEvent::OutputValidationFailed);
+                }
                 if let Some(u) = e.usage() {
                     event(AnalysisEvent::Usage(json!({"input_tokens":u.prompt_tokens,"output_tokens":u.completion_tokens,"cached_input_tokens":u.cached_tokens,"total_tokens":u.total_tokens,"partial":true})));
                 }
                 if e.kind() == shishi_api::ApiErrorKind::Cancelled {
                     crate::ai_control::CANCELLED.into()
                 } else if e.kind() == shishi_api::ApiErrorKind::InputLimit {
-                    format!("{}：工具续轮超过全局输入预算，已停止；已执行的工具不会重放", crate::ai::INPUT_LIMIT_ERROR)
+                    format!("{}：首轮完整请求超过输入额度，未调用模型", crate::ai::INPUT_LIMIT_ERROR)
                 } else {
                     let guidance = match e.kind() {
                         shishi_api::ApiErrorKind::HttpStatus if matches!(e.status(),Some(400|422)) => "；供应商拒绝请求参数，请核对模型、推理强度、工具及结构化输出支持。未自动丢弃参数，未应用本次结果",
@@ -178,9 +298,17 @@ pub(crate) fn analyze_client(
             "cached_input_tokens":output.usage.cached_tokens,"total_tokens":output.usage.total_tokens});
     event(AnalysisEvent::Usage(usage.clone()));
     let mut value = output.value;
+    if handler.degraded {
+        value["_analysis_degraded"] = json!(true);
+    }
     if r.config.retain_ai_traces {
-        std::fs::write(r.trace.join("output.txt"), value.to_string())
-            .map_err(|e| format!("分析结果跟踪保存失败：{e}"))?;
+        if let Err(error) = std::fs::write(r.trace.join("output.txt"), value.to_string()) {
+            event(AnalysisEvent::Stream {
+                kind: "diagnostic".into(),
+                text: format!("分析结果已取得，跟踪文件保存失败：{error}"),
+                append: false,
+            });
+        }
     }
     attach_result(&mut value, snapshot, &meter);
     Ok((value, usage))
@@ -205,9 +333,9 @@ impl Backend for Api {
         models_with_key(c, root, None)
     }
 
-    fn validate(&self, c: &Connection, config: &Config) -> Result<(), String> {
+    fn validate(&self, c: &Connection, model: &str, _: &str) -> Result<(), String> {
         shishi_api::Endpoint::parse(&c.base_url).map_err(|e| e.to_string())?;
-        if config.model.trim().is_empty() {
+        if model.trim().is_empty() {
             return Err("请选择或填写 API 模型".into());
         }
         Ok(())

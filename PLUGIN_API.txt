@@ -21,7 +21,7 @@ window.shishiPlugin.call(method,params={})返回Promise；只允许声明的方�
 可选setContentHeight(number|null)返回Promise<boolean>，传入自然内容高度（含内边距和底部操作），宿主按可用窗口限制配置页高度；null恢复填满可用空间。不得把iframe当前视口高度作为内容高度上报；重复值应去重，仅在内容或宽度变化时更新。
 页面只支持内联脚本、内联样式及data图片，不能访问宿主DOM、网络或任意文件；本机能力通过call提供。
 DLL另外导出uint8_t *shishi_plugin_settings_call(const uint8_t *input,size_t input_len,size_t *output_len,uint32_t (*cancelled)(uintptr_t),uintptr_t context)。输出仍用shishi_plugin_free释放，仍须shishi_plugin_abi()==1。
-配置请求context含plugin_dir和timeout_ms=90000；config在打开会话时固定。取消回调与context只在调用期间有效。宿主使用无窗口辅助进程，取消或95秒超时后终止；请求最多2 MiB，响应最多32 MiB。普通采集接口的进程内约定保持不变。
+配置请求context含plugin_dir和timeout_ms=90000；config在打开会话时固定。取消回调与context只在调用期间有效。配置与采集共用一个无窗口插件工作进程，取消或90秒超时后终止；配置请求最多2 MiB，响应最多32 MiB。
 宿主不导出SQLite ABI或共享sqlite3.dll；来源解密与数据库依赖由插件负责。完整教程见docs/PLUGINS.md。
 
 C ABI（禁止跨 DLL 传 Rust String/Vec/trait 对象）
@@ -31,7 +31,7 @@ void shishi_plugin_free(uint8_t *output, size_t output_len);
 输入输出为 UTF-8 JSON，不依赖结尾0。由DLL分配输出，宿主调用同一DLL的free后才能卸载。单次请求/响应不超过32 MiB。
 返回信封 {"ok":true,"result":...} 或 {"ok":false,"error":"说明"}。
 plugin-sdk::export_plugin!(handler) 提供 Rust 导出、分配释放和 panic 捕获。
-宿主在工作线程直接调用DLL，同一插件可被多个来源并发调用，插件必须可重入/线程安全。插件自行遵守context.timeout_ms，进程内ABI不提供强制终止或崩溃隔离。不要留下后台线程、回调或未结束的异步工作，否则DLL卸载后不安全。需要子进程时由插件管理其生命周期，父进程退出时必须结束。
+宿主在独立工作进程中串行调用所有插件，DLL按需加载并持续复用；普通业务失败不卸载DLL。致命异常、超时或在途取消会回收整个工作进程及子进程，后续调用重新创建，连续失败会退避。不要在调用返回后使用借用的回调、context或缓冲区。插件应遵守context.timeout_ms，正确释放自己的资源；内存状态可能随工作进程重建丢失。更新或卸载插件会回收工作进程。隔离不限制插件的本机权限。
 
 请求
 {"protocol":1,"method":"...","config":{...},"params":{...},"context":{"plugin_dir":"绝对包目录","work_dir":"可写临时目录","timeout_ms":90000}}
@@ -43,6 +43,7 @@ validate: 检查配置、文件内容和账号，返回 {"valid":true,"account_k
 fetch_incremental: params {"cursor":上次游标或null,"since":毫秒,"until":毫秒}。按范围读取，游标是插件私有JSON。返回 {"messages":[...],"cursor":新游标,"until":已成功读到的毫秒检查点}。宿主校验并成功保存消息后才提交游标。失败时不得跳过原游标，重试须幂等。
 fetch_range: params {"since":毫秒,"until":毫秒}，包含首尾，返回同格式；宿主不会提交此游标。
 lookup_messages: params {"ids":[原始消息编号],"until":当前毫秒}，返回 {"messages":[...]}，用于更新仍被事项跟踪的消息和撤回状态。未找到的ID可省略，不推断撤回。
+fetch_scan（可选）: capabilities 声明后，宿主用一次隔离读取替代扫描时的 validate、fetch_incremental 和分批 lookup_messages；上述必需接口仍保留供旧宿主和配置页面调用。首次 params {"cursor":上次游标或null,"since":毫秒,"until":毫秒,"tracked":[去重后的原始消息编号]}，插件必须在同一冻结读取中校验配置与账号、读增量并补齐跟踪证据（含编辑和撤回）；增量已返回的证据无需重读。返回 {"valid":true,"account_key":"稳定身份","messages":[...],"cursor":新游标,"until":检查点,"next_page":"续页令牌或null"}。续页仍调用 fetch_scan，params 仅为 {"page":"上次返回的令牌"}；每页身份、游标和检查点必须相同，令牌不可重复，未结束页必须含消息，整轮消息身份（chat+id）不得重复。令牌最多128个ASCII字母、数字、短横线、下划线或冒号。插件应复用本轮冻结读取，不在每页重启读取环境；可将有界响应页放到 work_dir，不使用跨账号全局缓存。每次扫描使用独立UUID工作子目录，宿主在完成、失败或取消后清理；插件不得在调用返回后留存访问临时目录的后台任务。单轮最多100000条消息、少于10000次续页，单次请求/响应仍不超过32 MiB。失败不提交任何页或游标；旧插件继续使用原接口。
 import_legacy（可选）: params.state为宿主保留的升级前原始JSON。插件解读自己的旧格式，返回 {"config":{...},"account_key":"...","cursor":...,"last_scan":毫秒,"message_ids":[旧编号],"messages":[旧消息的可读文本转换结果]}。宿主迁移仍无source_id的缓存、任务引用和审计中的sources，保留原始副本；导入后默认关闭，用户校验启用。
 
 统一消息

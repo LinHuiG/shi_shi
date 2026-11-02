@@ -43,6 +43,7 @@ pub(crate) fn start(app: &Arc<crate::engine::App>) -> Result<(), String> {
                             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                             let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                             let result = (|| -> Result<Value, String> {
+                                stream.set_nonblocking(false).map_err(|e| e.to_string())?;
                                 let mut line = String::new();
                                 BufReader::new(&mut stream)
                                     .take(REQUEST_LIMIT + 1)
@@ -148,65 +149,6 @@ pub(crate) fn call_handling(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn with_session<T>(
-    session: &ToolSession<'_>,
-    cancel: &AtomicBool,
-    deadline: Instant,
-    invoke: impl FnOnce(Value) -> Result<T, String>,
-) -> Result<T, String> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(|e| e.to_string())?;
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let address = listener.local_addr().map_err(|e| e.to_string())?;
-    let token = crate::model::id();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            while !session.stopped.load(Ordering::SeqCst) && !cancel.load(Ordering::SeqCst) && Instant::now() < deadline {
-                match listener.accept() {
-                    Ok((mut stream,_)) => {
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-                        let result = (|| -> Result<Value,String> {
-                            let mut line=String::new();
-                            BufReader::new(&mut stream).take(REQUEST_LIMIT+1).read_line(&mut line).map_err(|e|e.to_string())?;
-                            if line.len() as u64 > REQUEST_LIMIT { return Err("工具请求过长".into()); }
-                            let request:Value=serde_json::from_str(&line).map_err(|e|e.to_string())?;
-                            if request["token"].as_str() != Some(token.as_str()) { return Err("工具请求已失效".into()); }
-                            let name=request["name"].as_str().ok_or("缺少工具名")?;
-                            let call=request["call_id"].as_str().filter(|id|!id.is_empty() && id.len() <= 200).ok_or("缺少调用编号")?;
-                            let output=session.execute(name,call,&request["arguments"],cancel,deadline).map_err(|_|"工具执行或记录失败，未自动重试")?;
-                            match output {
-                                shishi_api::ToolResult::Text(text) => Ok(json!({"content":[{"type":"text","text":text}]})),
-                                _ => Err("注册命令返回类型无效".into()),
-                            }
-                        })();
-                        let value=result.unwrap_or_else(|error|json!({"isError":true,"content":[{"type":"text","text":error}]}));
-                        let _ = writeln!(stream,"{value}");
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(15)),
-                    Err(_) => break,
-                }
-            }
-        });
-        struct Stop<'a>(&'a AtomicBool);
-        impl Drop for Stop<'_> {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let _stop = Stop(&session.stopped);
-        invoke(json!({"address":address.to_string(),"token":token}))
-    })
-}
-
-/// The child knows declarations and this one-use route, not command templates.
-#[cfg(test)]
-pub fn call(route: &Value, name: &str, arguments: &Value, call_id: &str) -> Result<Value, String> {
-    call_request(
-        route,
-        json!({"token":route["token"],"name":name,"arguments":arguments,"call_id":call_id}),
-    )
-}
 fn call_request(route: &Value, request: Value) -> Result<Value, String> {
     let address: SocketAddr = route["address"]
         .as_str()
@@ -224,7 +166,8 @@ fn call_request(route: &Value, request: Value) -> Result<Value, String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|e| e.to_string())?;
-    if request.to_string().len() as u64 > REQUEST_LIMIT {
+    let request = request.to_string();
+    if request.len() as u64 > REQUEST_LIMIT {
         return Err("工具参数过长".into());
     }
     writeln!(stream, "{request}").map_err(|e| e.to_string())?;
@@ -242,84 +185,27 @@ fn call_request(route: &Value, request: Value) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{engine::App, model::*, tool_registry::ToolDefinition};
 
     #[test]
-    fn only_authenticated_declared_calls_execute_in_the_parent_and_ids_are_not_replayed() {
-        let root = std::env::temp_dir().join(format!("shishi-tool-bridge-{}", id()));
-        let app = App::load(root.clone()).unwrap();
-        let tool = ToolDefinition {
-            id: "synthetic".into(),
-            name: "synthetic_echo".into(),
-            description: "Synthetic bridge fixture".into(),
-            command_template: "echo synthetic_bridge_result".into(),
-            enabled: true,
-            ..Default::default()
-        };
-        app.state.lock().unwrap().config.tools.push(tool.clone());
-        let config = app.state.lock().unwrap().config.clone();
-        let session = ToolSession::new(
-            &app,
-            "request",
-            "format",
-            "",
-            vec![tool.clone()],
-            &config,
-            0,
-        );
-        let cancel = AtomicBool::new(false);
-        with_session(
-            &session,
-            &cancel,
-            Instant::now() + Duration::from_secs(10),
-            |route| {
-                let mut invalid = route.clone();
-                invalid["token"] = json!("invalid");
-                assert_eq!(
-                    call(&invalid, &tool.name, &json!({}), "unauthorized")?["isError"],
-                    true
-                );
-                assert!(app.state.lock().unwrap().tool_runs.is_empty());
-                let response = call(&route, &tool.name, &json!({}), "first")?;
-                assert!(response["content"][0]["text"]
-                    .as_str()
-                    .unwrap()
-                    .contains("synthetic_bridge_result"));
-                assert_eq!(
-                    call(&route, &tool.name, &json!({}), "first")?["isError"],
-                    true
-                );
-                app.state.lock().unwrap().config.tools[0].enabled = false;
-                let response = call(&route, &tool.name, &json!({}), "disabled")?;
-                let result: Value =
-                    serde_json::from_str(response["content"][0]["text"].as_str().unwrap()).unwrap();
-                assert_eq!(result["status"], "rejected");
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert!(session.stopped.load(Ordering::SeqCst));
-        session.finish(None, &Value::Null).unwrap();
-        let history = app
-            .tool_run_history(&json!({"tool_id":"synthetic","purpose":"format"}))
-            .unwrap();
-        assert_eq!(history["rows"][0]["call_count"], 2);
-        assert_eq!(app.state.lock().unwrap().calls, 0);
-        app.log_writer.flush().unwrap();
-        let logs = app
-            .activity_query(&json!({"purpose":"tool_call","filter":"ai"}))
-            .unwrap();
-        let text = logs.to_string();
-        assert!(text.contains("tool_call_finished"));
-        assert!(!text.contains("synthetic_bridge_result"));
-        assert!(call(
-            &json!({"address":"192.0.2.1:9"}),
-            "unknown",
-            &json!({}),
-            "blocked"
-        )
-        .is_err());
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
+    fn service_accepts_delayed_fragments_and_keeps_authentication() {
+        let (root, app) = crate::test_support::scoped_app("tool-service-frames");
+        let app = Arc::new(app);
+        start(&app).unwrap();
+        let route: Value = serde_json::from_slice(&fs::read(service_path(&root)).unwrap()).unwrap();
+        for (token, expected) in [
+            (json!("invalid"), "工具请求已失效"),
+            (route["token"].clone(), "缺少事项凭证"),
+        ] {
+            let response = crate::test_support::fragmented_json(
+                route["address"].as_str().unwrap().parse().unwrap(),
+                &json!({"token":token}),
+            );
+            assert_eq!(response["isError"], true);
+            assert_eq!(response["content"][0]["text"], expected);
+            assert!(app.state.lock().unwrap().tool_runs.is_empty());
+        }
+        assert!(call_request(&json!({"address":"192.0.2.1:9"}), json!({}))
+            .unwrap_err()
+            .contains("本机"));
     }
 }

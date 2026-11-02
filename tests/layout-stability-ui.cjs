@@ -1,10 +1,10 @@
-const fs=require('fs'),path=require('path'),assert=require('assert'),{chromium}=require('playwright');
+const fs=require('fs'),path=require('path'),assert=require('assert'),{withBrowser}=require('./ui-driver.cjs');
 const out=fs.mkdtempSync(path.join(require('os').tmpdir(),'shishi-layout-stability-')),now=Date.now();
 const task={id:'task-one',title:'合成事项标题',description:'核对合成资料。',reason:'合成依据',status:'待处理',generation:'',tags:[],created:now,updated:now,today:true,evidence:{direct:['m1'],background:[],completion:[]}};
 const fixture={config:{enabled:false,auto_ai:false,codex:'fixture',leaders:[],interval_minutes:5,daily_calls:40,work_start:'09:00',work_end:'18:00'},tasks:[task],schedules:[],activity:[],audit:[],reports:[],suggestions:[],chat_sources:[],handling:[],tag_state:{groups:[],proposals:[],versions:[],filters:{}},usage:{calls:0,input_tokens:0,output_tokens:0,cached_reports:0,unreported_calls:0},pending:1,in_work_hours:true};
 const mock=`window.fixture=${JSON.stringify(fixture)};window.ipc={postMessage(raw){const {id,method,params:p}=JSON.parse(raw);let data=true;if(method==='state')data=fixture;if(method==='evidence')data=Array.from({length:20},(_,i)=>({id:'m'+i,text:'合成依据\\n'.repeat(12),sender:'示例',group:'示例会话',time:Date.now(),evidence_role:'direct'}));if(method==='activity_query'){const rows=p.filter==='ai'?Array.from({length:50},(_,i)=>({kind:'ai_success',time:Date.now()-i,detail:{kind:'classify',model:'synthetic-model',elapsed_ms:1000}})):[];data={rows,total:rows.length,page:1,pages:1};}if(method==='prompt_history')data={versions:[{id:'v1',target:'classify',content:'合成提示词',action:'initial',created:Date.now()}],current:{classify:'v1'}};if(method==='analysis_backlog')data={hours:24,count:1,records:{m1:'fingerprint'},eligible:1};setTimeout(()=>receive({id,ok:true,data}),method==='prompt_history'?100:5);}};`;
 const close=(a,b,label)=>{for(const k of ['x','y','width'])assert(Math.abs(a[k]-b[k])<1,`${label} ${k}: ${a[k]} -> ${b[k]}`);};
-(async()=>{const browser=await chromium.launch({headless:true,executablePath:['C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe','C:/Program Files/Microsoft/Edge/Application/msedge.exe'].find(fs.existsSync),args:['--disable-background-networking']});try{
+withBrowser(async(browser)=>{
  const page=await browser.newPage({viewport:{width:1280,height:900}}),errors=[];page.on('pageerror',e=>errors.push(e.message));await page.setContent(require('./ui-bundle.cjs')().replace('<script>','<script>'+mock));await page.locator('#task-detail h2').waitFor();
  for(const width of [1280,1000]){
   await page.setViewportSize({width,height:900});await page.evaluate(()=>{page='tasks';render();});await page.locator("[data-task-record=evidence]").waitFor();
@@ -18,4 +18,4 @@ const close=(a,b,label)=>{for(const k of ['x','y','width'])assert(Math.abs(a[k]-
   await page.screenshot({path:path.join(out,'stable-'+width+'.png')});
  }
  await page.setViewportSize({width:760,height:900});assert(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth));assert.deepEqual(errors,[]);console.log('PASS native scrollbar gutters, log summary/date geometry, prompt tabs/loading geometry, evidence expansion, footer alignment and no caret; '+out);
-}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});
+}).catch(e=>{console.error(e);process.exitCode=1;});

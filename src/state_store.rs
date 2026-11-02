@@ -31,7 +31,7 @@ fn error(e: impl std::fmt::Display) -> String {
 fn encode(value: &impl Serialize) -> Result<String, String> {
     serde_json::to_string(value).map_err(error)
 }
-fn config_path(directory: &Path, name: &str) -> Result<PathBuf, String> {
+pub(crate) fn config_path(directory: &Path, name: &str) -> Result<PathBuf, String> {
     if !name.ends_with(".json") || uuid::Uuid::parse_str(name.trim_end_matches(".json")).is_err() {
         return Err(error("配置引用无效"));
     }
@@ -198,6 +198,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS advice_revisions (id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS handling_runs (id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, payload TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS handling_context_authorization ON handling_runs(json_extract(payload,'$.id'),json_extract(payload,'$.stop_requested'));
             CREATE TABLE IF NOT EXISTS tool_runs (id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, payload TEXT NOT NULL);
             PRAGMA user_version=1;
             COMMIT;").map_err(error)?;
@@ -264,22 +265,23 @@ impl Store {
         };
         let mut changed: BTreeMap<&'static str, Rows> = BTreeMap::new();
         macro_rules! rows {
-            ($field:ident, $key:expr) => {
+            ($table:ident, $($field:ident).+, $key:expr) => {
                 if self
                     .previous
                     .as_ref()
-                    .is_none_or(|old| !state.$field.same_snapshot(&old.$field))
+                    .is_none_or(|old| !state.$($field).+.same_snapshot(&old.$($field).+))
                 {
                     let mut rows = Rows::new();
-                    for (index, row) in state.$field.iter().enumerate() {
+                    for (index, row) in state.$($field).+.iter().enumerate() {
                         let key: String = ($key)(index, row);
                         if rows.insert(key, (index as i64, encode(row)?)).is_some() {
-                            return Err(error(concat!("重复记录编号：", stringify!($field))));
+                            return Err(error(concat!("重复记录编号：", stringify!($table))));
                         }
                     }
-                    changed.insert(stringify!($field), rows);
+                    changed.insert(stringify!($table), rows);
                 }
             };
+            ($field:ident, $key:expr) => { rows!($field, $field, $key); };
         }
         let message_changed = self
             .previous
@@ -306,22 +308,11 @@ impl Store {
             row.id.clone()
         });
         rows!(advice_revisions, |i: usize, _: &Value| i.to_string());
-        if self
-            .previous
-            .as_ref()
-            .is_none_or(|old| !state.handling.runs.same_snapshot(&old.handling.runs))
-        {
-            changed.insert(
-                "handling_runs",
-                state
-                    .handling
-                    .runs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, row)| Ok((i.to_string(), (i as i64, encode(row)?))))
-                    .collect::<Result<Rows, String>>()?,
-            );
-        }
+        rows!(
+            handling_runs,
+            handling.runs,
+            |i: usize, _: &crate::handling::Run| i.to_string()
+        );
         let tx = self.connection.transaction().map_err(error)?;
         for (&table, next) in &changed {
             // A newly opened writer learns existing keys once. Subsequent saves
@@ -391,14 +382,19 @@ impl Store {
     }
 }
 
-pub fn load(directory: &Path) -> Result<State, String> {
-    let mut db = connection(directory, false)?;
+pub(crate) fn read_connection(directory: &Path) -> Result<Connection, String> {
+    let db = connection(directory, false)?;
     let version: i64 = db
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .map_err(error)?;
     if version != VERSION {
         return Err(error("不支持的数据库版本，保留原数据并停止加载"));
     }
+    Ok(db)
+}
+
+pub fn load(directory: &Path) -> Result<State, String> {
+    let mut db = read_connection(directory)?;
     let tx = db.transaction().map_err(error)?;
     let (body, config): (String, String) = tx
         .query_row("SELECT payload,config FROM metadata WHERE id=1", [], |r| {
@@ -599,7 +595,7 @@ pub fn clean_config_generations(directory: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Audit, Message, Task};
+    use crate::model::Audit;
 
     fn directory() -> PathBuf {
         let directory =
@@ -618,18 +614,12 @@ mod tests {
     fn migration_round_trip_retries_old_writes_until_first_new_commit() {
         let directory = directory();
         let mut state = State::default();
-        state.tasks.push(Task {
-            id: "task".into(),
-            title: "Before upgrade".into(),
-            ..Default::default()
-        });
+        state
+            .tasks
+            .push(crate::test_support::task("task", "Before upgrade"));
         state.messages.insert(
             "message".into(),
-            Message {
-                id: "message".into(),
-                text: "Synthetic evidence".into(),
-                ..Default::default()
-            },
+            crate::test_support::message("message", "Synthetic evidence", 0),
         );
         state.tasks[0].evidence.direct.push("message".into());
         state.audit.push(Audit {
@@ -674,11 +664,7 @@ mod tests {
         });
         state.messages.insert(
             "message".into(),
-            Message {
-                id: "message".into(),
-                text: "evidence".into(),
-                ..Default::default()
-            },
+            crate::test_support::message("message", "evidence", 0),
         );
         legacy(&directory, &state);
         migrate(&directory).unwrap();
@@ -733,12 +719,7 @@ mod tests {
             let id = format!("message-{index:05}");
             state.messages.insert(
                 id.clone(),
-                Message {
-                    id,
-                    time: at + index,
-                    text: format!("Synthetic {index}"),
-                    ..Default::default()
-                },
+                crate::test_support::message(id, format!("Synthetic {index}"), at + index),
             );
         }
         let mut store = Store::open(&directory).unwrap();

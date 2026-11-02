@@ -25,8 +25,8 @@ fn message_key(source: &str, chat: &str, external: &str) -> String {
     )
 }
 fn normalize(source: &ChatSource, value: &Value) -> Result<Vec<Message>, String> {
-    let mut messages: Vec<Message> = serde_json::from_value(value["messages"].clone())
-        .map_err(|e| format!("消息格式无效：{e}"))?;
+    let mut messages: Vec<Message> =
+        from_json(&value["messages"]).map_err(|e| format!("消息格式无效：{e}"))?;
     if messages.len() > 100_000 {
         return Err("单次消息数量超过上限".into());
     }
@@ -74,39 +74,106 @@ fn normalize(source: &ChatSource, value: &Value) -> Result<Vec<Message>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn encoded(bytes: &[u8]) -> String {
-        use windows_sys::Win32::Security::Cryptography::{
-            CryptBinaryToStringA, CRYPT_STRING_BASE64, CRYPT_STRING_NOCRLF,
+    #[test]
+    fn incremental_evidence_is_not_looked_up_again_but_other_chats_are() {
+        let tracked = vec![
+            ("chat-a:shared", "shared"),
+            ("chat-b:shared", "shared"),
+            ("old", "old"),
+            ("old", "old"),
+            ("new", "new"),
+        ]
+        .into_iter()
+        .map(|(local, external)| (local.into(), external.into()))
+        .collect();
+        let rows = vec![
+            Message {
+                id: "chat-a:shared".into(),
+                external_id: "shared".into(),
+                ..Default::default()
+            },
+            Message {
+                id: "new".into(),
+                external_id: "new".into(),
+                withdrawn: true,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(missing_tracked(tracked, &rows), vec!["shared", "old"]);
+    }
+    #[test]
+    fn frozen_scan_pages_validate_identity_progress_and_boundary() {
+        let at = now();
+        let source = ChatSource {
+            id: "source".into(),
+            account_key: "account".into(),
+            last_scan: at - 1000,
+            ..Default::default()
         };
-        let mut len = 0;
-        let flags = CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF;
-        unsafe {
-            assert_ne!(
-                CryptBinaryToStringA(
-                    bytes.as_ptr(),
-                    bytes.len() as u32,
-                    flags,
-                    std::ptr::null_mut(),
-                    &mut len
-                ),
-                0
+        for fault in [
+            "",
+            "account",
+            "cursor",
+            "checkpoint",
+            "empty",
+            "token",
+            "duplicate",
+        ] {
+            let mut calls = 0;
+            let result = fetch_scan_pages(
+                &source,
+                at - 2000,
+                at,
+                vec!["tracked".into()],
+                |params| {
+                    calls += 1;
+                    if calls == 1 {
+                        assert_eq!(params["tracked"], json!(["tracked"]));
+                    } else {
+                        assert_eq!(params, json!({"page":"round:1"}));
+                    }
+                    let mut page = json!({"valid":true,"account_key":"account","messages":[{"id":format!("m{calls}"),"time":at,"text":"synthetic"}],"cursor":{"position":1},"until":at,"next_page":if calls==1 {json!("round:1")} else {Value::Null}});
+                    if calls == 2 {
+                        match fault {
+                            "account" => page["account_key"] = json!("other"),
+                            "cursor" => page["cursor"] = json!({"position":2}),
+                            "checkpoint" => page["until"] = json!(at - 1),
+                            "empty" => {
+                                page["messages"] = json!([]);
+                                page["next_page"] = json!("round:2");
+                            }
+                            "token" => page["next_page"] = json!("round:1"),
+                            "duplicate" => page["messages"][0]["id"] = json!("m1"),
+                            _ => {}
+                        }
+                    }
+                    Ok(page)
+                },
             );
-            let mut out = vec![0; len as usize];
-            assert_ne!(
-                CryptBinaryToStringA(
-                    bytes.as_ptr(),
-                    bytes.len() as u32,
-                    flags,
-                    out.as_mut_ptr(),
-                    &mut len
-                ),
-                0
-            );
-            String::from_utf8(out)
-                .unwrap()
-                .trim_end_matches('\0')
-                .into()
+            assert_eq!(calls, 2);
+            if fault.is_empty() {
+                let (messages, cursor, checkpoint) = result.unwrap();
+                assert_eq!(messages.len(), 2);
+                assert_eq!(cursor, json!({"position":1}));
+                assert_eq!(checkpoint, at);
+            } else {
+                assert!(result.is_err(), "{fault}");
+            }
         }
+        let path = std::env::temp_dir().join(format!("ss-scan-cleanup-{}", id()));
+        let directory;
+        {
+            let work = ScanWork::new(&path).unwrap();
+            directory = work.0.clone();
+            fs::write(work.0.join("page.json"), b"synthetic").unwrap();
+        }
+        assert!(!directory.exists());
+        assert!(path.exists());
+        fs::remove_dir(path).unwrap();
+    }
+    fn encoded(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
     #[test]
     fn message_identity_is_scoped_by_source_and_chat_and_external_id() {
@@ -135,7 +202,7 @@ mod tests {
 
     #[test]
     fn browser_upload_uses_existing_zip_validation_and_cleans_temporary_files() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let package = encoded(include_bytes!("../tests/fixtures/plugins/root.zip"));
         let v = json!({"name":"插件 包.ZIP","base64":package});
         assert_eq!(app.install_plugin_upload(&v).unwrap()["id"], "zip-fixture");
@@ -169,9 +236,6 @@ mod tests {
             b"inert DLL fixture"
         );
     }
-    fn fixture() -> App {
-        App::load(std::env::temp_dir().join(format!("shishi-sources-{}", id()))).unwrap()
-    }
     fn source(name: &str) -> ChatSource {
         ChatSource {
             id: id(),
@@ -184,7 +248,7 @@ mod tests {
     }
     #[test]
     fn deletion_and_retention_prevent_reimport_without_deleting_tasks() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let source = source("Fixture");
         let m = row(&source);
         let mut old = m.clone();
@@ -240,7 +304,7 @@ mod tests {
     }
     #[test]
     fn scan_counts_unique_persisted_changes_and_preserves_failure_boundaries() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let source = source("Fixture");
         let mut first = row(&source);
         app.state.lock().unwrap().chat_sources.push(source.clone());
@@ -323,7 +387,7 @@ mod tests {
     }
     #[test]
     fn scan_update_cursor_ignores_renames_replies_and_failed_saves() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let source = source("Fixture");
         let mut m = row(&source);
         app.state.lock().unwrap().chat_sources.push(source.clone());
@@ -371,7 +435,7 @@ mod tests {
     }
     #[test]
     fn no_bundled_plugins_and_uninstall_keeps_evidence() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         install_fixture(&app, "plugins");
         assert!(plugins::catalog(&app.root).0.is_empty());
         install_fixture(&app, "data/plugins");
@@ -403,7 +467,7 @@ mod tests {
     }
     #[test]
     fn uninstall_failed_save_restores_plugin_and_state() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         install_fixture(&app, "data/plugins");
         app.state
             .lock()
@@ -417,7 +481,7 @@ mod tests {
     }
     #[test]
     fn plugin_upgrade_and_same_version_repair_preserve_source_state() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         install_fixture(&app, "data/plugins");
         install_fixture(&app, "candidate");
         let candidate = app.root.join("candidate/fixture");
@@ -503,7 +567,7 @@ mod tests {
     }
     #[test]
     fn plugin_installation_does_not_rewrite_state_and_keeps_undeclared_files() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         install_fixture(&app, "data/plugins");
         install_fixture(&app, "candidate");
         let candidate = app.root.join("candidate/fixture");
@@ -544,7 +608,7 @@ mod tests {
     }
     #[test]
     fn source_toggle_preserves_progress_rejects_stale_writes_and_never_loads_disabled_plugins() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let mut original = source("Existing");
         original.cursor = json!({"offset":17});
         original.last_scan = 123;
@@ -594,7 +658,7 @@ mod tests {
     }
     #[test]
     fn source_toggle_save_failure_keeps_previous_state() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let original = source("Existing");
         app.state
             .lock()
@@ -622,7 +686,7 @@ mod tests {
     }
     #[test]
     fn failed_source_and_failed_save_never_advance_its_cursor() {
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let a = source("a");
         let b = source("b");
         {
@@ -658,7 +722,7 @@ mod tests {
     #[ignore = "Set SHISHI_TEST_PLUGIN to the built example plugin directory"]
     fn native_json_plugin_installs_discovers_reads_multiple_sources_and_preserves_failed_cursor() {
         let package = std::env::var("SHISHI_TEST_PLUGIN").expect("plugin fixture package");
-        let app = fixture();
+        let (_root, app) = crate::test_support::scoped_app("shishi-sources");
         let package = std::path::PathBuf::from(package);
         let package = if package.is_dir() {
             package.join("plugin.json")
@@ -730,6 +794,9 @@ mod tests {
 fn validate(plugin: &Plugin, source: &ChatSource, work: &Path) -> Result<String, String> {
     plugin.validate_fields(&source.config)?;
     let result = plugin.call("validate", &source.config, json!({}), work)?;
+    validate_identity(source, &result)
+}
+fn validate_identity(source: &ChatSource, result: &Value) -> Result<String, String> {
     if result["valid"] != true {
         return Err(result["message"]
             .as_str()
@@ -745,22 +812,152 @@ fn validate(plugin: &Plugin, source: &ChatSource, work: &Path) -> Result<String,
     }
     Ok(key.into())
 }
+
+/// One private work directory for a source's complete frozen scan. No token or
+/// file survives success, an invalid page, cancellation or a plugin failure.
+struct ScanWork(std::path::PathBuf, std::path::PathBuf);
+impl ScanWork {
+    fn new(parent: &Path) -> Result<Self, String> {
+        crate::storage::plain_directory(parent)?;
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        let canonical_parent = parent.canonicalize().map_err(|e| e.to_string())?;
+        let directory = parent.join(format!("scan-{}", id()));
+        fs::create_dir(&directory).map_err(|e| e.to_string())?;
+        let resolved = directory.canonicalize().map_err(|e| e.to_string())?;
+        if resolved.parent() != Some(canonical_parent.as_path()) {
+            return Err("扫描临时目录超出来源工作目录".into());
+        }
+        Ok(Self(directory, canonical_parent))
+    }
+}
+impl Drop for ScanWork {
+    fn drop(&mut self) {
+        // Recheck after plugin execution: never recursively remove a moved
+        // path or one replaced by a link outside this round's parent.
+        if crate::storage::plain_directory(&self.0).is_ok()
+            && self.0.canonicalize().is_ok_and(|path| {
+                path == self.1.join(self.0.file_name().unwrap())
+                    && path.parent() == Some(self.1.as_path())
+            })
+        {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+}
+fn fetch_scan_pages(
+    source: &ChatSource,
+    since: i64,
+    until: i64,
+    tracked: Vec<String>,
+    mut call: impl FnMut(Value) -> Result<Value, String>,
+) -> Result<(Vec<Message>, Value, i64), String> {
+    let mut params = json!({"cursor":source.cursor,"since":since,"until":until,"tracked":tracked});
+    let mut boundary: Option<(String, Value, i64)> = None;
+    let mut tokens = BTreeSet::new();
+    let mut received = BTreeSet::new();
+    let mut messages = Vec::new();
+    loop {
+        process::check_running()?;
+        let result = call(params)?;
+        process::check_running()?;
+        let account = validate_identity(source, &result)?;
+        let checkpoint = result["until"]
+            .as_i64()
+            .filter(|t| *t >= source.last_scan && *t <= until && *t >= since)
+            .ok_or("插件返回的增量检查点无效")?;
+        let cursor = result.get("cursor").ok_or("插件未返回增量游标")?;
+        let current = (account, cursor.clone(), checkpoint);
+        if boundary.as_ref().is_some_and(|frozen| frozen != &current) {
+            return Err("插件续页的账号、游标或检查点发生变化".into());
+        }
+        boundary.get_or_insert(current);
+        let rows = normalize(source, &result)?;
+        if rows
+            .iter()
+            .any(|message| !received.insert(message.id.clone()))
+        {
+            return Err("插件冻结分页返回了重复消息".into());
+        }
+        if messages.len().saturating_add(rows.len()) > 100_000 {
+            return Err("插件单轮读取超过 100000 条消息，请缩小范围".into());
+        }
+        let more = match result.get("next_page") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(token))
+                if !token.is_empty()
+                    && token.len() <= 128
+                    && token
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_:".contains(&b)) =>
+            {
+                Some(token.clone())
+            }
+            _ => return Err("插件续页令牌无效".into()),
+        };
+        if more.is_some() && rows.is_empty() {
+            return Err("插件续页没有读取进展".into());
+        }
+        messages.extend(rows);
+        let Some(token) = more else {
+            break;
+        };
+        if !tokens.insert(token.clone()) || tokens.len() >= 10_000 {
+            return Err("插件续页令牌重复或超过上限".into());
+        }
+        params = json!({"page":token});
+    }
+    let (_, cursor, checkpoint) = boundary.unwrap();
+    process::check_running()?;
+    Ok((messages, cursor, checkpoint))
+}
+fn missing_tracked(tracked: Vec<(String, String)>, messages: &[Message]) -> Vec<String> {
+    let received = messages
+        .iter()
+        .map(|m| m.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut requested = BTreeSet::new();
+    tracked
+        .into_iter()
+        .filter_map(|(id, external)| {
+            (!received.contains(id.as_str()) && requested.insert(external.clone()))
+                .then_some(external)
+        })
+        .collect()
+}
 fn fetch(
     root: &Path,
     source: &ChatSource,
-    tracked: Vec<String>,
+    tracked: Vec<(String, String)>,
     until: i64,
 ) -> Result<(Vec<Message>, Value, i64), String> {
     let plugin = plugins::find(root, &source.plugin_id)?;
     let work = crate::storage::data_dir(&root)
         .join("tmp/plugins")
         .join(&source.id);
-    validate(&plugin, source, &work)?;
     let since = if source.last_scan == 0 {
         until - 86_400_000
     } else {
         (source.last_scan - 600_000).max(until - 86_400_000)
     };
+    if plugin
+        .manifest
+        .capabilities
+        .iter()
+        .any(|method| method == "fetch_scan")
+    {
+        plugin.validate_fields(&source.config)?;
+        let work = ScanWork::new(&work)?;
+        let tracked = tracked
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        return fetch_scan_pages(source, since, until, tracked, |params| {
+            plugin.call("fetch_scan", &source.config, params, &work.0)
+        });
+    }
+    validate(&plugin, source, &work)?;
     let value = plugin.call(
         "fetch_incremental",
         &source.config,
@@ -775,8 +972,10 @@ fn fetch(
         return Err("插件未返回增量游标".into());
     }
     let mut messages = normalize(source, &value)?;
-    // Re-read tracked evidence so withdrawals and edited messages are reconciled.
-    for ids in tracked.chunks(500) {
+    // The increment already returned the current body/withdrawal state for
+    // these IDs. Only evidence outside that read needs a separate lookup.
+    let missing = missing_tracked(tracked, &messages);
+    for ids in missing.chunks(500) {
         let value = plugin.call(
             "lookup_messages",
             &source.config,
@@ -817,6 +1016,7 @@ impl App {
         if plugin.dir.parent() != Some(parent.as_path()) {
             return Err("插件目录不属于安装目录，未卸载".into());
         }
+        crate::plugin_worker::reset()?;
         // Move out of the discoverable directory first; a failed state save restores it.
         let storage = crate::storage::data_dir(&self.root).join("tmp/removed-plugins");
         fs::create_dir_all(&storage).map_err(|e| e.to_string())?;
@@ -886,6 +1086,7 @@ impl App {
             .plugin_access
             .try_write()
             .map_err(|_| "插件正在读取或配置，请稍后重试")?;
+        crate::plugin_worker::reset()?;
         let installed = plugins::install(&self.root, Path::new(path))?;
         let mut result = json!(installed.manifest);
         result["install_status"] = json!(installed.status);
@@ -904,33 +1105,29 @@ impl App {
         if encoded.len() > LIMIT.div_ceil(3) * 4 {
             return Err("拖入的 ZIP 超过32 MiB，请点击安装区域选择文件".into());
         }
-        let mut length = 0u32;
-        let flags = CRYPT_STRING_BASE64 | CRYPT_STRING_STRICT;
-        // Decode with the Windows API already available on supported systems.
-        let decode = |output: *mut u8, length: &mut u32| unsafe {
+        if encoded.is_empty() || !encoded.is_ascii() {
+            return Err("插件包传输不完整，请重试".into());
+        }
+        // Every four encoded characters produce at most three bytes. Retain
+        // Windows decoding compatibility without scanning the input twice.
+        let mut bytes = vec![0; encoded.len().div_ceil(4) * 3];
+        let mut length = bytes.len() as u32;
+        let decoded = unsafe {
             CryptStringToBinaryA(
                 encoded.as_ptr(),
                 encoded.len() as u32,
-                flags,
-                output,
-                length,
+                CRYPT_STRING_BASE64 | CRYPT_STRING_STRICT,
+                bytes.as_mut_ptr(),
+                &mut length,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
             ) != 0
         };
-        if encoded.is_empty()
-            || !encoded.is_ascii()
-            || !decode(std::ptr::null_mut(), &mut length)
-            || length as usize > LIMIT
-        {
-            return Err("插件包传输不完整，请重试".into());
-        }
-        let mut bytes = vec![0; length as usize];
-        if !decode(bytes.as_mut_ptr(), &mut length) {
+        if !decoded || length as usize > LIMIT {
             return Err("插件包传输不完整，请重试".into());
         }
         bytes.truncate(length as usize);
-        if bytes.len() > LIMIT || !bytes.starts_with(b"PK\x03\x04") {
+        if !bytes.starts_with(b"PK\x03\x04") {
             return Err("插件包不是有效的 ZIP 文件".into());
         }
         // Browser drops expose file contents, never a trusted filesystem path.
@@ -959,8 +1156,7 @@ impl App {
     }
     pub fn source_save(&self, v: &Value) -> Result<Value, String> {
         let _guard = self.plugin_access.read().map_err(|_| "插件状态不可用")?;
-        let mut source: ChatSource =
-            serde_json::from_value(v["source"].clone()).map_err(|e| e.to_string())?;
+        let mut source: ChatSource = from_json(&v["source"])?;
         if source.name.trim().is_empty() || source.name.chars().count() > 100 {
             return Err("来源名称应为 1–100 字".into());
         }
@@ -1181,7 +1377,7 @@ impl App {
                 .tasks
                 .iter()
                 .filter(|t| !t.archived)
-                .flat_map(|t| t.evidence.all())
+                .flat_map(|t| t.evidence.iter())
                 .collect::<BTreeSet<_>>();
             sources
                 .into_iter()
@@ -1191,7 +1387,7 @@ impl App {
                         .values()
                         .filter(|m| {
                             m.source_id == source.id
-                                && (tracked.contains(&m.id)
+                                && (tracked.contains(m.id.as_str())
                                     || (m.time
                                         >= now()
                                             - s.config.analysis_lookback_hours as i64 * 3_600_000
@@ -1199,7 +1395,7 @@ impl App {
                                         && (m.images.is_empty()
                                             || m.images.iter().any(|i| i.path.is_empty()))))
                         })
-                        .map(|m| m.external_id.clone())
+                        .map(|m| (m.id.clone(), m.external_id.clone()))
                         .collect::<Vec<_>>();
                     (source, ids)
                 })
@@ -1278,13 +1474,6 @@ impl App {
                         }
                         if crate::messages::allowed_with(&s, &m, &keep) {
                             accepted.insert(m.id.clone());
-                            if s.messages
-                                .get(&m.id)
-                                .is_none_or(|old| fingerprint(old) != fingerprint(&m))
-                            {
-                                s.analysis_retries.remove(&m.id);
-                                s.analysis_retry_counts.remove(&m.id);
-                            }
                             crate::message_progress::insert(&mut s, m);
                         } else {
                             counts.ignored += 1;
@@ -1323,7 +1512,9 @@ impl App {
         if successful > 0 {
             s.last_scan = start;
         }
-        let pending = !crate::context_budget::pending(&s).is_empty();
+        let pending = crate::context_budget::pending_refs(&s, false)
+            .next()
+            .is_some();
         crate::context_budget::mark_pending(&mut s, pending, now());
         s.pending_scan = false;
         s.last_error = errors.join("；");
@@ -1333,7 +1524,9 @@ impl App {
             if let Some(message) = s.messages.get(&id) {
                 match lock.messages.get(&id) {
                     None => counts.added += 1,
-                    Some(old) if fingerprint(old) != fingerprint(message) => counts.updated += 1,
+                    Some(old) if old.text != message.text || old.withdrawn != message.withdrawn => {
+                        counts.updated += 1
+                    }
                     Some(_) => counts.unchanged += 1,
                 }
             }
@@ -1388,13 +1581,6 @@ impl App {
             let keep = crate::messages::protected(&s);
             for m in rows {
                 if crate::messages::allowed_with(&s, &m, &keep) {
-                    if s.messages
-                        .get(&m.id)
-                        .is_none_or(|old| fingerprint(old) != fingerprint(&m))
-                    {
-                        s.analysis_retries.remove(&m.id);
-                        s.analysis_retry_counts.remove(&m.id);
-                    }
                     crate::message_progress::insert(&mut s, m);
                 }
             }

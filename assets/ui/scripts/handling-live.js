@@ -32,10 +32,12 @@ const handlingStreamSizes=new ResizeObserver(entries=>{
 function resizeHandlingStreams(){for(const output of document.querySelectorAll('[data-handling-stream]')){const view=handlingStreams.get(output);if(view){if(view.follow)followHandlingStream(output,view,true);else handlingStreamLatest(output,view);}}}
 function updateHandlingLive() {
   for(const output of document.querySelectorAll('[data-handling-stream]')) {
-    const run=(state?.handling||[]).find(r=>r.id===output.dataset.handlingStream);if(!run)continue;
+    const run=(state?.handling||[]).find(r=>r.id===output.dataset.handlingStream);if(!run||run._details===false)continue;
     let view=handlingStreams.get(output);
     const initial=!view,saved=handlingConversationViews.get(run.id);
     if(!view){view={follow:saved?.follow??true,frame:0,expected:-1};handlingStreams.set(output,view);handlingStreamSizes.observe(output);}
+    const revision=run._stream_revision?JSON.stringify(run._stream_revision):null;
+    if(revision!==null&&view.revision===revision)continue;
     const selection=window.getSelection();
     if(selection&&!selection.isCollapsed&&(output.contains(selection.anchorNode)||output.contains(selection.focusNode))){pauseHandlingStream(output,view);view.selectionPaused=true;continue;}
     view.selectionPaused=false;
@@ -45,6 +47,7 @@ function updateHandlingLive() {
     const nodes=new Map([...output.querySelectorAll('[data-stream-entry]')].map(el=>[el.dataset.streamEntry,el])),keys=new Set();
     renderHandlingEntries(output,entries,{run,saved,initial,nodes,keys});
     for(const [key,el] of nodes)if(!keys.has(key))el.remove();
+    view.revision=revision;
     for(const motion of handlingToolMotions.values())if(motion.output===output&&motion.el.isConnected){
       const height=motion.el.style.height;motion.el.style.height='';motion.el.open=motion.open;
       motion.end=motion.el.getBoundingClientRect().height;motion.el.open=true;motion.el.style.height=height;
@@ -105,10 +108,11 @@ function renderHandlingEntries(parent, entries, context, inGroup = false) {
       }
     }
     const inserted = !el.isConnected;
-    el.className = 'handling-stream-entry'
+    const className = 'handling-stream-entry'
       + (detail ? ' handling-stream-detail' : user ? ' handling-user-message' : ' handling-assistant-message')
       + (group ? ' handling-tool-group' : '')
       + (inGroup ? ' handling-tool-child' : '');
+    if(el.className!==className)el.className=className;
     if (previous ? previous.nextElementSibling !== el : parent.firstElementChild !== el) {
       if (previous) previous.after(el);
       else parent.prepend(el);
@@ -117,8 +121,7 @@ function renderHandlingEntries(parent, entries, context, inGroup = false) {
     if (inserted && !initial) motionAnimate(el, [{ opacity: .35 }, { opacity: 1 }]);
     if (group) {
       renderHandlingEntries(el.querySelector('.handling-tool-children'), entry.entries, context, true);
-      el.querySelector('.handling-tool-label').textContent = handlingToolLabel({ kind: entry.toolKind }) + ' · ' + entry.entries.length;
-      el.querySelector('.handling-tool-icon').innerHTML = handlingToolIcon(entry.toolKind);
+      updateHandlingToolHeading(el, handlingToolLabel({ kind: entry.toolKind }) + ' · ' + entry.entries.length, entry.toolKind);
       continue;
     }
     const body = el.querySelector('.handling-stream-text,.handling-turn-label'),
@@ -132,10 +135,15 @@ function renderHandlingEntries(parent, entries, context, inGroup = false) {
       else body.textContent = text;
     }
     if (detail) {
-      el.querySelector('.handling-tool-label').textContent = handlingToolLabel(entry, inGroup);
-      el.querySelector('.handling-tool-icon').innerHTML = handlingToolIcon(entry.kind);
+      updateHandlingToolHeading(el, handlingToolLabel(entry, inGroup), entry.kind);
     }
   }
+}
+function updateHandlingToolHeading(el,label,kind) {
+  const title=el.querySelector('.handling-tool-label');
+  if(title.textContent!==label)title.textContent=label;
+  const icon=el.querySelector('.handling-tool-icon');
+  if(icon._handlingKind!==kind){icon.innerHTML=handlingToolIcon(kind);icon._handlingKind=kind;}
 }
 
 document.addEventListener('scroll',e=>{

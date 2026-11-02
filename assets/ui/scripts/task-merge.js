@@ -1,19 +1,19 @@
-let mergePrimary = null,
+let mergePrimary = '',
   mergeTarget = '',
   mergeQuery = '';
 function mergeForm(t) {
-  mergePrimary = structuredClone(t);
+  mergePrimary = t.id;
   mergeTarget = '';
   mergeQuery = '';
   setModal(
-    `<h2>合并事项</h2><p class="subtitle">保留当前事项，将所选事项的描述和消息依据合并进来。可在操作记录中撤销。</p><div class="merge-current"><span class="tiny">保留的事项</span><b>${esc(t.title)}</b><p>${esc(t.description)}</p><span class="tiny">${esc(t.status)}</span></div><input id="merge-search" aria-label="搜索合并事项" placeholder="搜索标题、描述或标签"><div class="helper" id="merge-count"></div><div id="merge-candidates" class="merge-candidates"></div><div id="merge-environment"></div><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="apply-merge" disabled>确认合并</button></div>`,
+    `<h2>合并事项</h2><p class="subtitle">保留当前事项，将所选事项的描述和消息依据合并进来。可在操作记录中撤销。</p><div class="merge-current"><span class="tiny">保留的事项</span><b>${esc(t.title)}</b><p>${esc(t.description)}</p><span class="tiny">${esc(t.status)}</span></div><input id="merge-search" aria-label="搜索合并事项" placeholder="搜索标题、描述或标签"><div class="helper" id="merge-count"></div><div id="merge-candidates" class="merge-candidates"></div><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="apply-merge" disabled>确认合并</button></div>`,
   );
   $('#dialog').classList.add('wide-dialog');
   renderMergeCandidates();
 }
 function mergeCandidates() {
   return state.tasks
-    .filter((t) => t.id !== mergePrimary.id && !t.archived && !t.merged_into)
+    .filter((t) => t.id !== mergePrimary && !t.archived && !t.merged_into)
     .sort(
       (a, b) =>
         Number(a.status !== '待处理') - Number(b.status !== '待处理') || b.updated - a.updated,
@@ -52,20 +52,17 @@ function renderMergeCandidates() {
       )
       .join('') || '<p class="helper">没有符合条件的事项</p>',
   );
-  const target = all.find((t) => t.id === mergeTarget);
-  setHtml('#merge-environment', '');
-  updateMergeButton();
+  updateMergeButton(all);
 }
-function updateMergeButton() {
-  const t = mergeCandidates().find((t) => t.id === mergeTarget);
-  $('[data-action="apply-merge"]').disabled = !t;
+function updateMergeButton(candidates = mergeCandidates()) {
+  $('[data-action="apply-merge"]').disabled = !candidates.some((t) => t.id === mergeTarget);
 }
 async function applyMerge() {
   const b = $('[data-action="apply-merge"]');
   if (b.disabled) return;
   b.disabled = true;
   try {
-    await perform('merge', { ids: [mergePrimary.id, mergeTarget] }, '已合并，可在操作记录中撤销');
+    await perform('merge', { ids: [mergePrimary, mergeTarget] }, '已合并，可在操作记录中撤销');
     closeModal();
   } catch (e) {
     $('#modal-error').textContent = e.message;
@@ -113,7 +110,6 @@ document.addEventListener('change', (e) => {
     mergeTarget = el.value;
     renderMergeCandidates();
   }
-  if (el.id === 'merge-confirm-environment') updateMergeButton();
 });
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');

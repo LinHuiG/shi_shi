@@ -13,19 +13,8 @@ pub struct MorningJob {
     pub business_day: String,
     pub status: String,
     pub error: String,
-}
-
-impl EndArchiveAttemptLookup for State {
-    fn end_archive_attempt_status(&self, id: &str) -> Option<ArchiveAttemptStatus> {
-        let attempt = self.archive_attempts.iter().find(|a| a.id == id)?;
-        match attempt.status.as_str() {
-            "queued" => Some(ArchiveAttemptStatus::Queued),
-            "running" => Some(ArchiveAttemptStatus::Running),
-            "succeeded" => Some(ArchiveAttemptStatus::Succeeded),
-            "failed" => Some(ArchiveAttemptStatus::Failed),
-            _ => None,
-        }
-    }
+    #[serde(default)]
+    pub finished: i64,
 }
 
 fn cache_dir(root: &Path) -> Result<std::path::PathBuf, String> {
@@ -104,48 +93,29 @@ impl App {
         attempt: Option<&str>,
         at: i64,
     ) -> bool {
-        let Ok(schedule) = WorkSchedule::parse(&s.config.work_start, &s.config.work_end) else {
+        let Ok(snapshot) = self.work_snapshot(s, at) else {
             return false;
         };
-        let purpose = match kind {
-            "archive" => AiPurpose::Archive,
-            "handling" => AiPurpose::Handling,
-            "tool_call" => AiPurpose::ToolCall,
-            "format" => AiPurpose::Format,
-            "edit" => AiPurpose::Edit,
-            "schedule" => AiPurpose::Schedule,
-            "report" => AiPurpose::Report,
-            "learning" => AiPurpose::Learning,
-            "prompt_review" => AiPurpose::PromptReview,
-            "handling_learning" => AiPurpose::HandlingLearning,
-            "advice_revision" => AiPurpose::AdviceRevision,
-            "message_filter" => AiPurpose::MessageFilter,
-            _ => AiPurpose::Classify,
-        };
-        let trigger = match mode {
-            AiMode::Manual => AiTrigger::Manual,
-            AiMode::Nightly => AiTrigger::QueuedArchive,
-            _ => AiTrigger::Scheduled,
-        };
-        gate(
-            &s.work_scheduler.runtime,
-            &schedule,
-            &self.calendar_for(s),
-            s,
-            &AiGateRequest {
-                purpose,
-                trigger,
-                at_ms: at,
-                // Manual archive creates its own new attempt. That id is an
-                // accounting link, not permission to replay a boundary claim.
-                end_attempt_id: if mode == AiMode::Manual {
-                    None
-                } else {
-                    attempt
-                },
-            },
-        )
-        .is_ok_and(|g| g.allowed)
+        // Manual attempts are accounting links, not boundary-claim replays.
+        if mode == AiMode::Manual {
+            return true;
+        }
+        if let (AiMode::Nightly, "archive", Some(id)) = (mode, kind, attempt) {
+            // Check committed authority even while working: a terminal attempt
+            // must never dispatch again through an otherwise open time gate.
+            return s
+                .work_scheduler
+                .runtime
+                .find_end_claim(id)
+                .is_some_and(|(_, claim)| {
+                    claim.eligibility.is_eligible() && claim.claimed_at_ms <= at
+                })
+                && s.archive_attempts
+                    .iter()
+                    .find(|a| a.id == id)
+                    .is_some_and(|a| matches!(a.status.as_str(), "queued" | "running"));
+        }
+        snapshot.status.ai_allowed()
     }
 
     pub fn set_work_state(&self, params: &Value) -> Result<Value, String> {
@@ -197,8 +167,6 @@ impl App {
                 now_ms: at,
                 schedule: &schedule,
                 calendar: &calendar,
-                ai_busy: self.ai_busy.load(Ordering::SeqCst),
-                enabled: true,
             })
             .map_err(|e| e.to_string())?;
         // Persist only meaningful observations/claims, not the 5-second clock.
@@ -242,6 +210,7 @@ impl App {
                         business_day: business_day.to_string(),
                         status: "queued".into(),
                         error: String::new(),
+                        finished: 0,
                     });
                 }
             }
@@ -271,7 +240,7 @@ impl App {
             *locked = next;
             job
         };
-        let result = self.report("早报", AiMode::Automatic);
+        let result = self.report_result("早报", AiMode::Automatic);
         let (status, error) = match &result {
             Ok(report) => match report["summary_status"].as_str() {
                 Some("done") | Some("reused") | Some("fallback") => {
@@ -290,9 +259,16 @@ impl App {
         };
         let mut locked = self.state.lock().unwrap();
         let mut next = locked.clone();
+        let finished = result
+            .as_ref()
+            .ok()
+            .and_then(|report| report["finished"].as_i64())
+            .filter(|time| *time > 0)
+            .unwrap_or_else(|| next.next_report_finished(now()));
         if let Some(row) = next.morning_jobs.iter_mut().find(|j| j.id == job.id) {
             row.status = status;
             row.error = error;
+            row.finished = finished;
         }
         self.save(&next)?;
         *locked = next;
@@ -391,6 +367,7 @@ impl App {
                 .unwrap()
                 .insert_cache(cache)
                 .map_err(|e| e.to_string())?;
+            self.background.wake();
         }
         Ok(())
     }
@@ -399,36 +376,114 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{calendar, date, ts_ms};
 
     #[test]
     fn every_ai_purpose_uses_the_same_work_state_gate() {
-        let root = std::env::temp_dir().join(format!("shishi-gate-{}", crate::model::id()));
-        let app = App::load(root.clone()).unwrap();
-        app.test_force_working();
-        for kind in crate::model::PURPOSES {
-            let s = app.state.lock().unwrap();
-            assert!(
-                app.work_gate(&s, kind, AiMode::Manual, None, now()),
-                "{kind} should be allowed during overtime"
-            );
-            assert!(
-                app.work_gate(&s, kind, AiMode::Automatic, None, now()),
-                "{kind} automatic should be allowed during overtime"
-            );
+        let (_root, app) = crate::test_support::scoped_app("shishi-gate");
+        *app.calendar.lock().unwrap() = calendar();
+        let mut s = app.state.lock().unwrap();
+        let schedule = WorkSchedule::parse(&s.config.work_start, &s.config.work_end).unwrap();
+        for (at, automatic, overtime) in [
+            (ts_ms(2025, 1, 1, 10, 0), false, false), // holiday
+            (ts_ms(2025, 1, 2, 10, 0), true, false),
+            (ts_ms(2025, 1, 2, 21, 0), false, false),
+            (ts_ms(2025, 1, 4, 10, 0), false, false), // weekend
+            (ts_ms(2026, 1, 5, 10, 0), false, false), // unknown calendar
+            (ts_ms(2026, 1, 5, 10, 0), true, true),
+        ] {
+            if overtime {
+                s.work_scheduler
+                    .runtime
+                    .begin_overtime(at, &schedule)
+                    .unwrap();
+            }
+            for kind in PURPOSES.into_iter().chain(["tool_call", "unknown"]) {
+                for mode in [AiMode::Manual, AiMode::Automatic, AiMode::Nightly] {
+                    assert_eq!(
+                        app.work_gate(&s, kind, mode, None, at),
+                        mode == AiMode::Manual || automatic,
+                        "{kind} at {at}"
+                    );
+                }
+                assert!(app.work_gate(&s, kind, AiMode::Manual, Some("manual-attempt"), at));
+            }
         }
-        app.test_end_overtime();
-        // Unknown calendar blocks automatic purposes; explicit manual actions
-        // retain their own permission and quota checks outside this time gate.
-        for kind in crate::model::PURPOSES {
-            let s = app.state.lock().unwrap();
-            assert!(
-                app.work_gate(&s, kind, AiMode::Manual, None, now()),
-                "{kind} manual must remain available outside work/overtime"
-            );
-            assert!(!app.work_gate(&s, kind, AiMode::Automatic, None, now()));
-            assert!(app.work_gate(&s, kind, AiMode::Manual, Some("manual-attempt"), now()));
+        for at in [i64::MIN, i64::MAX, ts_ms(1800, 1, 1, 10, 0)] {
+            assert!(!app.work_gate(&s, "archive", AiMode::Manual, None, at));
         }
-        drop(app);
-        let _ = std::fs::remove_dir_all(root);
+        for start in ["25:00", "bad", "20:00"] {
+            s.config.work_start = start.into();
+            assert!(!app.work_gate(&s, "archive", AiMode::Manual, None, now()));
+        }
+        drop(s);
+    }
+
+    #[test]
+    fn archive_gate_checks_committed_claim_and_attempt_even_while_working() {
+        let (_root, app) = crate::test_support::scoped_app("archive-gate");
+        *app.calendar.lock().unwrap() = calendar();
+        let mut s = app.state.lock().unwrap();
+        for (day, working) in [(1, false), (2, true)] {
+            let at = ts_ms(2025, 1, day, 10, 0);
+            s.work_scheduler.runtime.day_records.clear();
+            for status in [
+                None,
+                Some("queued"),
+                Some("running"),
+                Some("succeeded"),
+                Some("failed"),
+                Some("unknown"),
+            ] {
+                s.archive_attempts.clear();
+                if let Some(status) = status {
+                    s.archive_attempts.push(ArchiveAttempt {
+                        id: "end-test".into(),
+                        status: status.into(),
+                        ..Default::default()
+                    });
+                }
+                for (claim_id, claimed_at_ms, eligibility) in [
+                    (None, at, EndEligibility::WorkedBeforeEnd),
+                    (Some("other"), at, EndEligibility::WorkedBeforeEnd),
+                    (Some("end-test"), at + 1, EndEligibility::WorkedBeforeEnd),
+                    (Some("end-test"), at, EndEligibility::NotEligible),
+                    (Some("end-test"), at, EndEligibility::WorkedBeforeEnd),
+                    (Some("end-test"), at, EndEligibility::OvertimeBeforeEnd),
+                ] {
+                    s.work_scheduler
+                        .runtime
+                        .day_record_mut(date(2025, 1, day))
+                        .end_claim = claim_id.map(|id| EndArchiveClaim {
+                        attempt_id: id.into(),
+                        claimed_at_ms,
+                        eligibility,
+                    });
+                    let expected = claim_id == Some("end-test")
+                        && claimed_at_ms <= at
+                        && eligibility.is_eligible()
+                        && matches!(status, Some("queued" | "running"));
+                    assert_eq!(app.work_gate(&s, "archive", AiMode::Nightly, Some("end-test"), at), expected,
+                        "day {day}, status {status:?}, claim {claim_id:?}/{claimed_at_ms}/{eligibility:?}");
+                    assert!(app.work_gate(&s, "archive", AiMode::Manual, Some("end-test"), at));
+                    assert_eq!(
+                        app.work_gate(&s, "archive", AiMode::Automatic, Some("end-test"), at),
+                        working
+                    );
+                    assert_eq!(
+                        app.work_gate(&s, "archive", AiMode::Nightly, None, at),
+                        working
+                    );
+                    for kind in PURPOSES.into_iter().filter(|kind| *kind != "archive") {
+                        assert_eq!(
+                            app.work_gate(&s, kind, AiMode::Nightly, Some("end-test"), at),
+                            working,
+                            "{kind}"
+                        );
+                    }
+                }
+            }
+        }
+        drop(s);
     }
 }

@@ -108,9 +108,6 @@ impl Client {
         executable: &str,
         cancel: Option<&AtomicBool>,
     ) -> Result<Arc<Self>, String> {
-        if !std::path::Path::new(executable).is_file() {
-            return Err("请先在设置中选择 Codex CLI".into());
-        }
         let mut command = Command::new(crate::ai_backend::codex::resolve_cli(executable)?);
         command.args(["app-server"]);
         Self::connect_command_guarded(command, cancel)

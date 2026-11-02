@@ -7,70 +7,41 @@ use std::collections::BTreeSet;
 pub const COMMAND_TIMEOUT_SECONDS: u64 = 60;
 pub const CALLS_PER_MINUTE: usize = 60;
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-#[serde(default, deny_unknown_fields)]
-pub struct Parameter {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub required: bool,
-    pub description: String,
-    pub default: Option<Value>,
-    #[serde(rename = "enum")]
-    pub enumeration: Vec<Value>,
-    pub minimum: Option<f64>,
-    pub maximum: Option<f64>,
-}
-impl Default for Parameter {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            kind: "string".into(),
-            required: false,
-            description: String::new(),
-            default: None,
-            enumeration: vec![],
-            minimum: None,
-            maximum: None,
-        }
+shishi_api::default_struct! {
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+    #[serde(default, deny_unknown_fields)]
+    pub struct Parameter {
+        pub name: String,
+        #[serde(rename = "type")]
+        pub kind: String = "string".into(),
+        pub required: bool,
+        pub description: String,
+        pub default: Option<Value>,
+        #[serde(rename = "enum")]
+        pub enumeration: Vec<Value>,
+        pub minimum: Option<f64>,
+        pub maximum: Option<f64>,
     }
 }
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-#[serde(default, deny_unknown_fields)]
-pub struct ToolDefinition {
-    #[serde(default)]
-    pub definition_version: u32,
-    pub id: String,
-    pub name: String,
-    pub display_name: String,
-    pub description: String,
-    pub parameters: Vec<Parameter>,
-    pub command_template: String,
-    pub working_directory: String,
-    pub timeout_seconds: u64,
-    pub rate_limit_per_minute: usize,
-    /// Old execution fields remain readable for compatibility and run history.
-    pub output_encoding: String,
-    pub enabled: bool,
-    pub updated: i64,
-}
-impl Default for ToolDefinition {
-    fn default() -> Self {
-        Self {
-            definition_version: 2,
-            id: String::new(),
-            name: String::new(),
-            display_name: String::new(),
-            description: String::new(),
-            parameters: vec![],
-            command_template: String::new(),
-            working_directory: String::new(),
-            timeout_seconds: 60,
-            rate_limit_per_minute: 60,
-            output_encoding: "utf-8".into(),
-            enabled: false,
-            updated: 0,
-        }
+shishi_api::default_struct! {
+    #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
+    #[serde(default, deny_unknown_fields)]
+    pub struct ToolDefinition {
+        #[serde(default)]
+        pub definition_version: u32 = 2,
+        pub id: String,
+        pub name: String,
+        pub display_name: String,
+        pub description: String,
+        pub parameters: Vec<Parameter>,
+        pub command_template: String,
+        pub working_directory: String,
+        pub timeout_seconds: u64 = 60,
+        pub rate_limit_per_minute: usize = 60,
+        /// Old execution fields remain readable for compatibility and run history.
+        pub output_encoding: String = "utf-8".into(),
+        pub enabled: bool,
+        pub updated: i64,
     }
 }
 pub fn valid_name(name: &str) -> bool {
@@ -181,7 +152,7 @@ impl ToolDefinition {
     }
     pub fn arguments(&self, arguments: &Value) -> Result<Map<String, Value>, String> {
         let args = arguments.as_object().ok_or("参数必须是 JSON 对象")?;
-        if arguments.to_string().len() > 64 * 1024 {
+        if !shishi_api::json::fits_bytes(arguments, 64 * 1024) {
             return Err("参数过长".into());
         }
         if args
@@ -213,8 +184,7 @@ pub fn effective(state: &State) -> Vec<ToolDefinition> {
 }
 impl App {
     pub fn tool_making_prompt(&self, p: &Value) -> Result<Value, String> {
-        let tool: ToolDefinition =
-            serde_json::from_value(p["tool"].clone()).map_err(|e| e.to_string())?;
+        let tool: ToolDefinition = from_json(&p["tool"])?;
         let pending = |s: &str| {
             if s.trim().is_empty() {
                 "待填写".to_string()
@@ -281,8 +251,7 @@ impl App {
             .collect::<Vec<_>>())
     }
     pub fn tool_save(&self, p: &Value) -> Result<Value, String> {
-        let mut tool: ToolDefinition =
-            serde_json::from_value(p["tool"].clone()).map_err(|e| e.to_string())?;
+        let mut tool: ToolDefinition = from_json(&p["tool"])?;
         // Saving from the v2 editor explicitly confirms its displayed conversion.
         if p["tool"]["definition_version"] == 2 {
             tool.simplify();

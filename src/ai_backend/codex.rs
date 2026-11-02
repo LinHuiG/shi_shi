@@ -1,30 +1,16 @@
 //! Codex CLI analysis adapter. Preserve tool isolation, traces and cancellation.
-use crate::{ai::analysis_workdir, model::Config, process};
+use crate::{ai::analysis_workdir, process};
 use serde_json::{json, Value};
 use std::{fs, path::Path, process::Command};
 mod live;
 use live::publish_thread;
 pub struct Codex;
 impl super::Backend for Codex {
-    fn analyze(
-        &self,
-        c: &super::Connection,
-        r: super::AnalysisRequest<'_>,
-        event: &mut dyn FnMut(super::AnalysisEvent),
-    ) -> Result<(Value, Value), String> {
-        if r.payload["_model_only"] == true {
-            analyze(r, c, event)
-        } else {
-            super::model_api::analyze(c, r, event)
-        }
-    }
     fn models(&self, c: &super::Connection, _root: &Path) -> Result<Value, String> {
         list_models(&c.executable)
     }
-    fn validate(&self, c: &super::Connection, config: &Config) -> Result<(), String> {
-        let mut config = config.clone();
-        config.codex = c.executable.clone();
-        validate_selection(&config)
+    fn validate(&self, c: &super::Connection, model: &str, effort: &str) -> Result<(), String> {
+        validate_selection(&c.executable, model, effort)
     }
     fn status(&self, c: &super::Connection, root: &Path) -> Result<Value, String> {
         let mut cmd = Command::new(resolve_cli(&c.executable)?);
@@ -43,14 +29,13 @@ impl super::Backend for Codex {
         crate::codex_bridge::open_thread(thread)
     }
 }
-fn analyze(
+pub(super) fn analyze_round(
     request: super::AnalysisRequest<'_>,
     connection: &super::Connection,
     event: &mut dyn FnMut(super::AnalysisEvent),
 ) -> Result<(Value, Value), String> {
-    let mut resolved = request.config.clone();
-    resolved.codex = connection.executable.clone();
-    let config = &resolved;
+    let executable = resolve_cli(&connection.executable)?;
+    let config = request.config;
     let (kind, payload, root, trace, prompt, cancel) = (
         request.kind,
         request.payload,
@@ -59,10 +44,7 @@ fn analyze(
         request.prompt,
         request.cancel,
     );
-    validate_selection(config)?;
-    if !Path::new(&config.codex).is_file() {
-        return Err("未找到 Codex CLI，请在设置中选择 codex.exe".into());
-    }
+    validate_selection(&executable, &config.model, &config.reasoning_effort)?;
     let job = crate::storage::data_dir(&root)
         .join("ai-work")
         .join(crate::model::id());
@@ -73,7 +55,6 @@ fn analyze(
     let result = job.join("result.json");
     fs::write(&schema_path, serde_json::to_vec(request.schema).unwrap())
         .map_err(|e| e.to_string())?;
-    let executable = resolve_cli(&config.codex)?;
     let mut cmd = Command::new(&executable);
     // A desktop-agent shell can lend its own tool pipe to children. This
     // analysis owns its MCP server and must not borrow the launching chat.
@@ -175,14 +156,14 @@ fn analyze(
     }
     let _visibility_guard = VisibilityGuard(visibility_stop.clone());
     let (visibility_tx, visibility_rx) = std::sync::mpsc::sync_channel(64);
-    let budget_stop = std::cell::Cell::new(false);
+    let isolation_violation = std::cell::Cell::new(false);
     let mut final_error = None;
     let run = process::run_guarded_polling(
         cmd,
         Some(prompt),
         config.ai_timeout_seconds,
         &crate::storage::data_dir(&root).join("tmp"),
-        &|| cancel.load(std::sync::atomic::Ordering::SeqCst) || budget_stop.get(),
+        &|| cancel.load(std::sync::atomic::Ordering::SeqCst) || isolation_violation.get(),
         &mut |line| {
             use std::io::Write;
             if config.retain_ai_traces && !line.is_empty() {
@@ -272,12 +253,8 @@ fn analyze(
                         });
                     }
                 }
-                let item = &v["item"];
-                match item["type"].as_str().unwrap_or("") {
-                    "mcp_tool_call" | "command_execution" | "web_search" | "file_change" => {
-                        budget_stop.set(true)
-                    }
-                    _ => {}
+                if is_native_tool_event(&v) {
+                    isolation_violation.set(true);
                 }
                 if let Some(update) = analysis_event(&v) {
                     event(update);
@@ -291,8 +268,10 @@ fn analyze(
     for update in visibility_rx.try_iter() {
         event(update);
     }
-    let run = if budget_stop.get() {
-        Err("AI 补查次数超限或调用了未授权工具，已停止本次进程；未采用结果".into())
+    let run = if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+        Err(crate::ai_control::CANCELLED.into())
+    } else if isolation_violation.get() {
+        Err(NATIVE_TOOL_VIOLATION.into())
     } else {
         run
     };
@@ -305,22 +284,11 @@ fn analyze(
                     if v["type"] == "turn.completed" {
                         usage = v["usage"].clone()
                     }
-                    if let Some(t) = v["item"]["type"].as_str() {
-                        if [
-                            "command_execution",
-                            "mcp_tool_call",
-                            "web_search",
-                            "file_change",
-                        ]
-                        .contains(&t)
-                        {
-                            tool_used = true;
-                        }
-                    }
+                    tool_used |= is_native_tool_event(&v);
                 }
             }
             if tool_used {
-                Err("Codex 尝试了非文本工具操作，本次结果已拒绝".into())
+                Err(NATIVE_TOOL_VIOLATION.into())
             } else {
                 fs::read_to_string(&result)
                     .map_err(|e| format!("Codex 未生成结果：{e}"))
@@ -331,13 +299,22 @@ fn analyze(
                     })
             }
         }
+        Err(e) if isolation_violation.get() || cancel.load(std::sync::atomic::Ordering::SeqCst) => {
+            Err(e)
+        }
         Err(e) => Err(final_error
             .map(|error| format!("Codex 请求失败：{error}"))
             .unwrap_or(e)),
     };
     if config.retain_ai_traces {
         if let Ok(raw) = fs::read_to_string(&result) {
-            let _ = fs::write(trace.join("output.txt"), raw);
+            if let Err(error) = fs::write(trace.join("output.txt"), raw) {
+                event(super::AnalysisEvent::Stream {
+                    kind: "diagnostic".into(),
+                    text: format!("分析结果跟踪保存失败：{error}"),
+                    append: false,
+                });
+            }
         }
     }
     // Job directory is generated beneath data/ai-work and contains no user-supplied paths.
@@ -349,29 +326,34 @@ fn analyze(
 }
 
 // This client only initializes and queries metadata; it never starts a model turn.
-static CATALOG: std::sync::Mutex<std::collections::BTreeMap<String, Value>> =
+static CATALOG: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, Value>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
-pub fn validate_selection(c: &Config) -> Result<(), String> {
+pub fn validate_selection(launcher: &str, model_id: &str, effort: &str) -> Result<(), String> {
     if ![
         "", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
     ]
-    .contains(&c.reasoning_effort.as_str())
+    .contains(&effort)
     {
         return Err("无效的推理强度".into());
     }
-    if let Some(catalog) = CATALOG.lock().unwrap().get(&c.codex) {
-        if !c.model.is_empty() {
+    // An unavailable saved launcher must not prevent editing its configuration.
+    let executable = resolve_cli(launcher)
+        .ok()
+        .and_then(|path| fs::canonicalize(path).ok());
+    let catalogs = CATALOG.lock().unwrap();
+    if let Some(catalog) = executable.as_ref().and_then(|path| catalogs.get(path)) {
+        if !model_id.is_empty() {
             let models = catalog.as_array().ok_or("模型列表无效")?;
             let model = models
                 .iter()
-                .find(|m| m["model"].as_str() == Some(&c.model))
+                .find(|m| m["model"].as_str() == Some(model_id))
                 .ok_or("所选模型已不在可用列表，请刷新模型")?;
-            if !c.reasoning_effort.is_empty()
+            if !effort.is_empty()
                 && !model["supportedReasoningEfforts"]
                     .as_array()
                     .map(|a| {
                         a.iter()
-                            .any(|e| e["reasoningEffort"].as_str() == Some(&c.reasoning_effort))
+                            .any(|e| e["reasoningEffort"].as_str() == Some(effort))
                     })
                     .unwrap_or(false)
             {
@@ -387,10 +369,10 @@ pub fn list_models(path: &str) -> Result<Value, String> {
     use std::io::{BufRead, BufReader, Write};
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-    if !Path::new(path).is_file() {
-        return Err("请先选择有效的 Codex CLI".into());
-    }
-    let mut cmd = Command::new(resolve_cli(path)?);
+    let executable = resolve_cli(path)?;
+    let catalog_path = fs::canonicalize(&executable)
+        .map_err(|error| format!("无法读取 Codex CLI 路径：{error}"))?;
+    let mut cmd = Command::new(&executable);
     cmd.args(["app-server"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -474,7 +456,7 @@ pub fn list_models(path: &str) -> Result<Value, String> {
         return Err("Codex 未返回可用模型，请检查登录状态".into());
     }
     let data = json!(data);
-    CATALOG.lock().unwrap().insert(path.into(), data.clone());
+    CATALOG.lock().unwrap().insert(catalog_path, data.clone());
     Ok(json!({"models":data,"source":"Codex model/list"}))
 }
 
@@ -482,18 +464,22 @@ pub fn detect_cli() -> String {
     let mut paths = vec![];
     if let Some(root) = std::env::var_os("LOCALAPPDATA") {
         let root = std::path::PathBuf::from(root);
-        for base in [root.join("OpenAI/Codex/bin"), root.join("Programs/Codex")] {
-            if let Ok(entries) = fs::read_dir(&base) {
-                let mut children = entries
-                    .flatten()
-                    .map(|e| e.path().join("codex.exe"))
-                    .collect::<Vec<_>>();
-                children.sort();
-                children.reverse();
-                paths.extend(children);
-            }
-            paths.push(base.join("codex.exe"));
+        let bundled = root.join("OpenAI/Codex/bin");
+        if let Some(path) = latest_bundled_cli(&bundled) {
+            paths.push(path);
         }
+        paths.push(bundled.join("codex.exe"));
+        let base = root.join("Programs/Codex");
+        if let Ok(entries) = fs::read_dir(&base) {
+            let mut children = entries
+                .flatten()
+                .map(|e| e.path().join("codex.exe"))
+                .collect::<Vec<_>>();
+            children.sort();
+            children.reverse();
+            paths.extend(children);
+        }
+        paths.push(base.join("codex.exe"));
     }
     if let Some(root) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&root) {
@@ -514,11 +500,66 @@ pub fn detect_cli() -> String {
         .unwrap_or_default()
 }
 
-/// npm's Windows launcher delegates to a native executable. Resolve that file
-/// directly, avoiding cmd.exe quoting, visible consoles, and NODE_OPTIONS.
+fn bundled_version(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        (8..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
+fn bundled_cli_root(path: &Path) -> Option<&Path> {
+    if !path.is_absolute()
+        || !path.file_name()?.eq_ignore_ascii_case("codex.exe")
+        || !bundled_version(path.parent()?.file_name()?)
+    {
+        return None;
+    }
+    let bin = path.parent()?.parent()?;
+    (bin.file_name()?.eq_ignore_ascii_case("bin")
+        && bin.parent()?.file_name()?.eq_ignore_ascii_case("Codex")
+        && bin
+            .parent()?
+            .parent()?
+            .file_name()?
+            .eq_ignore_ascii_case("OpenAI"))
+    .then_some(bin)
+}
+
+fn latest_bundled_cli(bin: &Path) -> Option<std::path::PathBuf> {
+    use std::os::windows::fs::MetadataExt;
+    let root = fs::symlink_metadata(bin).ok()?;
+    if !root.is_dir() || root.file_attributes() & 0x400 != 0 {
+        return None;
+    }
+    fs::read_dir(bin)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            if !bundled_version(&entry.file_name()) {
+                return None;
+            }
+            let dir = fs::symlink_metadata(entry.path()).ok()?;
+            if !dir.is_dir() || dir.file_attributes() & 0x400 != 0 {
+                return None;
+            }
+            let path = entry.path().join("codex.exe");
+            let file = fs::symlink_metadata(&path).ok()?;
+            (file.is_file() && file.file_attributes() & 0x400 == 0)
+                .then(|| (file.modified().ok(), file.created().ok(), path))
+        })
+        .max()
+        .map(|(_, _, path)| path)
+}
+
+/// Recover removed desktop versions within the saved installation only. npm
+/// launchers resolve directly to their native binary without invoking a shell.
 pub fn resolve_cli(path: &str) -> Result<String, String> {
     let p = Path::new(path);
     if !p.is_file() {
+        if fs::metadata(p).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+            if let Some(replacement) = bundled_cli_root(p).and_then(latest_bundled_cli) {
+                return Ok(replacement.to_string_lossy().into());
+            }
+        }
         return Err("未找到 Codex CLI，请选择 codex.exe 或 npm 安装的 codex.cmd".into());
     }
     if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe")) {
@@ -563,6 +604,11 @@ pub fn resolve_cli(path: &str) -> Result<String, String> {
             .into(),
     )
 }
+
+#[cfg(test)]
+#[path = "codex/launcher_tests.rs"]
+mod launcher_tests;
+
 fn exec_help(
     executable: &str,
     root: &Path,
@@ -590,7 +636,24 @@ fn exec_help(
     Ok(help)
 }
 
+const NATIVE_TOOL_VIOLATION: &str =
+    "Codex 纯模型进程尝试调用未授权的原生工具，已停止本次进程；未采用结果";
+
+fn is_native_tool_event(value: &Value) -> bool {
+    matches!(
+        value["item"]["type"].as_str(),
+        Some("mcp_tool_call" | "command_execution" | "web_search" | "file_change")
+    )
+}
+
 fn analysis_event(value: &Value) -> Option<super::AnalysisEvent> {
+    if is_native_tool_event(value) {
+        return Some(super::AnalysisEvent::Stream {
+            kind: "phase".into(),
+            text: "检测到未授权的原生工具操作，正在停止".into(),
+            append: false,
+        });
+    }
     let phase = match value["type"].as_str() {
         Some("thread.started") => None,
         Some("turn.started") => Some("Codex 已开始处理，等待公开内容"),
@@ -598,12 +661,6 @@ fn analysis_event(value: &Value) -> Option<super::AnalysisEvent> {
             Some("正在处理，等待公开内容")
         }
         Some("item.started") if value["item"]["type"] == "agent_message" => Some("正在接收响应"),
-        Some("item.started") if value["item"]["type"] == "mcp_tool_call" => {
-            Some("正在读取本次分析上下文")
-        }
-        Some("item.completed") if value["item"]["type"] == "mcp_tool_call" => {
-            Some("本次上下文读取完成，继续处理")
-        }
         _ => None,
     };
     if let Some(text) = phase {
@@ -641,29 +698,6 @@ fn analysis_event(value: &Value) -> Option<super::AnalysisEvent> {
     }
 }
 #[cfg(test)]
-fn progress_text(event: &Value) -> Option<String> {
-    let kind = event["item"]["type"].as_str().unwrap_or("");
-    if !["agent_message", "reasoning"].contains(&kind) {
-        return None;
-    }
-    let text = event["item"]["text"].as_str()?.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if text.starts_with('{') || text.starts_with("```") {
-        return Some("已收到回复，正在校验事项数据…".into());
-    }
-    Some(
-        text.lines()
-            .filter(|s| !s.trim().is_empty())
-            .last()?
-            .trim()
-            .chars()
-            .take(160)
-            .collect(),
-    )
-}
-#[cfg(test)]
 mod progress_output_tests {
     use super::*;
     #[test]
@@ -690,17 +724,24 @@ mod progress_output_tests {
         assert_eq!(analysis_event(&json!({"type":"unknown"})), None);
     }
     #[test]
-    fn progress_only_uses_published_text() {
-        assert_eq!(
-            progress_text(&json!({"item":{"type":"reasoning","text":"正在核对事项关联"}})),
-            Some("正在核对事项关联".into())
-        );
-        assert!(
-            progress_text(&json!({"item":{"type":"command_execution","text":"ignore"}})).is_none()
-        );
-        assert_eq!(
-            progress_text(&json!({"item":{"type":"agent_message","text":"{\"tasks\":[]}"}})),
-            Some("已收到回复，正在校验事项数据…".into())
-        );
+    fn native_tool_events_are_isolation_failures_but_text_tool_requests_are_not() {
+        for kind in [
+            "mcp_tool_call",
+            "command_execution",
+            "web_search",
+            "file_change",
+        ] {
+            for phase in ["item.started", "item.completed"] {
+                let event = json!({"type":phase,"item":{"type":kind}});
+                assert!(is_native_tool_event(&event));
+                assert!(matches!(analysis_event(&event),
+                    Some(super::super::AnalysisEvent::Stream { kind, text, .. })
+                    if kind == "phase" && text.contains("未授权的原生工具") && !text.contains("超限")));
+            }
+        }
+        let text_request = json!({"type":"item.completed","item":{"type":"agent_message","text":"{\"tool_call\":{\"name\":\"read_context\",\"arguments\":\"{}\"},\"result\":null}"}});
+        assert!(!is_native_tool_event(&text_request));
+        assert!(matches!(analysis_event(&text_request),
+            Some(super::super::AnalysisEvent::Stream { kind, .. }) if kind == "content"));
     }
 }

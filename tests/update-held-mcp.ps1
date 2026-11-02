@@ -105,6 +105,24 @@ try {
     if($taskAfter -ne $taskExpectedConfig){throw 'Saved configuration changed'}
     & python $taskFixtureReader verify $taskData
     if($LASTEXITCODE -ne 0){throw 'Legacy task field cleanup or preservation failed'}
+    $taskCliPath=Join-Path $taskInstall 'ss.exe'
+    if(Test-Path -LiteralPath $taskCliPath) {
+        # Hold only the new CLI's input reader. No request reaches the backend.
+        $taskCli=Start-Fixture $taskCliPath @('call','memory_save','--input','-') -Stdin
+        foreach($taskAction in @('Probe','ReleaseHelpers')) {
+            $taskCliGuard=Start-Fixture (Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe') @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot '../installer/process.ps1'),'-InstallDir',$taskInstall,'-Action',$taskAction)
+            if(!$taskCliGuard.WaitForExit(10000) -or $taskCliGuard.ExitCode -ne 10){throw 'An active CLI did not block replacement'}
+            if($taskCli.HasExited){throw 'Update preparation stopped an active CLI'}
+        }
+        $taskUninstall=Start-Fixture (Join-Path $taskInstall 'Uninstall.exe') @() -RawArguments "/S /TEST _?=$taskInstall"
+        if(!$taskUninstall.WaitForExit(15000)){throw 'Blocked fixture uninstall did not finish'}
+        if(!(Test-Path -LiteralPath (Join-Path $taskInstall 'shishi.exe')) -or !(Test-Path -LiteralPath $taskCliPath)){throw 'Uninstall partially removed a held installation'}
+        $taskCli.Kill();$taskCli.WaitForExit(10000) | Out-Null
+        $taskUninstall=Start-Fixture (Join-Path $taskInstall 'Uninstall.exe') @() -RawArguments "/S /TEST _?=$taskInstall"
+        if(!$taskUninstall.WaitForExit(15000) -or $taskUninstall.ExitCode -ne 0){throw 'Fixture uninstall failed after CLI exit'}
+        if((Test-Path -LiteralPath (Join-Path $taskInstall 'shishi.exe')) -or (Test-Path -LiteralPath $taskCliPath)){throw 'Uninstall did not remove both binaries'}
+        if((Get-Content -LiteralPath $taskSentinel -Raw) -ne 'Synthetic upgrade preservation'){throw 'Uninstall changed saved data'}
+    }
     $taskResult=@{target_version=$TargetVersion;held_external_mcp='released';reopened_desktop='blocked without stopping desktop or helpers';unrelated_installation_mcp='still serving';external_owner='preserved';upgrade='passed';saved_data='preserved';saved_configuration='preserved';restart='passed';directory=$taskRoot}
     $taskResult | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Report -Encoding utf8
     $taskResult | ConvertTo-Json -Depth 5
