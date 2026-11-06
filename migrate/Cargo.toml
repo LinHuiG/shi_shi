@@ -1,0 +1,16 @@
+[package]
+name = "shishi-migrate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Run once by the installer to convert 1.1.68 data, then deleted. Built on its
+# own so the `import` feature never reaches shishi.exe.
+[dependencies]
+shishi-core = { path = "../core", features = ["import"] }
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

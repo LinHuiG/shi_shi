@@ -22,7 +22,7 @@ window.shishiPlugin.call(method,params={})返回Promise；只允许声明的方�
 页面只支持内联脚本、内联样式及data图片，不能访问宿主DOM、网络或任意文件；本机能力通过call提供。
 DLL另外导出uint8_t *shishi_plugin_settings_call(const uint8_t *input,size_t input_len,size_t *output_len,uint32_t (*cancelled)(uintptr_t),uintptr_t context)。输出仍用shishi_plugin_free释放，仍须shishi_plugin_abi()==1。
 配置请求context含plugin_dir和timeout_ms=90000；config在打开会话时固定。取消回调与context只在调用期间有效。配置与采集共用一个无窗口插件工作进程，取消或90秒超时后终止；配置请求最多2 MiB，响应最多32 MiB。
-宿主不导出SQLite ABI或共享sqlite3.dll；来源解密与数据库依赖由插件负责。完整教程见docs/PLUGINS.md。
+宿主不导出SQLite ABI或共享sqlite3.dll；来源解密与数据库依赖由插件负责。完整教程见docs/PLUGIN_ADAPTATION.md。
 
 C ABI（禁止跨 DLL 传 Rust String/Vec/trait 对象）
 uint32_t shishi_plugin_abi(void); // 返回1
@@ -31,7 +31,7 @@ void shishi_plugin_free(uint8_t *output, size_t output_len);
 输入输出为 UTF-8 JSON，不依赖结尾0。由DLL分配输出，宿主调用同一DLL的free后才能卸载。单次请求/响应不超过32 MiB。
 返回信封 {"ok":true,"result":...} 或 {"ok":false,"error":"说明"}。
 plugin-sdk::export_plugin!(handler) 提供 Rust 导出、分配释放和 panic 捕获。
-宿主在独立工作进程中串行调用所有插件，DLL按需加载并持续复用；普通业务失败不卸载DLL。致命异常、超时或在途取消会回收整个工作进程及子进程，后续调用重新创建，连续失败会退避。不要在调用返回后使用借用的回调、context或缓冲区。插件应遵守context.timeout_ms，正确释放自己的资源；内存状态可能随工作进程重建丢失。更新或卸载插件会回收工作进程。隔离不限制插件的本机权限。
+宿主在独立工作进程中串行调用所有插件，DLL按需加载并持续复用；普通业务失败不卸载DLL。致命异常、超时或在途取消会回收整个工作进程及子进程，后续调用重新创建。插件不要读取标准输入，也不要依赖标准输出（宿主用它们与工作进程通信，插件写入的输出会被忽略）。不要在调用返回后使用借用的回调、context或缓冲区。插件应遵守context.timeout_ms，正确释放自己的资源；内存状态可能随工作进程重建丢失。更新或卸载插件会回收工作进程。隔离不限制插件的本机权限。
 
 请求
 {"protocol":1,"method":"...","config":{...},"params":{...},"context":{"plugin_dir":"绝对包目录","work_dir":"可写临时目录","timeout_ms":90000}}

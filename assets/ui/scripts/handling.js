@@ -1,623 +1,320 @@
-// A deliberately small Markdown renderer: no HTML, images, or active URL schemes.
-function handlingMd(value) {
-  const inline = (text) => {
-    const re = /`([^`\n]+)`|\[([^\]\n]+)\]\(([^\s)]+)\)|\*\*([^*\n]+)\*\*|\*([^*\n]+)\*/g;
-    let out = '',
-      last = 0,
-      m;
-    while ((m = re.exec(text))) {
-      out += esc(text.slice(last, m.index));
-      if (m[1] != null) out += `<code>${esc(m[1])}</code>`;
-      else if (m[2] != null) {
-        let url;
-        try {
-          url = new URL(m[3]);
-        } catch {}
-        out +=
-          url && ['https:', 'http:'].includes(url.protocol)
-            ? `<a href="${esc(url.href)}" target="_blank" rel="noopener noreferrer">${esc(m[2])}</a>`
-            : esc(m[0]);
-      } else out += m[4] != null ? `<strong>${esc(m[4])}</strong>` : `<em>${esc(m[5])}</em>`;
-      last = re.lastIndex;
-    }
-    return out + esc(text.slice(last));
-  };
-  const lines = String(value || '').split(/\r?\n/);
-  let html = '',
-    code = null,
-    list = '',
-    paragraph = [];
-  const flush = () => {
-    if (paragraph.length) {
-      html += `<p>${paragraph.map(inline).join('<br>')}</p>`;
-      paragraph = [];
-    }
-    if (list) {
-      html += `</${list}>`;
-      list = '';
-    }
-  };
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (/^\s*```/.test(line)) {
-      if (code !== null) {
-        html += `<pre><code>${esc(code.join('\n'))}</code></pre>`;
-        code = null;
-      } else {
-        flush();
-        code = [];
-      }
-      continue;
-    }
-    if (code !== null) {
-      code.push(line);
-      continue;
-    }
-    if (line.includes('|') && i + 1 < lines.length && /^\s*\|?\s*:?-{3,}/.test(lines[i + 1])) {
-      flush();
-      const cells = (x) =>
-        x
-          .trim()
-          .replace(/^\||\|$/g, '')
-          .split('|')
-          .map((x) => inline(x.trim()));
-      html +=
-        '<div class="md-table"><table><thead><tr>' +
-        cells(line)
-          .map((x) => `<th>${x}</th>`)
-          .join('') +
-        '</tr></thead><tbody>';
-      i++;
-      while (i + 1 < lines.length && lines[i + 1].includes('|'))
-        html +=
-          '<tr>' +
-          cells(lines[++i])
-            .map((x) => `<td>${x}</td>`)
-            .join('') +
-          '</tr>';
-      html += '</tbody></table></div>';
-      continue;
-    }
-    const heading = line.match(/^(#{1,6})\s+(.*)$/),
-      bullet = line.match(/^\s*(?:([-+*])|\d+\.)\s+(.*)$/),
-      quote = line.match(/^>\s?(.*)$/);
-    if (heading) {
-      flush();
-      const n = Math.min(heading[1].length + 1, 6);
-      html += `<h${n}>${inline(heading[2])}</h${n}>`;
-    } else if (bullet) {
-      if (paragraph.length) flush();
-      const type = bullet[1] ? 'ul' : 'ol';
-      if (list !== type) {
-        flush();
-        html += `<${type}>`;
-        list = type;
-      }
-      html += `<li>${inline(bullet[2])}</li>`;
-    } else if (quote) {
-      flush();
-      html += `<blockquote>${inline(quote[1])}</blockquote>`;
-    } else if (!line.trim()) flush();
-    else {
-      if (list) flush();
-      paragraph.push(line);
-    }
-  }
-  flush();
-  if (code !== null) html += `<pre><code>${esc(code.join('\n'))}</code></pre>`;
-  return `<div class="handling-md">${html}</div>`;
-}
-function handlingDuration(ms) {
-  if (!Number.isFinite(ms) || ms < 0) return '未知';
-  const s = Math.floor(ms / 1000);
-  return s >= 3600
-    ? `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分`
-    : s >= 60
-      ? `${Math.floor(s / 60)} 分 ${s % 60} 秒`
-      : `${s} 秒`;
-}
-function handlingProcess(round) {
-  return (
-    (round.steps || [])
-      .map(
-        (step) =>
-          `<details class="handling-step"><summary>${esc({ agentMessage: '进展说明', commandExecution: '执行命令', fileChange: '修改文件', mcpToolCall: '工具与上下文查询', webSearch: '网页检索', userMessage: '输入消息', functionCall: '执行工具', functionCallOutput: '工具输出' }[step.kind] || step.kind)} · ${esc(step.status || '已记录')}${step.duration_ms != null ? ' · ' + handlingDuration(step.duration_ms) : ''}</summary>${step.kind === 'agentMessage' ? handlingMd(step.text) : `<pre><code>${esc(step.text)}</code></pre>`}</details>`,
-      )
-      .join('') || '<p class="helper">暂未收到执行过程；只展示该接入返回的可见记录。</p>'
-  );
-}
-// Durable Codex investigations. User text is always escaped before rendering.
-const handlingDesktop = (r) =>
-  r?.connection?.driver === 'codex' || r?.transport === 'desktop' || r?.desktop_control;
-const handlingState = (r) =>
-  r?.stop_requested
-    ? r.status
-    : r?.desktop_control && r?.transport !== 'desktop'
-      ? r.desktop_status || 'syncPending'
-      : r?.status;
-const handlingLabels = {
-  ended: '本次处置已结束',
-  detached: '本次处置已结束',
-  stopping: '正在终止处置',
-  terminated: '处置已终止',
-  syncPending: '等待同步',
-  starting: '正在创建会话',
-  submitting: '正在提交',
-  inProgress: '调查中',
-  waiting: '等待你处理',
-  completed: '已有结论 · 待你确认',
-  failed: '执行失败',
-  interrupted: '已停止',
-  uncertain: '提交结果待核实',
-  disconnected: '连接中断 · 请同步',
-  idle: '尚未执行',
-};
-const handlingActive = (r) =>
-  [
-    'starting',
-    'submitting',
-    'inProgress',
-    'waiting',
-    'uncertain',
-    'disconnected',
-    'stopping',
-  ].includes(r?.status);
-let handlingIndex;
-function indexHandlingRuns(rebuild = false) {
-  const rows = state?.handling;
-  if (rebuild || !handlingIndex || handlingIndex.state !== state || handlingIndex.rows !== rows || handlingIndex.size !== rows?.length) {
-    const tasks = new Map();
-    for (const run of rows || []) {
-      const taskId = run.task_id;
-      let list = tasks.get(taskId);
-      if (!list) tasks.set(taskId, list = []);
-      list.push(run);
-    }
-    handlingIndex = {state, rows, size: rows?.length, tasks};
-  }
-  return handlingIndex.tasks;
-}
-const taskRuns = (id) =>
-  (indexHandlingRuns().get(id) || []).filter((r) => r.status !== 'setupCancelled');
-const taskRun = (id) =>
-  taskRuns(id)
-    .filter((r) => r.current_source !== false)
-    .at(-1);
-const handlingRestart = (r) =>
-  ['terminated', 'detached', 'ended'].includes(r?.status) ||
-  (r?.restartable ?? (r?.status === 'failed' && (r.rounds || []).every((x) => x.not_submitted)));
-const handlingButton = (id) => {
-  if (handlingStarting.has(id)) return 'AI 处置中';
-  const r = taskRun(id);
-  return r && !handlingRestart(r)
-    ? (handlingActive({...r,status:handlingState(r)}) ? 'AI 处置中' : 'AI 处置 / 追问')
-    : taskRuns(id).length
-      ? '重新处置'
-      : 'AI一键处置';
-};
-let handlingProposal = null, handlingProjects = [];
-const handlingDrafts = new Map(),
-  handlingErrors = new Map(),
-  handlingSending = new Set(),
-  handlingStarting = new Set();
-function handlingEndedSummary(t) {
-  const r = taskRun(t.id);
-  return r && ['terminated','detached','ended'].includes(r.status)
-    ? `<section class="handling-terminated"><span class="helper">本次处置已结束，可重新发起。</span><button class="quiet" data-handle="history" data-task-id="${esc(t.id)}">查看上次过程</button></section>` : '';
-}
-function handlingPanel(t) {
-  const r = taskRun(t.id);
-  if (!r) return '';
-  const desktop = handlingDesktop(r),
-    waiting =
-      r.waiting_on === 'approval'
-        ? '等待审批，请在 Codex 处理'
-        : r.waiting_on === 'input'
-          ? '等待你在 Codex 回答'
-          : r.waiting_on === 'sync' ? '同步暂不可用' : null,
-    status=waiting||(handlingState(r)==='inProgress'?'':handlingLabels[handlingState(r)]||handlingState(r));
-  return `<section class="handling-panel handling-conversation">
- <header class="handling-heading"><div class="handling-heading-main"><h3 id="handling-window-title">${esc(t.title)}</h3><span class="helper handling-source">AI 处置 · ${esc(r.project_name)} · ${esc(r.connection?.name || (desktop?'Codex':'来源未记录'))}</span></div><div class="handling-heading-actions">${status?`<span class="handling-state-label" role="status">${esc(status)}</span>`:''}
- ${r.thread_id&&desktop?`<button class="quiet handling-open" data-handle="open" data-task-id="${esc(t.id)}">在 Codex 打开 ↗</button>`:''}
- <details class="handling-more"><summary aria-label="更多处置操作">•••</summary><div>
- <button class="quiet" data-handle="sync" data-task-id="${esc(t.id)}">同步状态</button>
- ${(!desktop||!r.thread_id)&&['uncertain','disconnected','starting','submitting'].includes(r.status)?`<button class="quiet" data-handle="reconnect" data-task-id="${esc(t.id)}">恢复同步</button>`:''}
- <button class="quiet" data-handle="terminate" data-task-id="${esc(t.id)}" data-run-id="${esc(r.id)}" ${desktop?'title="结束后拾事不再同步，Codex 继续运行"':''}>${desktop?'结束本次处置':r.status==='stopping'?'重试终止':handlingActive(r)?'终止 AI 处置':'结束本次处置'}</button>
- </div></details><button class="quiet handling-window-close" data-handling-close aria-label="关闭 AI 处置页面">×</button></div></header>
- ${!desktop&&r.requests?.length?`<button class="primary" data-handle="requests" data-task-id="${esc(t.id)}">处理请求 (${r.requests.length})</button>`:''}
- ${r.error?`<div class="error-box">${esc(r.error)}</div>`:''}${r.sync_notice?`<div class="helper handling-sync-notice">${esc(r.sync_notice)}</div>`:''}${handlingLivePanel(r)}<div id="handling-dock" class="handling-dock">${handlingRestart(r)?'<p class="helper">本次处置已结束，可在事项中重新发起。</p>':handlingComposer(t.id)}</div></section>`;
-}
-async function beginHandling(id) {
-  if (handlingStarting.has(id)) {
-    toast('正在创建处置，请稍候');
-    return;
-  }
-  const existing = taskRun(id);
-  if (existing && !handlingRestart(existing)) {
-    handlingFollowup(id);
-    return;
-  }
-  const p = await rpc('handling_prepare', { task_id: id });
-  handlingProjects = p.projects;
-  const recommended = p.suggested?.project_id || p.default_project_id;
-  const choices = p.projects.filter((x) => x.id === recommended);
+// AI 处置: ShiShi starts the task's session in Codex or DSH with the chosen
+// model, effort and project, runs its first turn and hands it over; the
+// user continues in that client, which writes back through the CLI.
 
-  setModal(
-    `<h2>AI一键处置</h2><p class="subtitle">选择项目或本地目录，会话按所选执行端保存，可继续追问。首轮调查定位并给出建议，沿用所选项目说明、技能、权限和审批。</p><p class="helper">可切换项目，也可选择本地目录。</p><div class="form-group"><label>项目</label><select id="handling-project"><option value="">请选择项目</option>${p.projects.map((x, i) => `<option value="${i}" ${choices.length === 1 && x === choices[0] ? 'selected' : ''}>${esc(x.name)} · ${esc(x.cwd)}</option>`).join('')}</select><button style="margin-top:8px" data-handle="add-project">＋ 选择本地项目目录</button></div><div class="form-group"><label>本次补充说明（可选）</label><textarea id="handling-instructions" maxlength="2000" placeholder="例如：先核对复现步骤和相关日志。"></textarea></div><details style="margin-top:12px"><summary>查看当前通用调查提示词</summary><pre style="white-space:pre-wrap">${esc(p.boundary || '')}\n\n${esc(p.prompt)}</pre></details><p class="helper">${esc(modelChoice('handling').model || '默认模型')} · ${esc(modelChoice('handling').reasoning_effort || '默认推理强度')}。上下文接口只提供此事项相关会话和时间范围内的消息。</p>${taskRuns(id).some((r) => handlingActive(r) && r.thread_id) ? '<label class="check"><input id="handling-stop-previous" type="checkbox">确认停止原处置后开始</label>' : ''}<div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-handle="submit" data-task-id="${esc(id)}">开始调查</button></div>`,
-  );
+const handlingLabels = {
+  running: '首轮进行中',
+  completed: '已交给客户端',
+  failed: '启动失败',
+  interrupted: '首轮已中断',
+};
+const handlingClient = (r) => ((r?.driver || r?.connection?.driver) === 'dsh' ? 'DSH' : 'Codex');
+const taskRun = (id) => (state?.handling || []).find((r) => r.task_id === id);
+let handlingChoices = null;
+const handlingStarting = new Set();
+
+// The detail action: start a session, or go back to the one handed over.
+function handlingButton(id) {
+  const r = taskRun(id);
+  if (handlingStarting.has(id) || r?.status === 'running') return 'AI 处置中';
+  return r?.thread_id ? `在 ${handlingClient(r)} 中继续` : 'AI一键处置';
 }
 function handlingBadge(id) {
   const r = taskRun(id);
-  if (!r) return '';
-  const status = handlingState(r),
-    busy = ['starting', 'submitting', 'inProgress'].includes(status),
-    text = busy
-      ? r.desktop_control
-        ? 'Codex 正在处理'
-        : 'AI 处理中'
-      : {
-          waiting: 'AI 等待你处理',
-          completed: 'AI 已有结论',
-          interrupted: 'AI 已中断',
-          failed: 'AI 失败',
-          uncertain: 'AI 待核实',
-          disconnected: 'AI 连接中断',
-        }[status] || (status === 'syncPending' ? '等待同步' : '');
-  return text
-    ? `<span class="badge ${busy ? 'blue' : status === 'completed' ? 'green' : status === 'waiting' ? 'high' : ''}" data-handling-status="${esc(status)}">${busy ? '<span class="spin"></span>' : ''}${text}</span>`
-    : '';
+  if (r?.status === 'running')
+    return `<span class="badge blue" data-handling-status="running"><span class="spin"></span>${handlingClient(r)} 处置中</span>`;
+  return r?.status === 'failed' ? '<span class="badge" data-handling-status="failed">AI 处置失败</span>' : '';
 }
-function handlingComposerHost(id) {
-  return Array.from(document.querySelectorAll('[data-composer-task]')).find(
-    (el) => el.dataset.composerTask === id,
-  );
+// Under the actions: where the session lives, a failure, and a fresh start.
+function handlingNote(t) {
+  const r = taskRun(t.id);
+  if (!r || r.status === 'running') return '';
+  const where = r.thread_id
+    ? `已交给 ${esc(handlingClient(r))}${r.project_name ? ` · ${esc(r.project_name)}` : ''}`
+    : esc(handlingLabels[r.status] || r.status);
+  return `<section class="handling-note"><span class="helper">${where}</span>${r.error ? `<span class="helper error-text">${esc(r.error)}</span>` : ''}${r.thread_id ? `<button class="quiet small" data-handle="restart" data-task-id="${esc(t.id)}">重新处置</button>` : ''}</section>`;
 }
-function handlingModelCaption(run) {
-  const previous=run?.model_reported===false&&run?.last_reported_model;
-  let model=run?.model_reported===false?(previous||'模型未报告'):run?.model||'模型未报告';
-  try{const route=JSON.parse(model);if(Array.isArray(route)&&route.length===2)model=route.join(' / ');}catch{}
-  const reportedEffort=run?.model_reported===false?(previous?run.last_reported_effort:''):run?.effort;
-  const effort=({none:'无',minimal:'最低',low:'低',medium:'中',high:'高',xhigh:'很高',max:'最高',ultra:'最高'})[reportedEffort]||reportedEffort;
-  return model+(previous?'（上次报告）':'')+(effort?' · '+effort:'');
+
+// ---------------------------------------------------------------- pickers
+
+// The start dialog picks connection, model and effort in one menu; the
+// settings' handling model is the default and a choice lasts only for this
+// session.
+const handlingConnection = (id) => handlingChoices?.connections.find((c) => c.id === id);
+const handlingModelName = (m) => [m.providerName, m.displayName || m.model].filter(Boolean).join(' / ');
+function handlingEfforts(pick) {
+  const model = handlingConnection(pick.connection)?.models.find((m) => m.model === pick.model);
+  const efforts = (model?.supportedReasoningEfforts || []).map((e) => e.reasoningEffort);
+  if (pick.effort && !efforts.includes(pick.effort)) efforts.push(pick.effort);
+  return efforts;
 }
-function updateHandlingSending(id) {
-  const host = handlingComposerHost(id);
-  if (!host) return;
-  const sending = handlingSending.has(id);
-  host.querySelector('textarea').disabled = sending;
-  const button=host.querySelector('[data-handle=send]');
-  if(button)button.disabled=sending||!host.querySelector('textarea').value.trim();
-  host.setAttribute('aria-busy', String(sending));
+function handlingChip(pick) {
+  const c = handlingConnection(pick.connection),
+    m = c?.models.find((m) => m.model === pick.model);
+  const model = m ? m.displayName || m.model : pick.model || '默认模型';
+  const effort = pick.effort ? effortNames[pick.effort] || pick.effort : '默认强度';
+  const title = [c?.name || handlingClient(c), m ? handlingModelName(m) : model, effort].join(' · ');
+  return `<button type="button" class="handling-chip" data-handling-menu="model" aria-haspopup="listbox" aria-expanded="false" title="${esc(title)}，仅本次会话生效"><span>${esc(model)}</span><small>${esc(effort)}</small>${icon('chevron')}</button>`;
 }
-function handlingComposer(id) {
-  const r = taskRun(id),
-    sending = handlingSending.has(id),
-    savedError = handlingErrors.get(id),
-    error =
-      savedError?.run_id === r?.id && savedError?.thread_id === r?.thread_id
-        ? savedError.message
-        : '';
-  return `<div class="handling-composer" data-composer-task="${esc(id)}" data-run-id="${esc(r?.id)}" data-thread-id="${esc(r?.thread_id)}" aria-busy="${sending}"><textarea rows="1" id="handling-question" aria-label="继续追问当前 AI" maxlength="6000" ${sending ? 'disabled' : ''} placeholder="补充线索，或继续追问…">${esc(handlingDrafts.get(id) || '')}</textarea><div class="handling-composer-meta"><span class="handling-composer-model">${esc(handlingModelCaption(r))}</span><button class="handling-send" data-handle="send" data-task-id="${esc(id)}" aria-label="发送追问" title="发送追问" ${sending || !handlingDrafts.get(id)?.trim() ? 'disabled' : ''}>↑</button></div><div class="error-box" id="handling-inline-error" ${error ? '' : 'hidden'}>${esc(error)}</div></div>`;
+
+let handlingMenu = null;
+function closeHandlingMenu(focus = false) {
+  const menu = handlingMenu;
+  if (!menu) return;
+  handlingMenu = null;
+  menu.el.remove();
+  menu.anchor.setAttribute('aria-expanded', 'false');
+  if (focus && menu.anchor.isConnected) menu.anchor.focus({ preventScroll: true });
 }
-async function sendHandlingQuestion(id) {
-  if (handlingSending.has(id)) return;
-  const host = handlingComposerHost(id);
-  if (!host) return;
-  const identity = { run_id: host.dataset.runId, thread_id: host.dataset.threadId };
+function handlingMenuItems(kind, host, query) {
+  const q = query.trim().toLowerCase(),
+    hit = (...texts) =>
+      !q ||
+      texts.some((t) =>
+        String(t || '')
+          .toLowerCase()
+          .includes(q),
+      );
+  const option = (attrs, selected, body, title = '') =>
+    `<button type="button" role="option" ${attrs} aria-selected="${selected}" ${title ? `title="${esc(title)}"` : ''}>${selected ? icon('check') : '<span class="icon"></span>'}<span class="handling-option-text">${body}</span></button>`;
+  if (kind === 'project') {
+    const current = handlingChoices.project;
+    return (handlingChoices.list || [])
+      .filter((p) => hit(p.name, p.cwd))
+      .map((p) =>
+        option(
+          `data-project="${esc(p.id)}"`,
+          p.id === current,
+          `<b>${esc(p.name)}</b><small>${esc(p.cwd)}</small>`,
+          p.cwd,
+        ),
+      )
+      .join('');
+  }
+  const pick = handlingChoices.pick,
+    connections = handlingChoices.connections;
+  const groups = connections
+    .map((c) => {
+      const items = [
+        { model: '', label: '接入默认模型' },
+        ...c.models.map((m) => ({ model: m.model, label: handlingModelName(m) })),
+      ]
+        .filter((m) => hit(m.label, m.model, c.name))
+        .map((m) =>
+          option(
+            `data-connection="${esc(c.id)}" data-model="${esc(m.model)}"`,
+            c.id === pick.connection && m.model === (pick.model || ''),
+            `<span>${esc(m.label)}</span>`,
+            m.label,
+          ),
+        )
+        .join('');
+      return (
+        items &&
+        `<div role="group" aria-label="${esc(c.name || handlingClient(c))}"><div class="handling-menu-group">${esc(c.name || handlingClient(c))}</div>${items}</div>`
+      );
+    })
+    .join('');
+  const efforts = ['', ...handlingEfforts(pick)]
+    .map(
+      (e) =>
+        `<button type="button" data-effort="${esc(e)}" aria-pressed="${e === (pick.effort || '')}">${esc(e ? effortNames[e] || e : '默认')}</button>`,
+    )
+    .join('');
+  return `${groups}<div class="handling-menu-efforts" role="group" aria-label="推理强度"><span>推理强度</span>${efforts}</div>`;
+}
+function renderHandlingMenu() {
+  const { el, kind, host, input } = handlingMenu;
+  const list = el.querySelector('.handling-menu-list');
+  list.innerHTML = handlingMenuItems(kind, host, input.value) || '<p class="helper">没有匹配项</p>';
+}
+// Opens next to its anchor inside the viewport and the dialog: below for
+// the project field, above for the bottom-left model chip when it fits.
+function openHandlingMenu(anchor) {
+  closeHandlingMenu();
+  const kind = anchor.dataset.handlingMenu,
+    host = anchor.closest('[data-handling-picker]'),
+    bounds = (anchor.closest('.dialog, .handling-window') || document.body).getBoundingClientRect();
+  const el = document.createElement('div');
+  el.className = 'handling-menu';
+  el.innerHTML = `<input type="search" aria-label="${kind === 'project' ? '搜索项目' : '搜索模型'}" placeholder="${kind === 'project' ? '搜索项目或路径' : '搜索模型或接入'}" autocomplete="off"><div class="handling-menu-list" role="listbox"></div>`;
+  document.body.append(el);
+  handlingMenu = { el, kind, host, anchor, input: el.querySelector('input') };
+  renderHandlingMenu();
+  const a = anchor.getBoundingClientRect(),
+    left = Math.max(bounds.left + 8, 8),
+    right = Math.min(bounds.right - 8, innerWidth - 8);
+  el.style.width = `${Math.min(kind === 'project' ? Math.max(a.width, 320) : 340, right - left)}px`;
+  const below = innerHeight - a.bottom - 12,
+    above = a.top - 12,
+    up = kind === 'model' ? above >= Math.min(el.offsetHeight, 360) || above > below : below < 200 && above > below;
+  el.style.maxHeight = `${Math.min(420, up ? above : below)}px`;
+  el.style.left = `${Math.max(left, Math.min(a.left, right - el.offsetWidth))}px`;
+  el.style.top = `${up ? a.top - 4 - el.offsetHeight : a.bottom + 4}px`;
+  anchor.setAttribute('aria-expanded', 'true');
+  handlingMenu.input.focus({ preventScroll: true });
+}
+async function chooseHandlingConnection(id) {
+  const c = handlingChoices;
+  if (c.loading === id) return;
+  const kept = c.project;
+  c.loading = id;
+  c.list = null;
+  c.project = '';
+  syncHandlingStart();
+  let list = [],
+    error = '';
   try {
-    const question = host.querySelector('textarea').value.trim();
-    if (!question) throw Error('请填写追问内容');
-    const target = {
-      task_id: id,
-      run_id: host.dataset.runId,
-      thread_id: host.dataset.threadId,
-      text: question,
-    };
-    handlingSending.add(id);
-    try {
-      handlingErrors.delete(id);
-      host.querySelector('.error-box').hidden = true;
-      updateHandlingSending(id);
-      const reply = await rpc('handling_followup', target);
-      const current=handlingComposerHost(id);
-      if (taskRun(id)?.id===identity.run_id && taskRun(id)?.thread_id===identity.thread_id && (handlingDrafts.get(id)||question).trim()===question) {
-        handlingDrafts.delete(id);
-        if(current?.dataset.runId===identity.run_id && current?.dataset.threadId===identity.thread_id) {current.querySelector("textarea").value="";resizeHandlingComposer(current.querySelector("textarea"));}
-      }
-      await refreshState(true);
-      toast(reply?.steered ? '已插话到当前任务' : '已发送到原会话');
-    } finally {
-      handlingSending.delete(id);
-      updateHandlingSending(id);
-    }
-  } catch (error) {
-    if (error.message === '本次处置已终止') {
-      handlingErrors.delete(id);
-      await refreshState(true);
-      return;
-    }
-    handlingErrors.set(id, { ...identity, message: error.message });
-    const current = handlingComposerHost(id),
-      inline =
-        current?.dataset.runId === identity.run_id &&
-        current?.dataset.threadId === identity.thread_id
-          ? current.querySelector('.error-box')
-          : null;
-    if (inline) {
-      inline.hidden = false;
-      inline.textContent = error.message;
-    } else toast(error.message);
-    await refreshState(false);
+    list = await rpc('handling_projects', { connection_id: id });
+  } catch (e) {
+    error = e.message;
   }
+  if (handlingChoices !== c || c.loading !== id) return;
+  c.loading = '';
+  c.list = list;
+  c.error = error;
+  // A project chosen before the model stays chosen while the new list has it.
+  c.project = ([kept, c.suggested].find((id) => id && list.some((p) => p.id === id)) ?? list[0]?.id) || '';
+  syncHandlingStart();
 }
-function handlingFollowup(id) {
-  openHandlingWindow(id);
-}
-
-document.addEventListener('click',e=>{
-  for(const menu of document.querySelectorAll('.handling-more[open]')) {
-    if(!menu.contains(e.target) || e.target.closest('[data-handle]'))menu.open=false;
+document.addEventListener('click', (e) => {
+  const anchor = e.target.closest('[data-handling-menu]');
+  if (anchor) return handlingMenu?.anchor === anchor ? closeHandlingMenu() : openHandlingMenu(anchor);
+  const b = handlingMenu && e.target.closest('.handling-menu button');
+  if (!b) return;
+  const { kind, host } = handlingMenu;
+  if (kind === 'project') {
+    handlingChoices.project = b.dataset.project;
+    closeHandlingMenu(true);
+    return syncHandlingStart();
   }
+  const pick = { ...handlingChoices.pick };
+  if (b.dataset.effort !== undefined) pick.effort = b.dataset.effort;
+  else {
+    if (pick.connection !== b.dataset.connection) pick.effort = '';
+    Object.assign(pick, { connection: b.dataset.connection, model: b.dataset.model });
+    if (!handlingEfforts(pick).includes(pick.effort)) pick.effort = '';
+  }
+  const switched = pick.connection !== handlingChoices.pick.connection;
+  handlingChoices.pick = pick;
+  host.innerHTML = handlingChip(pick);
+  handlingMenu.anchor = host.firstElementChild;
+  if (b.dataset.effort !== undefined) closeHandlingMenu(true);
+  else renderHandlingMenu();
+  if (switched) void chooseHandlingConnection(pick.connection);
 });
-function resizeHandlingComposer(field) {
-  if (!field) return;
-  const previous = field.scrollTop;
-  field.style.height = '0px';
-  field.style.height = Math.max(40, Math.min(field.scrollHeight, 160)) + 'px';
-  field.style.overflowY = field.scrollHeight > 160 ? 'auto' : 'hidden';
-  field.scrollTop = previous;
-
-}
-function resizeHandlingComposers() {
-  document.querySelectorAll('#handling-question').forEach(resizeHandlingComposer);
-}
 document.addEventListener('input', (e) => {
-  if (e.target.id === 'handling-question') {
-    const id = e.target.closest('[data-composer-task]').dataset.composerTask;
-    handlingDrafts.set(id, e.target.value);
-    updateHandlingSending(id);
-    resizeHandlingComposer(e.target);
-    resizeHandlingStreams();
-  }
+  if (handlingMenu && e.target === handlingMenu.input) renderHandlingMenu();
 });
-document.addEventListener('keydown', (e) => {
-  if (
-    e.target.id !== 'handling-question' ||
-    e.key !== 'Enter' ||
-    e.isComposing ||
-    e.keyCode === 229
-  )
-    return;
-  e.preventDefault();
-  if (e.repeat || e.target.disabled) return;
-  if (e.ctrlKey) {
-    const field = e.target;
-    field.setRangeText('\n', field.selectionStart, field.selectionEnd, 'end');
-    field.dispatchEvent(new Event('input', { bubbles: true }));
-    return;
-  }
-  void sendHandlingQuestion(e.target.closest('[data-composer-task]').dataset.composerTask);
+document.addEventListener('pointerdown', (e) => {
+  if (handlingMenu && !e.target.closest('.handling-menu, [data-handling-menu]')) closeHandlingMenu();
 });
-// Present the requested scope without interpreting command text as safe.
-const approvalBusy = new Set();
-function handlingRequests(id) {
-  const run = taskRun(id),
-    request = run?.requests?.[0];
-  if (!request) {
-    toast('当前没有待处理请求，请同步状态');
-    return;
-  }
+addEventListener('resize', () => closeHandlingMenu());
+// Captured so Esc closes the menu before it closes the dialog.
+document.addEventListener(
+  'keydown',
+  (e) => {
+    if (!handlingMenu || e.isComposing) return;
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      return closeHandlingMenu(true);
+    }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    const items = [...handlingMenu.el.querySelectorAll('[role="option"]')];
+    if (!items.length) return;
+    e.preventDefault();
+    const at = items.indexOf(document.activeElement),
+      next = e.key === 'ArrowDown' ? (at + 1) % items.length : at <= 0 ? items.length - 1 : at - 1;
+    items[next].focus();
+  },
+  true,
+);
+
+// ---------------------------------------------------------------- start
+
+// Projects come only from the chosen connection's client; a suggestion
+// counts only when that client offers it.
+function syncHandlingStart() {
+  const field = $('#handling-project');
+  if (!field || !handlingChoices) return;
+  const c = handlingChoices,
+    project = c.list?.find((p) => p.id === c.project),
+    client = handlingClient(handlingConnection(c.pick.connection));
+  field.disabled = !c.list?.length;
+  field.innerHTML = `<span class="handling-option-text">${project ? `<b>${esc(project.name)}</b><small>${esc(project.cwd)}</small>` : `<b>${c.list ? '没有可选项目' : '正在读取项目…'}</b>`}</span>${icon('chevron')}`;
+  field.title = project?.cwd || '';
+  const note = $('#handling-project-note');
+  note.textContent = c.error
+    ? `读取 ${client} 项目失败：${c.error}`
+    : c.list && !c.list.length
+      ? `请先在 ${client} 中添加项目。`
+      : '';
+  note.hidden = !note.textContent;
+  note.classList.toggle('error-text', !!c.error);
+  $('#dialog [data-handle="submit"]').disabled = !project;
+}
+async function beginHandling(id) {
+  const p = await rpc('handling_prepare', { task_id: id });
+  if (!p.default) throw Error('请先在设置中添加 Codex 或 DeepSeek Harness 接入');
+  const d = p.default;
+  handlingChoices = { ...p, task: id, pick: { connection: d.connection_id, model: d.model, effort: d.effort } };
   setModal(
-    approvalDialog(
-      run,
-      state.tasks?.find((t) => t.id === id),
-      request,
-    ),
+    `<h2>AI一键处置</h2><p class="subtitle">拾事用所选模型在 Codex 或 DSH 中跑完首轮调查，再把会话交给客户端继续；进展和结论由客户端通过拾事 CLI 写回事项。</p><div class="form-group"><label id="handling-project-label">项目</label><button type="button" class="handling-select" id="handling-project" data-handling-menu="project" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="handling-project-label"></button><p class="helper" id="handling-project-note" hidden></p></div><div class="form-group"><label for="handling-instructions">本次补充说明（可选）</label><textarea id="handling-instructions" maxlength="2000" placeholder="例如：先核对复现步骤和相关日志。"></textarea></div><details class="handling-prompt"><summary>查看当前通用调查提示词</summary><pre>${esc(p.prompt)}</pre></details><div id="modal-error" class="error-box"></div><div class="dialog-foot handling-start-foot"><span class="handling-chip-host" data-handling-picker>${handlingChip(handlingChoices.pick)}</span><button data-action="close">取消</button><button class="primary" data-handle="submit" data-task-id="${esc(id)}" disabled>开始调查</button></div>`,
   );
-  $('#dialog').classList.add('approval-shell');
-  $('#handling-request .approval-deny')?.focus({ preventScroll: true });
+  syncHandlingStart();
+  await chooseHandlingConnection(d.connection_id);
 }
 
-function syncHandlingApproval() {
-  if ($('#overlay').hidden) return;
-  const host = $('#handling-request');
-  if (!host) return;
-  const run = (state?.handling || []).find((r) => r.id === host.dataset.runId);
-  if (
-    !run ||
-    run.stop_requested ||
-    run.desktop_control ||
-    !run.requests?.some((q) => JSON.stringify(q.id) === host.dataset.requestId)
-  )
+// ---------------------------------------------------------------- actions
+
+const handlingActions = {
+  async start(id) {
+    const r = taskRun(id);
+    if (handlingStarting.has(id) || r?.status === 'running')
+      return toast(r?.thread_id ? `${handlingClient(r)} 正在执行首轮，完成后即可继续` : '正在启动处置，请稍候');
+    if (r?.thread_id) return rpc('handling_open', { run_id: r.id }).then((v) => v?.hint && toast(v.hint));
+    return beginHandling(id);
+  },
+  restart: (id) => beginHandling(id),
+  async submit(id) {
+    const c = handlingChoices,
+      project = c.list?.find((p) => p.id === c.project);
+    if (!project) throw Error('请选择项目');
+    const params = {
+      task_id: id,
+      connection_id: c.pick.connection,
+      cwd: project.cwd,
+      project_name: project.name,
+      instructions: $('#handling-instructions').value,
+      model: c.pick.model,
+      effort: c.pick.effort,
+    };
+    handlingStarting.add(id);
     closeModal();
-}
-async function previewHandlingProposal(id) {
-  const result = await rpc('prompt_history');
-  const proposal = state.evolution?.handling?.find(p => p.id === id),
-    current = result.versions.find(v => v.id === result.current.handling);
-  if (!proposal) throw Error('建议不存在，请刷新');
-  handlingProposal = {id, expected:current.id};
-  const stale = proposal.base !== current.id || proposal.adopted || proposal.rejected || !proposal.prompt;
-  setModal(`<h2>预览处置提示词建议</h2><p>${esc(proposal.reason)}</p><details><summary>当前提示词</summary><pre>${esc(current.content)}</pre></details><label>建议提示词<textarea id="handling-proposal-prompt" rows="10" maxlength="20000">${esc(proposal.prompt || proposal.policy?.prompt || '')}</textarea></label>${stale ? '<p class="helper">此建议需要按当前版本重新生成，原历史保留。</p>' : ''}<div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">关闭</button><button class="primary" data-handle="proposal-adopt" ${stale ? 'disabled' : ''}>采用</button></div>`);
-}
+    try {
+      await rpc('handling_start', params);
+      await refreshState(true);
+      toast(`已开始，首轮结束后会提醒，再到 ${handlingClient(handlingConnection(c.pick.connection))} 中继续`);
+    } finally {
+      handlingStarting.delete(id);
+    }
+  },
+};
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('[data-handle]');
   if (!b) return;
-  const action = b.dataset.handle,
-    id = b.dataset.taskId || selected;
   const html = b.innerHTML;
   b.disabled = true;
   try {
-    switch (action) {
-      case 'start':
-        await beginHandling(id);
-        break;
-      case 'add-project': {
-        const path = await rpc('pick', { kind: '本地项目目录', type: 'directory' });
-        if (!path) break;
-        const added = await rpc('handling_add_project', { cwd: path });
-        handlingProjects = await rpc('handling_projects');
-        const select = $('#handling-project');
-        select.innerHTML =
-          '<option value="">请选择项目</option>' +
-          handlingProjects
-            .map((p, i) => `<option value="${i}">${esc(p.name)} · ${esc(p.cwd)}</option>`)
-            .join('');
-        select.value = String(handlingProjects.findIndex((p) => p.id === added.id));
-        break;
-      }
-      case 'submit': {
-        const i = $('#handling-project').value;
-        if (i === '') throw Error('请选择项目');
-        const p = handlingProjects[Number(i)];
-        const params = {
-          task_id: id,
-          project_id: p.id,
-          ...(p.connection_id ? {connection_id:p.connection_id} : {}),
-          cwd: p.cwd,
-          instructions: $('#handling-instructions').value,
-          stop_previous: !!$('#handling-stop-previous')?.checked,
-        };
-        handlingStarting.add(id);
-        if (page === 'tasks' && selected === id) renderDetail();
-        closeModal();
-        try {
-          await rpc('handling_start', params);
-          await refreshState(true);
-          openHandlingWindow(id);
-          toast('已开始调查');
-        } finally {
-          handlingStarting.delete(id);
-        }
-        break;
-      }
-      case 'send':
-        await sendHandlingQuestion(id);
-        break;
-      case 'followup':
-        handlingFollowup(id);
-        break;
-      case 'reconnect': {
-        const r = taskRun(id);
-        if (!r.thread_id) {
-          setModal(
-            `<h2>关联已创建的正式会话</h2><p class="helper">上次创建结果不确定。先在对应接入客户端检查是否已有同标题会话，复制会话编号后关联；确实没有创建时才点下方重试。</p><input id="handling-thread-id" placeholder="会话编号"><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">关闭</button><button data-handle="reset-setup" data-task-id="${esc(id)}">已核实未创建，重新开始</button><button data-handle="attach" data-task-id="${esc(id)}">关联并核实</button></div>`,
-          );
-        } else {
-          await rpc('handling_reconnect', { task_id: id });
-          await refreshState(true);
-        }
-        break;
-      }
-      case 'reset-setup':
-        await rpc('handling_reset_setup', { task_id: id, confirmed_no_thread: true });
-        closeModal();
-        await refreshState(true);
-        await beginHandling(id);
-        break;
-      case 'attach':
-        await rpc('handling_reconnect', { task_id: id, thread_id: $('#handling-thread-id').value });
-        closeModal();
-        await refreshState(true);
-        break;
-      case 'sync':
-        await rpc('handling_sync', { task_id: id });
-        await refreshState(true);
-        break;
-      case 'open':
-        try {
-          await rpc('handling_open', { thread_id: b.dataset.threadId || taskRun(id).thread_id });
-        } catch (error) {
-          toast(error.message);
-        }
-        break;
-      case 'terminate':
-        try {
-          await rpc('handling_terminate', { task_id: id, run_id: b.dataset.runId });
-          toast(
-            handlingDesktop(taskRun(id))
-              ? '本次处置已结束，Codex 继续运行'
-              : '处置已终止，可以重新发起',
-          );
-        } finally {
-          await refreshState(true);
-        }
-        break;
-      case 'requests':
-        handlingRequests(id);
-        break;
-      case 'answer': {
-        const host = $('#handling-request'),
-          run = (state.handling || []).find((r) => r.id === host.dataset.runId),
-          q = run?.requests?.find((q) => JSON.stringify(q.id) === host.dataset.requestId);
-        if (!q) throw new Error('请求已变化，请关闭并同步状态后重试');
-        const requestKey = host.dataset.runId + ':' + host.dataset.requestId;
-        if (approvalBusy.has(requestKey)) break;
-        approvalBusy.add(requestKey);
-        host.querySelectorAll('button').forEach((button) => (button.disabled = true));
-        try {
-          await rpc('handling_request', {
-            task_id: host.dataset.taskId,
-            run_id: host.dataset.runId,
-            thread_id: host.dataset.threadId,
-            request_id: host.dataset.requestId,
-            action: b.dataset.decision,
-            option_id: b.dataset.optionId,
-          });
-          if ($('#handling-request') === host) closeModal();
-          await refreshState(true);
-        } finally {
-          approvalBusy.delete(requestKey);
-          host.querySelectorAll('button').forEach((button) => (button.disabled = false));
-        }
-        break;
-      }
-      case 'history': {
-        if(taskRuns(id).some(run=>run._details===false))await refreshState(true);
-        const runs = taskRuns(id),
-          current = taskRun(id),
-          logs = await rpc('handling_audit', { task_id: id });
-        setModal(
-          `<h2>处置过程</h2>${runs
-            .slice()
-            .reverse()
-            .map(
-              (r) =>
-                `<details data-handling-history="${esc(r.id)}" ${r.id === current?.id ? 'open' : ''}><summary>${esc(r.project_name || '处置会话')} · ${esc(handlingLabels[handlingState(r)] || handlingState(r))}</summary><div class="helper">${esc(r.thread_id)}</div>${(r.rounds || []).map((x, i) => `<details ${i === r.rounds.length - 1 ? 'open' : ''}><summary>第 ${i + 1} 轮 · ${esc(handlingLabels[x.status] || x.status)}</summary><p class="helper">本轮耗时：${handlingDuration(x.duration_ms)} · 开始：${x.started_at ? esc(date(x.started_at)) : '未知'} · 结束：${x.completed_at ? esc(date(x.completed_at)) : '未知'}</p><h3>你的输入</h3>${handlingMd(x.question)}<h3>执行过程</h3>${handlingProcess(x)}${(x.supplements || []).map((v) => `<h3>补充指令${v.accepted ? '' : ' · 待核实'}</h3><pre style="white-space:pre-wrap">${esc(v.text)}</pre>`).join('')}<h3>最终结论</h3>${handlingMd(x.conclusion || '本轮尚无最终结论')}</details>`).join('')}</details>`,
-            )
-            .join(
-              '',
-            )}<h3 style="margin-top:20px">上下文查询记录（最近 100 条）</h3>${logs.map((l) => `<div class="source"><b>${esc(date(l.time))} · ${esc(l.tool)} · ${l.ok ? '成功' : '拒绝'}</b><pre style="white-space:pre-wrap">${esc(JSON.stringify(l.arguments))}</pre><div class="helper">返回消息：${esc((l.message_ids || []).join('、') || '无')}</div></div>`).join('') || '<p class="helper">尚无上下文接口查询。</p>'}<div class="dialog-foot"><button data-action="close">关闭</button></div>`,
-        );
-        break;
-      }
-      case 'learn': {
-        b.textContent = '正在生成建议…';
-        const r = await rpc('handling_learn');
-        await refreshState(true);
-        toast(r.unchanged ? r.reason : '建议已生成，请预览后采用');
-        break;
-      }
-      case 'policy-proposal':
-        await previewHandlingProposal(b.dataset.id);
-        break;
-      case 'proposal-adopt':
-        await rpc('handling_adopt',{...handlingProposal,prompt:$('#handling-proposal-prompt').value});
-        closeModal();
-        await refreshState(true);
-        toast('已采用，历史版本保留');
-        break;
-    }
+    await handlingActions[b.dataset.handle](b.dataset.taskId || selected, b);
   } catch (error) {
-    if (error.message === '本次处置已终止') {
-      await refreshState(true);
-      return;
-    }
     if ($('#modal-error') && !$('#overlay').hidden) $('#modal-error').textContent = error.message;
     else toast(error.message);
-    if (['start', 'submit'].includes(action)) await refreshState(false);
   } finally {
-    b.disabled = false;
-    if (action !== 'followup') b.innerHTML = html;
+    if (b.isConnected) {
+      b.disabled = false;
+      b.innerHTML = html;
+    }
   }
 });

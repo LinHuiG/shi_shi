@@ -1,0 +1,30 @@
+[package]
+name = "shishi-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+miniz_oxide.workspace = true
+crc32fast.workspace = true
+base64.workspace = true
+shishi-api = { path = "../providers/api" }
+shishi-acp = { path = "../providers/acp" }
+
+[dev-dependencies]
+shishi-api = { path = "../providers/api", features = ["loopback-http"] }
+
+[features]
+# Only the installer's 1.1.68 migration tool builds this.
+import = []
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }

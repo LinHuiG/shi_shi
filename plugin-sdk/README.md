@@ -6,4 +6,4 @@ Rust 辅助库，用于导出协议版本 1 的 C ABI。它不是进程沙箱，
 
 在独立插件的 Cargo.toml 中将本库声明为 path 或固定 Git revision 依赖，设置 `[lib] crate-type = ["cdylib"]`。只有实现全部必需方法、准备 manifest 和依赖文件后才形成完整插件包。
 
-参见 [插件教程](../docs/PLUGINS.md)、[协议参考](../PLUGIN_API.txt) 和 [示例](../examples/json-source/README.md)。本库采用主项目 [GNU AGPL v3.0](../LICENSE)（`AGPL-3.0-only`，仅 3.0 版）。
+参见 [插件教程](../docs/PLUGIN_ADAPTATION.md)、[协议参考](../PLUGIN_API.txt) 和 [示例](../examples/json-source/README.md)。本库采用主项目 [GNU AGPL v3.0](../LICENSE)（`AGPL-3.0-only`，仅 3.0 版）。

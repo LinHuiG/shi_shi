@@ -1,662 +1,246 @@
-//! `submit_analysis` MCP server and ticket/result store.
-//!
-//! The ACP client supplies this server in `session/new.mcpServers` as a stdio
-//! server. DSH wraps its tools as `mcp__shishi_submit__submit_analysis`
-//! (dsh-mcp-client naming contract). The server accepts the exact caller
-//! schema, writes one accepted result atomically, and rejects duplicates,
-//! missing fields, extra fields and a second invalid correction.
+//! Structured analysis results: the `submit_analysis` stdio MCP server
+//! (`app.exe --analysis-submit-mcp <ticket>`, exposed by DSH as
+//! `mcp__shishi_submit__submit_analysis`) and the one-prompt analysis run
+//! that reads its accepted result. There is no prose fallback: no accepted
+//! submission means the analysis failed. One invalid call may be corrected.
 
-use crate::schema_validate;
-use crate::sha256;
-use serde::{Deserialize, Serialize};
+use crate::client::{AcpClient, AcpEvent, ClientError, McpServer, PromptResult};
 use serde_json::{json, Value};
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::fs;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-
-const TICKET_VERSION: u32 = 1;
-const MAX_TICKET_BYTES: usize = 4 * 1024 * 1024;
-const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_MCP_LINE: usize = 4 * 1024 * 1024;
-const MAX_INVALID: u32 = 1;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmitTicket {
-    pub version: u32,
-    pub request_id: String,
-    pub kind: String,
-    pub schema: Value,
-    pub schema_hash: String,
-    #[serde(default = "default_max_invalid")]
-    pub max_invalid: u32,
-}
-
-fn default_max_invalid() -> u32 {
-    MAX_INVALID
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmitResultFile {
-    pub version: u32,
-    pub request_id: String,
-    pub kind: String,
-    pub schema_hash: String,
-    pub value: Value,
-}
-
-#[derive(Debug, Clone)]
-pub struct SubmitPaths {
-    pub directory: PathBuf,
-    pub ticket_path: PathBuf,
-    pub result_path: PathBuf,
-    pub failure_path: PathBuf,
-    pub state_path: PathBuf,
-}
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SubmitError {
     #[error("submit store I/O error: {0}")]
     Io(String),
-    #[error("invalid submit path: {0}")]
-    InvalidPath(String),
-    #[error("invalid submit ticket: {0}")]
-    InvalidTicket(String),
     #[error("no accepted submit_analysis result")]
     Missing,
     #[error("submit_analysis is closed: {0}")]
     Closed(String),
-    #[error("duplicate submit_analysis call")]
+    #[error("duplicate submit_analysis call: a result was already accepted")]
     Duplicate,
-    #[error("submit_analysis schema invalid: {0:?}")]
-    Schema(Vec<String>),
+    #[error("submit_analysis rejected: {0}")]
+    Schema(String),
     #[error("submit_analysis protocol error: {0}")]
     Protocol(String),
 }
 
+fn io(error: impl std::fmt::Display) -> SubmitError {
+    SubmitError::Io(error.to_string())
+}
+
+/// One request directory: `ticket.json` {request_id, kind, schema},
+/// `result.json` once accepted, `state.json` counting invalid calls.
+#[derive(Debug, Clone)]
+pub struct SubmitPaths {
+    pub ticket_path: PathBuf,
+    pub result_path: PathBuf,
+    pub state_path: PathBuf,
+}
+
 impl SubmitPaths {
-    pub fn create(
-        base: &Path,
-        request_id: &str,
-        kind: &str,
-        schema: Value,
-    ) -> Result<(Self, SubmitTicket), SubmitError> {
-        validate_component(request_id, "request id")?;
-        validate_component(kind, "kind")?;
-        if !schema.is_object() {
-            return Err(SubmitError::InvalidTicket(
-                "schema must be an object".into(),
-            ));
-        }
-        let directory = base.join(request_id);
-        fs::create_dir_all(&directory).map_err(|error| SubmitError::Io(error.to_string()))?;
-        let schema_hash = sha256::hex(&serde_json::to_vec(&schema).unwrap_or_default());
-        let ticket = SubmitTicket {
-            version: TICKET_VERSION,
-            request_id: request_id.to_string(),
-            kind: kind.to_string(),
-            schema,
-            schema_hash,
-            max_invalid: MAX_INVALID,
-        };
-        let paths = Self {
-            ticket_path: directory.join("ticket.json"),
-            result_path: directory.join("result.json"),
-            failure_path: directory.join("failure.json"),
-            state_path: directory.join("state.json"),
-            directory,
-        };
-        paths.write_ticket(&ticket)?;
-        Ok((paths, ticket))
+    fn at(directory: &Path) -> Self {
+        let file = |name| directory.join(name);
+        Self { ticket_path: file("ticket.json"), result_path: file("result.json"), state_path: file("state.json") }
     }
 
-    pub fn load(ticket_path: &Path) -> Result<(Self, SubmitTicket), SubmitError> {
-        let bytes = read_bounded(ticket_path, MAX_TICKET_BYTES)?;
-        let ticket: SubmitTicket = serde_json::from_slice(&bytes)
-            .map_err(|error| SubmitError::InvalidTicket(error.to_string()))?;
-        if ticket.version != TICKET_VERSION {
-            return Err(SubmitError::InvalidTicket(format!(
-                "unsupported ticket version {}",
-                ticket.version
-            )));
-        }
-        validate_component(&ticket.request_id, "request id")?;
-        validate_component(&ticket.kind, "kind")?;
-        if !ticket.schema.is_object() {
-            return Err(SubmitError::InvalidTicket(
-                "schema must be an object".into(),
-            ));
-        }
-        if ticket.max_invalid > MAX_INVALID {
-            return Err(SubmitError::InvalidTicket(
-                "max_invalid exceeds the one-correction limit".into(),
-            ));
-        }
-        let actual_hash = sha256::hex(&serde_json::to_vec(&ticket.schema).unwrap_or_default());
-        if actual_hash != ticket.schema_hash {
-            return Err(SubmitError::InvalidTicket(
-                "schema hash does not match the ticket".into(),
-            ));
-        }
-        let directory = ticket_path
-            .parent()
-            .ok_or_else(|| SubmitError::InvalidPath("ticket has no parent".into()))?
-            .to_path_buf();
-        Ok((
-            Self {
-                ticket_path: ticket_path.to_path_buf(),
-                result_path: directory.join("result.json"),
-                failure_path: directory.join("failure.json"),
-                state_path: directory.join("state.json"),
-                directory,
-            },
-            ticket,
-        ))
+    pub fn create(base: &Path, request_id: &str, kind: &str, schema: Value) -> Result<Self, SubmitError> {
+        let paths = Self::at(&base.join(request_id));
+        fs::create_dir_all(base.join(request_id)).map_err(io)?;
+        let ticket = json!({"request_id": request_id, "kind": kind, "schema": schema});
+        fs::write(&paths.ticket_path, ticket.to_string()).map_err(io)?;
+        Ok(paths)
     }
 
-    fn write_ticket(&self, ticket: &SubmitTicket) -> Result<(), SubmitError> {
-        let bytes =
-            serde_json::to_vec(ticket).map_err(|error| SubmitError::Io(error.to_string()))?;
-        write_atomic_new(&self.ticket_path, &bytes)
+    pub fn load(ticket_path: &Path) -> Result<(Self, Value), SubmitError> {
+        let ticket = serde_json::from_slice(&fs::read(ticket_path).map_err(io)?).map_err(io)?;
+        Ok((Self::at(ticket_path.parent().unwrap()), ticket))
     }
 
-    pub fn read_accepted(
-        &self,
-        expected_request_id: &str,
-        expected_kind: &str,
-        expected_schema: &Value,
-    ) -> Result<Value, SubmitError> {
-        if self.failure_path.is_file() {
-            let reason = fs::read_to_string(&self.failure_path)
-                .unwrap_or_default()
-                .chars()
-                .take(240)
-                .collect::<String>();
-            return Err(SubmitError::Closed(reason));
-        }
-        if !self.result_path.is_file() {
-            return Err(SubmitError::Missing);
-        }
-        let bytes = read_bounded(&self.result_path, MAX_RESULT_BYTES)?;
-        let result: SubmitResultFile = serde_json::from_slice(&bytes)
-            .map_err(|error| SubmitError::Protocol(error.to_string()))?;
-        if result.version != TICKET_VERSION {
-            return Err(SubmitError::Protocol("unsupported result version".into()));
-        }
-        if result.request_id != expected_request_id || result.kind != expected_kind {
-            return Err(SubmitError::Protocol(
-                "result does not match the request id/kind".into(),
-            ));
-        }
-        let expected_hash = sha256::hex(&serde_json::to_vec(expected_schema).unwrap_or_default());
-        if result.schema_hash != expected_hash {
-            return Err(SubmitError::Protocol(
-                "result schema hash does not match the caller schema".into(),
-            ));
-        }
-        schema_validate::validate(expected_schema, &result.value).map_err(SubmitError::Schema)?;
-        Ok(result.value)
+    fn state(&self) -> Value {
+        fs::read(&self.state_path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(json!({"invalid": 0}))
     }
 
-    pub fn submit(&self, ticket: &SubmitTicket, arguments: &Value) -> Result<Value, SubmitError> {
+    pub fn read_accepted(&self, request_id: &str, kind: &str, schema: &Value) -> Result<Value, SubmitError> {
+        if let Some(reason) = self.state()["closed"].as_str() {
+            return Err(SubmitError::Closed(reason.into()));
+        }
+        let bytes = fs::read(&self.result_path).map_err(|_| SubmitError::Missing)?;
+        let result: Value = serde_json::from_slice(&bytes).map_err(|e| SubmitError::Protocol(e.to_string()))?;
+        if result["request_id"] != request_id || result["kind"] != kind {
+            return Err(SubmitError::Protocol("result does not match the request id/kind".into()));
+        }
+        shishi_api::schema_validate::validate(schema, &result["value"])
+            .map_err(|e| SubmitError::Schema(e.to_string()))?;
+        Ok(result["value"].clone())
+    }
+
+    /// The tool result for one `submit_analysis` call.
+    pub fn submit(&self, ticket: &Value, arguments: &Value) -> Result<Value, SubmitError> {
         if self.result_path.is_file() {
             return Err(SubmitError::Duplicate);
         }
-        if self.failure_path.is_file() {
-            return Err(SubmitError::Closed(
-                "invalid correction already exhausted".into(),
-            ));
+        let state = self.state();
+        if let Some(reason) = state["closed"].as_str() {
+            return Err(SubmitError::Closed(reason.into()));
         }
-        let mut invalid = read_invalid_count(&self.state_path);
-        match shishi_api::schema_validate::validate_output(&ticket.schema, arguments.clone()) {
+        let errors = match shishi_api::schema_validate::validate_output(&ticket["schema"], arguments.clone()) {
             Ok(value) => {
-                let result = SubmitResultFile {
-                    version: TICKET_VERSION,
-                    request_id: ticket.request_id.clone(),
-                    kind: ticket.kind.clone(),
-                    schema_hash: ticket.schema_hash.clone(),
-                    value,
-                };
-                let bytes = serde_json::to_vec(&result)
-                    .map_err(|error| SubmitError::Io(error.to_string()))?;
-                write_atomic_new(&self.result_path, &bytes)?;
-                Ok(json!({
-                    "content": [{"type": "text", "text": "accepted"}],
-                    "isError": false
-                }))
+                let result = json!({"request_id": ticket["request_id"], "kind": ticket["kind"], "value": value});
+                let temp = self.result_path.with_extension("tmp");
+                fs::write(&temp, result.to_string()).and_then(|_| fs::rename(&temp, &self.result_path)).map_err(io)?;
+                return Ok(json!({"content": [{"type": "text", "text": "accepted"}], "isError": false}));
             }
-            Err(errors) => {
-                invalid = invalid.saturating_add(1);
-                fs::write(&self.state_path, json!({"invalid": invalid}).to_string())
-                    .map_err(|error| SubmitError::Io(error.to_string()))?;
-                let bounded = vec![errors.to_string().chars().take(240).collect::<String>()];
-                if invalid > ticket.max_invalid {
-                    let reason = json!({
-                        "reason": "invalid_correction_exhausted",
-                        "errors": bounded
-                    });
-                    let _ = fs::write(&self.failure_path, reason.to_string());
-                    Err(SubmitError::Closed(bounded.join("; ")))
-                } else {
-                    Ok(json!({
-                        "content": [{
-                            "type": "text",
-                            "text": format!(
-                                "submit_analysis rejected (one correction allowed): {}",
-                                bounded.join("; ")
-                            )
-                        }],
-                        "isError": true
-                    }))
-                }
-            }
+            Err(errors) => errors.to_string().chars().take(240).collect::<String>(),
+        };
+        let invalid = state["invalid"].as_u64().unwrap_or(0) + 1;
+        let closed = (invalid > 1).then(|| errors.clone());
+        fs::write(&self.state_path, json!({"invalid": invalid, "closed": closed}).to_string()).map_err(io)?;
+        match closed {
+            Some(reason) => Err(SubmitError::Closed(reason)),
+            None => Ok(
+                json!({"content": [{"type": "text", "text": format!("submit_analysis rejected (one correction allowed): {errors}")}], "isError": true}),
+            ),
         }
     }
 }
 
-fn read_invalid_count(path: &Path) -> u32 {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("invalid").and_then(Value::as_u64))
-        .unwrap_or(0)
-        .min(u32::MAX as u64) as u32
-}
-
-fn validate_component(value: &str, field: &str) -> Result<(), SubmitError> {
-    if value.is_empty()
-        || value.len() > 64
-        || !value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return Err(SubmitError::InvalidPath(format!(
-            "{field} must be 1..=64 of [A-Za-z0-9_-]"
-        )));
-    }
-    Ok(())
-}
-
-fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, SubmitError> {
-    let mut file = fs::File::open(path).map_err(|error| SubmitError::Io(error.to_string()))?;
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(max as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| SubmitError::Io(error.to_string()))?;
-    if bytes.len() > max {
-        return Err(SubmitError::Io(format!(
-            "file exceeds {max} bytes: {}",
-            path.display()
-        )));
-    }
-    Ok(bytes)
-}
-
-fn write_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), SubmitError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| SubmitError::InvalidPath("output path has no parent".into()))?;
-    let temp = parent.join(format!(
-        ".{}.tmp-{}-{}",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("submit"),
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0)
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|error| SubmitError::Io(error.to_string()))?;
-    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-        let _ = fs::remove_file(&temp);
-        return Err(SubmitError::Io(error.to_string()));
-    }
-    drop(file);
-    match fs::rename(&temp, path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists || path.exists() => {
-            let _ = fs::remove_file(&temp);
-            Err(SubmitError::Duplicate)
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&temp);
-            Err(SubmitError::Io(error.to_string()))
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// MCP stdio server
-
-pub fn serve_from_args() -> Result<(), String> {
-    let args = std::env::args().collect::<Vec<_>>();
-    let ticket = args
-        .iter()
-        .position(|arg| arg == "--analysis-submit-mcp")
-        .and_then(|index| args.get(index + 1))
-        .or_else(|| args.get(1))
-        .ok_or_else(|| "missing --analysis-submit-mcp <ticket>".to_string())?;
-    serve(Path::new(ticket)).map_err(|error| error.to_string())
-}
-
+/// The MCP stdio loop for one ticket (protocol `2024-11-05`, one tool).
 pub fn serve(ticket_path: &Path) -> Result<(), SubmitError> {
     let (paths, ticket) = SubmitPaths::load(ticket_path)?;
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let mut line = Vec::new();
-    while read_mcp_line(&mut reader, &mut line)? {
-        if line.is_empty() {
+    let mut out = std::io::stdout().lock();
+    for line in std::io::stdin().lock().lines() {
+        let line = line.map_err(io)?;
+        if line.trim().is_empty() {
             continue;
         }
-        let value: Value = match serde_json::from_slice(&line) {
-            Ok(value) => value,
-            Err(_) => {
-                write_line(
-                    &mut out,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": Value::Null,
-                        "error": {"code": -32700, "message": "parse error"}
-                    }),
-                )?;
-                continue;
-            }
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            writeln!(
+                out,
+                "{}",
+                json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "parse error"}})
+            )
+            .map_err(io)?;
+            continue;
         };
-        let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-        let id = value.get("id").cloned().unwrap_or(Value::Null);
-        let has_id = value.get("id").is_some();
-        if method.is_empty() {
-            // A response from the client: this server never sends requests.
-            continue;
-        }
-        if !has_id {
-            // notifications/initialized and unknown notifications are no-ops.
-            continue;
-        }
-        let response = match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {"name": "shishi_submit", "version": env!("CARGO_PKG_VERSION")}
-            })),
+        // Notifications and client responses need no answer.
+        let (Some(method), Some(id)) = (message["method"].as_str(), message.get("id")) else { continue };
+        let tool_error = |text: String| Ok(json!({"content": [{"type": "text", "text": text}], "isError": true}));
+        let result = match method {
+            "initialize" => {
+                Ok(json!({"protocolVersion": "2024-11-05", "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "shishi_submit", "version": env!("CARGO_PKG_VERSION")}}))
+            }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({
-                "tools": [{
-                    "name": "submit_analysis",
-                    "description": "Submit the single structured analysis result for this request. Call exactly once with the complete result object. Invalid input is rejected and at most one corrected call is allowed.",
-                    "inputSchema": ticket.schema
-                }]
-            })),
-            "tools/call" => {
-                let name = value
-                    .get("params")
-                    .and_then(|params| params.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if name != "submit_analysis" {
-                    Ok(json!({
-                        "content": [{"type": "text", "text": "unknown tool"}],
-                        "isError": true
-                    }))
-                } else {
-                    let arguments = value
-                        .get("params")
-                        .and_then(|params| params.get("arguments"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    match paths.submit(&ticket, &arguments) {
-                        Ok(result) => Ok(result),
-                        Err(SubmitError::Duplicate) => Ok(json!({
-                            "content": [{"type": "text", "text": "duplicate submit_analysis call: a result was already accepted"}],
-                            "isError": true
-                        })),
-                        Err(SubmitError::Closed(reason)) => Ok(json!({
-                            "content": [{"type": "text", "text": format!("submit_analysis closed: {reason}")}],
-                            "isError": true
-                        })),
-                        Err(SubmitError::Schema(errors)) => Ok(json!({
-                            "content": [{"type": "text", "text": format!("submit_analysis rejected: {}", errors.join("; "))}],
-                            "isError": true
-                        })),
-                        Err(error) => Err(error),
-                    }
+            "tools/list" => Ok(json!({"tools": [{"name": "submit_analysis", "inputSchema": ticket["schema"],
+                "description": "Submit the single structured analysis result for this request. Call exactly once with the complete result object. Invalid input is rejected and at most one corrected call is allowed."}]})),
+            "tools/call" if message["params"]["name"] != "submit_analysis" => tool_error("unknown tool".into()),
+            "tools/call" => match paths.submit(&ticket, &message["params"]["arguments"]) {
+                Err(e @ (SubmitError::Duplicate | SubmitError::Closed(_) | SubmitError::Schema(_))) => {
+                    tool_error(e.to_string())
                 }
-            }
-            _ => {
-                write_line(
-                    &mut out,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": {"code": -32601, "message": "method not found"}
-                    }),
-                )?;
-                continue;
-            }
+                other => other.map_err(|e| (-32603, e.to_string())),
+            },
+            _ => Err((-32601, "method not found".into())),
         };
-        match response {
-            Ok(result) => write_line(
-                &mut out,
-                &json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            )?,
-            Err(error) => write_line(
-                &mut out,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "error": {"code": -32603, "message": error.to_string()}
-                }),
-            )?,
-        }
+        let reply = match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err((code, message)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
+        };
+        writeln!(out, "{reply}").and_then(|_| out.flush()).map_err(io)?;
     }
     Ok(())
 }
 
-fn read_mcp_line(reader: &mut impl BufRead, line: &mut Vec<u8>) -> Result<bool, SubmitError> {
-    let bytes = crate::jsonrpc::read_line(reader, line, MAX_MCP_LINE + 2)
-        .map_err(|error| SubmitError::Io(error.to_string()))?;
-    if bytes > MAX_MCP_LINE + 2 {
-        return Err(SubmitError::Protocol("MCP line is too long".into()));
-    }
-    while line
-        .last()
-        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
-    {
-        line.pop();
-    }
-    Ok(bytes != 0)
+#[derive(Debug, Clone)]
+pub struct AnalysisSpec {
+    pub request_id: String,
+    pub kind: String,
+    pub schema: Value,
+    pub prompt: String,
+    pub images: Vec<Value>,
+    pub workdir: PathBuf,
+    pub app_exe: PathBuf,
+    pub model: Option<(String, String)>,
+    pub effort: Option<String>,
 }
 
-fn write_line(out: &mut impl Write, value: &Value) -> Result<(), SubmitError> {
-    serde_json::to_writer(&mut *out, value).map_err(|error| SubmitError::Io(error.to_string()))?;
-    out.write_all(b"\n")
-        .and_then(|_| out.flush())
-        .map_err(|error| SubmitError::Io(error.to_string()))
+#[derive(Debug, Clone)]
+pub struct PreparedAnalysis {
+    pub paths: SubmitPaths,
+    pub server: McpServer,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalysisAccepted {
+    pub value: Value,
+    pub session_id: String,
+    pub prompt: PromptResult,
+    /// Only a confirmed close lets the caller reuse the process.
+    pub session_closed: bool,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum AnalysisError {
+    #[error("{0}")]
+    Client(#[from] ClientError),
+    #[error("{0}")]
+    Submit(SubmitError),
+    #[error("analysis ended without an accepted submit_analysis result")]
+    MissingSubmission,
+    #[error("analysis prompt stopped without an acceptable result: {0}")]
+    Stopped(String),
+}
+
+/// The ticket and the `shishi_submit` server declaration for one analysis.
+pub fn prepare(ticket_base: &Path, spec: &AnalysisSpec) -> Result<PreparedAnalysis, AnalysisError> {
+    let paths = SubmitPaths::create(ticket_base, &spec.request_id, &spec.kind, spec.schema.clone())
+        .map_err(AnalysisError::Submit)?;
+    let args = ["--analysis-submit-mcp".to_string(), paths.ticket_path.to_string_lossy().into()];
+    Ok(PreparedAnalysis { server: McpServer::stdio("shishi_submit", &spec.app_exe, args), paths })
+}
+
+/// One new session, one prompt of the caller's exact payload, and only the
+/// accepted MCP result.
+pub fn run(
+    client: &AcpClient,
+    spec: &AnalysisSpec,
+    prepared: &PreparedAnalysis,
+    timeout: Duration,
+    on_event: &mut dyn FnMut(AcpEvent),
+) -> Result<AnalysisAccepted, AnalysisError> {
+    let deadline = Instant::now() + timeout;
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| ClientError::Timeout("analysis".into()))
+    };
+    let session = client.new_session(&spec.workdir, std::slice::from_ref(&prepared.server), remaining()?)?.session_id;
+    if let Some((provider, model)) = &spec.model {
+        client.select_model(&session, provider, model, remaining()?)?;
+    }
+    if let Some(effort) = &spec.effort {
+        client.select_effort(&session, effort, remaining()?)?;
+    }
+    let outcome = (|| {
+        let prompt = client.prompt(&session, &spec.prompt, &spec.images, remaining()?, on_event)?;
+        if matches!(prompt.stop_reason.as_str(), "cancelled" | "refusal") {
+            return Err(AnalysisError::Stopped(prompt.stop_reason));
+        }
+        match prepared.paths.read_accepted(&spec.request_id, &spec.kind, &spec.schema) {
+            Ok(value) => Ok((prompt, value)),
+            Err(SubmitError::Missing) => Err(AnalysisError::MissingSubmission),
+            Err(error) => Err(AnalysisError::Submit(error)),
+        }
+    })();
+    let close = remaining().map_or(Duration::from_secs(2), |r| r.min(Duration::from_secs(2)));
+    let session_closed = client.close_session(&session, close).is_ok();
+    let (prompt, value) = outcome?;
+    Ok(AnalysisAccepted { value, session_id: session, prompt, session_closed })
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mcp_frames_keep_empty_lines_tails_and_the_existing_size_boundary() {
-        let mut reader = &b"\r\n{}\n[]"[..];
-        let mut line = Vec::with_capacity(MAX_MCP_LINE + 2);
-        let allocated = line.as_ptr();
-        for expected in [b"".as_slice(), b"{}", b"[]"] {
-            assert!(read_mcp_line(&mut reader, &mut line).unwrap());
-            assert_eq!(line, expected);
-            assert_eq!(line.as_ptr(), allocated);
-        }
-        assert!(!read_mcp_line(&mut reader, &mut line).unwrap());
-        for size in [MAX_MCP_LINE + 2, MAX_MCP_LINE + 3] {
-            let input = vec![b'x'; size];
-            let result = read_mcp_line(&mut input.as_slice(), &mut line);
-            assert_eq!(result.is_ok(), size == MAX_MCP_LINE + 2);
-        }
-    }
-
-    fn schema() -> Value {
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "reason": {"type": "string", "maxLength": 10},
-                "changes": {"type": "array", "maxItems": 2, "items": {"type": "string"}}
-            },
-            "required": ["reason", "changes"]
-        })
-    }
-
-    use crate::test_path as temp_dir;
-
-    #[test]
-    fn accepts_one_valid_result_and_rejects_duplicate() {
-        let base = temp_dir("valid");
-        let (paths, ticket) = SubmitPaths::create(&base, "req-1", "edit", schema()).unwrap();
-        let result = paths
-            .submit(&ticket, &json!({"reason": "ok", "changes": ["a"]}))
-            .unwrap();
-        assert_eq!(result["isError"], false);
-        let accepted = paths.read_accepted("req-1", "edit", &schema()).unwrap();
-        assert_eq!(accepted["reason"], "ok");
-        assert!(matches!(
-            paths.submit(&ticket, &json!({"reason": "ok", "changes": []})),
-            Err(SubmitError::Duplicate)
-        ));
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn presentation_defaults_are_saved_before_strict_readback() {
-        let base = temp_dir("output-default");
-        let mut schema = schema();
-        schema["properties"]["summary"] = json!({"type":"string","maxLength":3,"default":""});
-        schema["required"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("summary"));
-        let (paths, ticket) =
-            SubmitPaths::create(&base, "req-default", "edit", schema.clone()).unwrap();
-        assert_eq!(
-            paths
-                .submit(
-                    &ticket,
-                    &json!({"reason":"ok","changes":[],"summary":["invalid"]})
-                )
-                .unwrap()["isError"],
-            false
-        );
-        let accepted = paths.read_accepted("req-default", "edit", &schema).unwrap();
-        assert_eq!(accepted["summary"], "");
-        assert_eq!(read_invalid_count(&paths.state_path), 0);
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn allows_one_correction_then_closes() {
-        let base = temp_dir("correct");
-        let (paths, ticket) = SubmitPaths::create(&base, "req-2", "edit", schema()).unwrap();
-        let first = paths.submit(&ticket, &json!({"reason": "ok"})).unwrap();
-        assert_eq!(first["isError"], true);
-        let second = paths
-            .submit(&ticket, &json!({"reason": "ok", "changes": ["a"]}))
-            .unwrap();
-        assert_eq!(second["isError"], false);
-        assert!(paths.read_accepted("req-2", "edit", &schema()).is_ok());
-        let _ = fs::remove_dir_all(base);
-
-        let base = temp_dir("exhaust");
-        let (paths, ticket) = SubmitPaths::create(&base, "req-3", "edit", schema()).unwrap();
-        assert_eq!(
-            paths.submit(&ticket, &json!({"reason": "ok"})).unwrap()["isError"],
-            true
-        );
-        assert!(matches!(
-            paths.submit(&ticket, &json!({"reason": "ok"})),
-            Err(SubmitError::Closed(_))
-        ));
-        assert!(paths.failure_path.is_file());
-        assert!(!paths.result_path.is_file());
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn invalid_first_does_not_create_result() {
-        let base = temp_dir("invalid");
-        let (paths, ticket) = SubmitPaths::create(&base, "req-4", "edit", schema()).unwrap();
-        let response = paths
-            .submit(
-                &ticket,
-                &json!({"reason": "ok", "changes": [], "extra": true}),
-            )
-            .unwrap();
-        assert_eq!(response["isError"], true);
-        assert!(!paths.result_path.exists());
-        assert!(matches!(
-            paths.read_accepted("req-4", "edit", &schema()),
-            Err(SubmitError::Missing)
-        ));
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn accepted_result_identity_and_schema_are_enforced() {
-        let base = temp_dir("hash");
-        let (paths, ticket) = SubmitPaths::create(&base, "req-5", "edit", schema()).unwrap();
-        let value = json!({"reason":"ok","changes":[]});
-        paths.submit(&ticket, &value).unwrap();
-        assert_eq!(
-            paths.read_accepted("req-5", "edit", &schema()).unwrap(),
-            value
-        );
-        let mut modified = schema();
-        modified["properties"]["reason"]["maxLength"] = json!(20);
-        assert!(
-            matches!(paths.read_accepted("req-5", "edit", &modified), Err(SubmitError::Protocol(error)) if error.contains("schema hash"))
-        );
-        assert!(
-            matches!(paths.read_accepted("other", "edit", &schema()), Err(SubmitError::Protocol(error)) if error.contains("id/kind"))
-        );
-        let saved: Value = serde_json::from_slice(&fs::read(&paths.result_path).unwrap()).unwrap();
-        for (field, replacement, expected) in [
-            ("version", json!(2), "version"),
-            ("request_id", json!("other"), "id/kind"),
-            ("kind", json!("other"), "id/kind"),
-            ("schema_hash", json!("bad"), "schema hash"),
-            ("value", json!({"reason":"ok"}), "schema"),
-            (
-                "value",
-                json!({"reason":"ok","changes":[],"extra":true}),
-                "schema",
-            ),
-        ] {
-            let mut tampered = saved.clone();
-            tampered[field] = replacement;
-            fs::write(&paths.result_path, serde_json::to_vec(&tampered).unwrap()).unwrap();
-            match paths.read_accepted("req-5", "edit", &schema()).unwrap_err() {
-                SubmitError::Protocol(message) => {
-                    assert!(message.contains(expected), "{field}: {message}")
-                }
-                SubmitError::Schema(_) => assert_eq!(expected, "schema"),
-                other => panic!("wrong validation for {field}: {other:?}"),
-            }
-        }
-        let _ = fs::remove_dir_all(base);
-    }
-
-    #[test]
-    fn invalid_request_component_is_rejected() {
-        let base = temp_dir("path");
-        assert!(SubmitPaths::create(&base, "../escape", "edit", schema()).is_err());
-        assert!(SubmitPaths::create(&base, "ok", "bad kind", schema()).is_err());
-        let _ = fs::remove_dir_all(base);
-    }
-}
+mod tests;

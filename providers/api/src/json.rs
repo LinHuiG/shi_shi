@@ -1,22 +1,12 @@
 //! Borrowed JSON serialization and exact character accounting.
 use serde::Serialize;
-use serde_json::Value;
 use std::io;
-
-pub fn canonical_json(value: &Value) -> String {
-    // serde_json's default Map is a BTreeMap. Nested objects are already sorted;
-    // the ordering regression must remain green if dependency features change.
-    value.to_string()
-}
 
 struct Count<const CHARS: bool>(usize);
 impl<const CHARS: bool> io::Write for Count<CHARS> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let used = if CHARS {
-            bytes.iter().filter(|byte| **byte & 0xc0 != 0x80).count()
-        } else {
-            bytes.len()
-        };
+        // UTF-8 continuation bytes do not start characters, even when the serializer splits writer calls.
+        let used = if CHARS { bytes.iter().filter(|byte| **byte & 0xc0 != 0x80).count() } else { bytes.len() };
         self.0 = self.0.checked_sub(used).ok_or(io::ErrorKind::WriteZero)?;
         Ok(bytes.len())
     }
@@ -25,8 +15,7 @@ impl<const CHARS: bool> io::Write for Count<CHARS> {
     }
 }
 
-/// Count encoded characters without retaining JSON. UTF-8 continuation bytes
-/// do not start characters, even when the serializer splits writer calls.
+/// Count encoded characters without retaining JSON.
 pub fn chars<T: Serialize + ?Sized>(value: &T) -> usize {
     let mut count = Count::<true>(usize::MAX);
     serde_json::to_writer(&mut count, value).expect("JSON value serialization");

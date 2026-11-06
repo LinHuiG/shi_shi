@@ -1,0 +1,259 @@
+.handling-availability-note {
+  margin: 0 0 12px;
+  padding-left: 4px;
+}
+.live-heading {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-bottom: 18px;
+  flex: none;
+}
+.live-heading h2 {
+  margin: 0 0 4px;
+}
+.live-heading p {
+  margin: 0;
+}
+.live-mark {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  background: var(--blue-bg);
+  color: var(--blue-fg);
+  font-size: var(--fs-icon-lg);
+}
+.live-dialog .ai-live-output {
+  flex: 1;
+  overflow: auto;
+  white-space: normal;
+  background: var(--surface-sunken);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 20px;
+  scrollbar-gutter: stable;
+  overflow-anchor: none;
+  min-height: 0;
+  max-height: none;
+  overscroll-behavior: contain;
+}
+.live-reading-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 38px;
+  font-size: var(--fs-caption);
+  color: var(--text-muted);
+  flex: none;
+}
+.live-metrics {
+  display: grid;
+  gap: 2px;
+  padding: 5px 0;
+  line-height: 18px;
+}
+.live-metrics > div {
+  display: grid;
+  grid-template-columns: 6em auto;
+  gap: 10px;
+  align-items: baseline;
+}
+.live-metrics b {
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+@media (max-width: 900px) {
+  .live-dialog .dialog-foot > .helper {
+    max-width: 65%;
+  }
+}
+@media (max-height: 600px) {
+  .live-heading {
+    padding-bottom: 8px;
+  }
+}
+.live-dialog .dialog-foot {
+  margin-top: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex: none;
+}
+.live-dialog {
+  width: min(760px, calc(100vw - 40px));
+  display: flex;
+  flex-direction: column;
+  padding: 24px;
+  overflow: hidden;
+  height: min(620px, calc(100dvh - 48px));
+  max-height: calc(100dvh - 48px);
+}
+
+/* Pickers: the model chip sits bottom-left (start dialog foot, follow-up
+   composer); the project field and both menus keep long names and paths
+   on one ellipsized line inside the dialog. */
+.handling-start-foot {
+  align-items: center;
+}
+.handling-chip-host {
+  min-width: 0;
+  margin-inline-end: auto;
+}
+.handling-chip {
+  --btn-bg: transparent;
+  --btn-line: transparent;
+  --btn-fg: var(--text-secondary);
+  --btn-hover: var(--surface-selected);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: var(--control-h-sm);
+  padding: 2px 8px;
+  font-size: var(--fs-caption);
+}
+.handling-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.handling-chip small {
+  flex: none;
+  color: var(--text-secondary);
+}
+.handling-chip .icon,
+.handling-select .icon {
+  flex: none;
+  margin: 0;
+  width: 12px;
+  height: 12px;
+}
+.handling-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: var(--control-h);
+  text-align: left;
+}
+.handling-option-text {
+  display: flex;
+  flex: 1;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+.handling-option-text > span,
+.handling-option-text b {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.handling-option-text b {
+  font-weight: 600;
+}
+.handling-option-text > span {
+  flex: 1;
+  max-width: none;
+}
+.handling-option-text small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: var(--fs-caption);
+}
+#handling-project-note {
+  margin-top: var(--sp-1);
+}
+#handling-project-note.error-text {
+  color: var(--red-fg);
+}
+.handling-prompt pre {
+  white-space: pre-wrap;
+}
+.handling-menu {
+  position: fixed;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px;
+  background: var(--surface-layer);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-float);
+}
+.handling-menu input {
+  flex: none;
+}
+.handling-menu-list {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.handling-menu-list > .helper {
+  margin: 8px;
+}
+.handling-menu-group {
+  padding: 8px 8px 2px;
+  color: var(--text-secondary);
+  font-size: var(--fs-caption);
+}
+.handling-menu [role='option'] {
+  --btn-bg: transparent;
+  --btn-line: transparent;
+  --btn-hover: var(--surface-selected);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  text-align: left;
+}
+.handling-menu [role='option'] .icon {
+  flex: none;
+  margin: 0;
+  color: var(--accent);
+}
+.handling-menu-efforts {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 4px 2px;
+  border-top: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: var(--fs-caption);
+}
+.handling-menu-efforts span {
+  margin-inline-end: 4px;
+}
+.handling-menu-efforts button {
+  min-height: var(--control-h-sm);
+  padding: 2px 8px;
+  font-size: var(--fs-caption);
+}
+.handling-menu-efforts button[aria-pressed='true'] {
+  --btn-bg: var(--accent);
+  --btn-fg: var(--on-accent);
+  --btn-hover: var(--accent);
+  --btn-fg-hover: var(--on-accent);
+}
+.handling-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-1) var(--sp-3);
+  margin-top: var(--sp-2);
+}
+.handling-note .error-text {
+  color: var(--red-fg);
+}

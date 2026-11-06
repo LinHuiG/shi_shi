@@ -1,72 +1,95 @@
 let mergePrimary = '',
-  mergeTarget = '',
-  mergeQuery = '';
-function mergeForm(t) {
+  mergeQuery = '',
+  mergeBusy = false,
+  mergeVersions = {},
+  mergeRows = [];
+const mergeSelected = new Set();
+function mergeContent(t) {
+  const status = t.status === '处理中' ? 'processing' : t.status === '已完成' ? 'done' : '',
+    tags = taskTags(t);
+  return `<span class="merge-content"><span class="merge-copy"><b title="${esc(t.title)}">${esc(t.title)}</b><span class="merge-description" title="${esc(t.description)}">${esc(t.description || '暂无描述')}</span></span><span class="merge-label-area"><span class="merge-meta" title="${esc([t.status, ...tags.map((tag) => tag.kind + '：' + tag.value)].join(' · '))}"><span class="merge-status ${status}">${esc(t.status)}</span> ${tags.map((tag) => `<span class="merge-tag" title="${esc(tag.kind + '：' + tag.value)}">${esc(tag.value)}</span>`).join(' ')}</span></span></span>`;
+}
+async function mergeForm(t) {
+  mergeRows = (await rpc('merge_candidates', { id: t.id })).rows;
   mergePrimary = t.id;
-  mergeTarget = '';
   mergeQuery = '';
+  mergeBusy = false;
+  mergeSelected.clear();
+  mergeVersions = Object.fromEntries([...mergeRows, t].map((task) => [task.id, task.updated]));
   setModal(
-    `<h2>合并事项</h2><p class="subtitle">保留当前事项，将所选事项的描述和消息依据合并进来。可在操作记录中撤销。</p><div class="merge-current"><span class="tiny">保留的事项</span><b>${esc(t.title)}</b><p>${esc(t.description)}</p><span class="tiny">${esc(t.status)}</span></div><input id="merge-search" aria-label="搜索合并事项" placeholder="搜索标题、描述或标签"><div class="helper" id="merge-count"></div><div id="merge-candidates" class="merge-candidates"></div><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="apply-merge" disabled>确认合并</button></div>`,
+    `<header class="merge-dialog-header"><div><h2>合并事项</h2><p class="subtitle">将所选内容合入保留事项，可在操作记录中撤销。</p></div><button class="merge-close" data-action="close" aria-label="关闭合并事项"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><path d="M3 3l10 10M13 3L3 13"/></svg></button></header><div class="merge-current"><span class="merge-current-label"><svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><path d="M2 2h8v8H2zM4 6l1.5 1.5L8.5 4"/></svg>保留的事项</span>${mergeContent(t)}</div><div class="merge-tools"><label class="merge-search"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><circle cx="6.6" cy="6.6" r="4.3"/><path d="m10 10 3.5 3.5"/></svg><input id="merge-search" name="merge-search" type="search" autocomplete="off" aria-label="搜索合并事项" placeholder="搜索标题、描述或标签…"></label><span id="merge-count" aria-live="polite"></span><div class="merge-selection" role="group" aria-label="选择事项"><button data-merge-select="all" title="选中当前搜索结果">全选</button><button data-merge-select="invert" title="反选当前搜索结果">反选</button><span class="merge-tools-separator" aria-hidden="true"></span><button data-merge-select="clear" title="清空全部已选事项">清空</button></div></div><div id="merge-candidates" class="merge-candidates"></div><div id="modal-error" class="error-box" role="alert"></div><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-action="apply-merge" disabled>确认合并</button></div>`,
   );
-  $('#dialog').classList.add('wide-dialog');
+  $('#dialog').classList.add('merge-dialog');
   renderMergeCandidates();
 }
-function mergeCandidates() {
-  return state.tasks
-    .filter((t) => t.id !== mergePrimary && !t.archived && !t.merged_into)
-    .sort(
-      (a, b) =>
-        Number(a.status !== '待处理') - Number(b.status !== '待处理') || b.updated - a.updated,
-    );
-}
 function renderMergeCandidates() {
-  const all = mergeCandidates(),
-    q = mergeQuery.trim().toLowerCase(),
-    rows = all.filter(
-      (t) =>
-        !q ||
-        (
-          t.title +
-          ' ' +
-          t.description +
-          ' ' +
-          taskTags(t)
-            .map((v) => v.kind + ' ' + v.value)
-            .join(' ')
-        )
-          .toLowerCase()
-          .includes(q),
-    );
-  $('#merge-count').textContent =
-    `${all.length} 条可合并事项（不含当前事项） · 搜索结果 ${rows.length} 条`;
+  const all = mergeRows,
+    available = new Set(all.map((t) => t.id)),
+    q = mergeQuery.trim().toLowerCase();
+  for (const id of mergeSelected) if (!available.has(id)) mergeSelected.delete(id);
+  const rows = all.filter(
+    (t) =>
+      !q ||
+      [t.title, t.description, ...taskTags(t).map((tag) => tag.kind + ' ' + tag.value)]
+        .join(' ')
+        .toLowerCase()
+        .includes(q),
+  );
+  setHtml(
+    '#merge-count',
+    `已选<strong>${mergeSelected.size}</strong><span>/${all.length}</span>${q ? `<span> · 结果${rows.length}</span>` : ''}`,
+    { animate: false },
+  );
   setHtml(
     '#merge-candidates',
     rows
       .map(
         (t) =>
-          `<label class="merge-option ${mergeTarget === t.id ? 'selected' : ''}"><input type="radio" name="merge-choice" value="${esc(t.id)}" ${mergeTarget === t.id ? 'checked' : ''}><span><b>${esc(t.title)}</b><span class="tiny">${esc(t.status)} · ${esc(
-            taskTags(t)
-              .map((tag) => tag.kind + ' · ' + tag.value)
-              .join('、'),
-          )}</span><p>${esc(t.description || '暂无描述')}</p></span></label>`,
+          `<label class="merge-option ${mergeSelected.has(t.id) ? 'selected' : ''}" data-merge-id="${esc(t.id)}"><input type="checkbox" name="merge-choice" value="${esc(t.id)}" aria-label="选择${esc(t.title)}" ${mergeSelected.has(t.id) ? 'checked' : ''}>${mergeContent(t)}</label>`,
       )
       .join('') || '<p class="helper">没有符合条件的事项</p>',
+    { animate: false },
   );
-  updateMergeButton(all);
+  document.querySelectorAll('[name="merge-choice"]').forEach((el) => {
+    el.checked = mergeSelected.has(el.value);
+    el.disabled = mergeBusy;
+  });
+  document.querySelectorAll('[data-merge-select]').forEach((el) => {
+    el.disabled = mergeBusy || (el.dataset.mergeSelect === 'clear' ? !mergeSelected.size : !rows.length);
+  });
+  $('#merge-search').disabled = mergeBusy;
+  document.querySelectorAll('.merge-dialog [data-action="close"]').forEach((el) => (el.disabled = mergeBusy));
+  updateMergeButton();
 }
-function updateMergeButton(candidates = mergeCandidates()) {
-  $('[data-action="apply-merge"]').disabled = !candidates.some((t) => t.id === mergeTarget);
+function updateMergeButton() {
+  const button = $('[data-action="apply-merge"]');
+  button.disabled = mergeBusy || !mergeSelected.size;
+  button.setAttribute('aria-busy', String(mergeBusy));
+  button.textContent = mergeBusy
+    ? '正在合并…'
+    : mergeSelected.size
+      ? `确认合并（${mergeSelected.size}项）`
+      : '确认合并';
 }
 async function applyMerge() {
-  const b = $('[data-action="apply-merge"]');
-  if (b.disabled) return;
-  b.disabled = true;
+  const button = $('[data-action="apply-merge"]');
+  if (button.disabled || mergeBusy) return;
+  const ids = [mergePrimary, ...mergeSelected],
+    versions = Object.fromEntries(ids.map((id) => [id, mergeVersions[id]]));
+  mergeBusy = true;
+  button.dataset.pending = 'true';
+  renderMergeCandidates();
+  $('#modal-error').textContent = '';
   try {
-    await perform('merge', { ids: [mergePrimary, mergeTarget] }, '已合并，可在操作记录中撤销');
+    await perform('merge', { ids, versions }, `已合并${ids.length - 1}项，可在操作记录中撤销`);
+    delete button.dataset.pending;
     closeModal();
-  } catch (e) {
-    $('#modal-error').textContent = e.message;
-    updateMergeButton();
+  } catch (error) {
+    $('#modal-error').textContent = error.message;
+  } finally {
+    mergeBusy = false;
+    delete button.dataset.pending;
+    if (!$('#overlay').hidden && $('#merge-candidates')) renderMergeCandidates();
   }
 }
 
@@ -86,20 +109,11 @@ document.addEventListener('change', (e) => {
   if (el.id === 'inbox-from' || el.id === 'inbox-until') {
     inboxFrom = $('#inbox-from').value;
     inboxUntil = $('#inbox-until').value;
-    inboxPage = 1;
-    inboxSelected.clear();
-    renderInbox();
-  }
-  if (el.id === 'inbox-page-size') {
-    inboxPageSize = Number(el.value);
-    inboxPage = 1;
     inboxSelected.clear();
     renderInbox();
   }
   if (el.dataset.inboxSelect) {
-    el.checked
-      ? inboxSelected.add(el.dataset.inboxSelect)
-      : inboxSelected.delete(el.dataset.inboxSelect);
+    el.checked ? inboxSelected.add(el.dataset.inboxSelect) : inboxSelected.delete(el.dataset.inboxSelect);
     renderInbox();
   }
   if (el.id === 'inbox-select-all') {
@@ -107,7 +121,8 @@ document.addEventListener('change', (e) => {
     renderInbox();
   }
   if (el.name === 'merge-choice') {
-    mergeTarget = el.value;
+    if (mergeBusy) return;
+    el.checked ? mergeSelected.add(el.value) : mergeSelected.delete(el.value);
     renderMergeCandidates();
   }
 });
@@ -115,17 +130,23 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (
     !b ||
-    ![
-      'settingsTarget',
-      'promptSection',
-      'adviceReply',
-      'adviceAction',
-      'inboxDelete',
-      'workflow',
-    ].some((k) => b.dataset[k])
+    !['settingsTarget', 'promptSection', 'adviceReply', 'adviceAction', 'inboxDelete', 'workflow', 'mergeSelect'].some(
+      (k) => b.dataset[k],
+    )
   )
     return;
   try {
+    if (b.dataset.mergeSelect) {
+      if (mergeBusy) return;
+      if (b.dataset.mergeSelect === 'clear') mergeSelected.clear();
+      else
+        for (const el of document.querySelectorAll('[name="merge-choice"]')) {
+          if (b.dataset.mergeSelect === 'all' || !mergeSelected.has(el.value)) mergeSelected.add(el.value);
+          else mergeSelected.delete(el.value);
+        }
+      renderMergeCandidates();
+      return;
+    }
     if (b.dataset.settingsTarget) {
       $('#settings-' + b.dataset.settingsTarget)?.scrollIntoView({
         block: 'start',
@@ -137,9 +158,7 @@ document.addEventListener('click', async (e) => {
       if (!(await leaveSettings())) return;
       settingsDirty = false;
       promptEditing = false;
-      promptSection = ['advice', 'memory'].includes(b.dataset.promptSection)
-        ? b.dataset.promptSection
-        : 'history';
+      promptSection = b.dataset.promptSection === 'memory' ? 'memory' : 'history';
       page = 'prompts';
       await render();
       return;
@@ -200,24 +219,6 @@ document.addEventListener('click', async (e) => {
         $('#inbox-until').value = '';
         renderInbox();
         break;
-      case 'inbox-prev':
-        inboxPage = Math.max(1, inboxPage - 1);
-        inboxSelected.clear();
-        await renderInbox();
-        break;
-      case 'inbox-next':
-        inboxPage = Math.min(inboxData.pages, inboxPage + 1);
-        inboxSelected.clear();
-        await renderInbox();
-        break;
-      case 'inbox-jump':
-        inboxPage = Math.max(
-          1,
-          Math.min(inboxData.pages, Number($('#inbox-page-jump').value) || 1),
-        );
-        inboxSelected.clear();
-        await renderInbox();
-        break;
       case 'retention-settings':
         page = 'settings';
         await render();
@@ -241,7 +242,7 @@ document.addEventListener('click', async (e) => {
     if ($('#modal-error') && !$('#overlay').hidden) $('#modal-error').textContent = err.message;
     toast(err.message);
   } finally {
-    if (!b.dataset.workflow?.startsWith('inbox-')) b.disabled = false;
+    if (!b.dataset.mergeSelect && !b.dataset.workflow?.startsWith('inbox-')) b.disabled = false;
   }
 });
 

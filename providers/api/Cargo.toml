@@ -11,8 +11,14 @@ serde = "1"
 thiserror = "2"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls-no-alpn"] }
 native-tls = "0.2.16"
-tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
-windows-sys = { version = "0.59.0", features = [
-    "Win32_Foundation",
-    "Win32_Networking_WinHttp",
-] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59.0", features = ["Win32_Foundation", "Win32_Networking_WinHttp"] }
+
+[features]
+# Test builds only: accept plain http to loopback (see http_client).
+loopback-http = ["tokio/rt-multi-thread"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -24,11 +24,12 @@ window.receive = (v) => {
   pending.delete(v.id);
   v.ok ? p.resolve(v.data) : p.reject(rpcError(v.error));
 };
+window.chrome?.webview?.addEventListener('message', (event) => window.receive(event.data));
 const longAiMethods = new Set([
   'tool_test',
   'scan',
   'analyze',
-  'format',
+  'advice_feedback',
   'schedule_format',
   'edit_ai',
   'report',
@@ -36,20 +37,16 @@ const longAiMethods = new Set([
   'learn',
   'source_range',
   'prompt_retry',
-  'handling_learn',
 ]);
 async function rpc(method, params = {}) {
-  if (!longAiMethods.has(method) || !state?.async_ai_requests) return rpcRaw(method, params);
+  if (!longAiMethods.has(method)) return rpcRaw(method, params);
   const accepted = await rpcRaw('ai_job_start', { method, params });
-  if (!accepted?.job_id) throw Error('后台操作未返回编号，请查看日志；不要重复提交。');
   for (;;) {
     let result;
     try {
       result = await rpcRaw('ai_job_result', { job_id: accepted.job_id });
     } catch (error) {
-      throw Error(
-        `查询后台操作 ${accepted.job_id} 失败：${error.message}；后台可能仍在执行，请查看状态与日志。`,
-      );
+      throw Error(`查询后台操作 ${accepted.job_id} 失败：${error.message}；后台可能仍在执行，请查看状态与日志。`);
     }
     if (result.done) {
       if (!result.ok) throw rpcError(result.error);
@@ -64,35 +61,8 @@ const esc = (s) =>
     /[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c],
   );
-function recordedAiSource(detail) {
-  if (detail?.source) return detail.source;
-  let route;
-  try {
-    route = JSON.parse(detail?.model);
-  } catch {}
-  return Array.isArray(route) && route.length === 2 && route.every((v) => typeof v === 'string')
-    ? {
-        driver: 'dsh',
-        connection_name: 'DSH（历史记录）',
-        provider: route[0],
-        model_name: route[1],
-        label: 'DSH（历史记录） / ' + route[0],
-      }
-    : null;
-}
-function aiSourceLabel(source) {
-  return source?.label || source?.connection_name || '来源未记录';
-}
 function aiModelLabel(detail) {
-  const source = recordedAiSource(detail);
-  let route;
-  try {
-    route = JSON.parse(detail.model);
-  } catch {}
-  const provider = source?.provider || (Array.isArray(route) ? route[0] : '');
-  const model =
-    source?.model_name || (Array.isArray(route) ? route[1] : detail.model) || '默认模型';
-  return `${aiSourceLabel(source)}${!source?.provider && provider ? ' / ' + provider : ''} · ${model}`;
+  return `${detail.source.label} · ${detail.source.model_name || '默认模型'}`;
 }
 const aiLiveSpeedTip = '最近 1 秒 API 已上报输出 tokens 的增量；每秒计算一次。';
 const aiSpeedTip =
@@ -100,9 +70,7 @@ const aiSpeedTip =
 const liveTokenSample = {};
 function tokenSpeed(output, elapsed) {
   const rate =
-    Number.isFinite(output) && output >= 0 && Number.isFinite(elapsed) && elapsed > 0
-      ? (output * 1000) / elapsed
-      : NaN;
+    Number.isFinite(output) && output >= 0 && Number.isFinite(elapsed) && elapsed > 0 ? (output * 1000) / elapsed : NaN;
   return Number.isFinite(rate)
     ? rate.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 })
     : '—';
@@ -119,8 +87,7 @@ function generationSpeed(stats) {
 function requestMetrics(requestId = '') {
   const live = state?.ai_live,
     liveMatches = live && (!requestId || live.request_id === requestId);
-  if (state?.ai_busy && liveMatches)
-    return { generation: live.generation, first: live.first_response_ms };
+  if (state?.ai_busy && liveMatches) return { generation: live.generation, first: live.first_response_ms };
   const terminal = (state?.activity || []).find(
     (a) =>
       ['ai_success', 'ai_failed', 'ai_cancelled'].includes(a.kind) &&
@@ -170,8 +137,7 @@ function requestSpeed(requestId = '') {
       apiRate = sampleTokenRate(api, key, live.usage_final ? null : live.output_tokens, at);
     if (api.at !== previousAt) {
       const reported = live.usage_elapsed_ms;
-      api.fresh =
-        Number.isFinite(api.reported) && reported > api.reported && reported - api.reported <= 1500;
+      api.fresh = Number.isFinite(api.reported) && reported > api.reported && reported - api.reported <= 1500;
       api.reported = Number.isFinite(live.output_tokens) && !live.usage_final ? reported : null;
     }
     if (Number.isFinite(apiRate) && api.fresh) {
@@ -209,11 +175,7 @@ function firstResponseLabel(value) {
 }
 function analysisProgressText() {
   const live = state?.ai_live,
-    text =
-      (live?.entries || []).at(-1)?.text ||
-      live?.phase ||
-      state?.ai_progress ||
-      '正在连接，等待公开内容';
+    text = (live?.entries || []).at(-1)?.text || live?.phase || state?.ai_progress || '正在连接，等待公开内容';
   return (
     Array.from(
       String(text)
@@ -227,9 +189,7 @@ function analysisProgressText() {
   );
 }
 const date = (t) =>
-  t
-    ? new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false })
-    : '尚未扫描';
+  t ? new Date(t).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '尚未扫描';
 let state = null,
   page = 'tasks',
   selected = '',
@@ -243,10 +203,11 @@ let state = null,
   modalFromTrace = false;
 const names = {
   tasks: '事项',
-  schedules: '定时事项',
+  review: '回顾',
+  schedules: '回顾',
   inbox: '消息收件箱',
-  reports: '报表与归档',
-  learning: '迭代建议',
+  reports: '回顾',
+  learning: '回顾',
   logs: '系统日志',
   settings: '设置',
   sources: '消息来源',
@@ -282,13 +243,15 @@ function badge(p) {
   return `<span class="badge ${p === '紧急' ? 'urgent' : p === '高' ? 'high' : p === '已完成' ? 'green' : p === '普通' ? 'normal' : p === '低' ? 'low' : ''}">${esc(p)}</span>`;
 }
 function empty(title, text, button = '') {
-  return `<div class="empty"><div class="empty-icon">▤</div><div>${title}</div><p>${text}</p>${button}</div>`;
+  return `<div class="empty"><div class="empty-icon">${icon('empty')}</div><div>${title}</div><p>${text}</p>${button}</div>`;
 }
 let modalClosing = null,
   modalOutsideDismiss = null,
-  modalBack = null;
+  modalBack = null,
+  modalEpoch = 0;
 function setModal(html) {
   if (cancelEmbeddedPluginSettings?.() === false) return;
+  modalEpoch++;
   const overlay = $('#overlay'),
     closing = modalClosing,
     opacity = getComputedStyle(overlay).opacity;
@@ -299,7 +262,17 @@ function setModal(html) {
   modalFromTrace = false;
   modalOutsideDismiss = null;
   modalBack = null;
-  $('#dialog').classList.remove('wide-dialog', 'live-dialog', 'approval-shell', 'plugin-settings-dialog', 'plugin-settings-compact', 'tool-editor-dialog', 'tool-history-dialog', 'tool-detail-dialog');
+  $('#dialog').classList.remove(
+    'wide-dialog',
+    'live-dialog',
+    'plugin-settings-dialog',
+    'plugin-settings-compact',
+    'tool-editor-dialog',
+    'tool-history-dialog',
+    'tool-detail-dialog',
+    'merge-dialog',
+  );
+  clearHtml($('#dialog'));
   $('#dialog').innerHTML = html;
   overlay.hidden = false;
   if (closing) motionAnimate(overlay, [{ opacity }, { opacity: 1 }]);
@@ -311,9 +284,15 @@ function setModal(html) {
 }
 function modalReturnPoint() {
   if ($('#overlay').hidden || modalClosing) return null;
-  const dialog = $('#dialog'), nodes = [...dialog.childNodes], classes = dialog.className,
-    scroll = dialog.scrollTop, focused = document.activeElement, task = modalTask,
-    outside = modalOutsideDismiss, back = modalBack, fromTrace = modalFromTrace;
+  const dialog = $('#dialog'),
+    nodes = [...dialog.childNodes],
+    classes = dialog.className,
+    scroll = dialog.scrollTop,
+    focused = document.activeElement,
+    task = modalTask,
+    outside = modalOutsideDismiss,
+    back = modalBack,
+    fromTrace = modalFromTrace;
   return () => {
     setModal('');
     dialog.className = classes;
@@ -333,27 +312,36 @@ async function copyText(text) {
       return true;
     }
   } catch {}
-  const focused = document.activeElement, field = document.createElement('textarea');
+  const focused = document.activeElement,
+    field = document.createElement('textarea');
   field.value = text;
   field.readOnly = true;
   field.style.cssText = 'position:fixed;left:-9999px;top:0';
   document.body.append(field);
   field.focus({ preventScroll: true });
   field.select();
-  try { return !!document.execCommand('copy'); }
-  catch { return false; }
-  finally {
+  try {
+    return !!document.execCommand('copy');
+  } catch {
+    return false;
+  } finally {
     field.remove();
     if (focused?.isConnected) focused.focus({ preventScroll: true });
   }
 }
 async function modalRequest(button, method, params, accept, { label, lockForm = false } = {}) {
   const controls = lockForm ? [...$('#dialog').querySelectorAll('input,select,textarea,button')] : [button];
-  const previous = controls.map(control => [control, control.disabled]);
-  const message = $('#modal-error'), caption = button.textContent;
-  controls.forEach(control => { control.disabled = true; });
+  const previous = controls.map((control) => [control, control.disabled]);
+  const message = $('#modal-error'),
+    caption = button.textContent;
+  controls.forEach((control) => {
+    control.disabled = true;
+  });
   button.dataset.pending = 'true';
-  if (label) { button.textContent = label; message.textContent = ''; }
+  if (label) {
+    button.textContent = label;
+    message.textContent = '';
+  }
   try {
     const result = await rpc(method, params);
     delete button.dataset.pending;
@@ -362,13 +350,16 @@ async function modalRequest(button, method, params, accept, { label, lockForm = 
     message.textContent = error.message;
   } finally {
     delete button.dataset.pending;
-    previous.forEach(([control, disabled]) => { control.disabled = disabled; });
+    previous.forEach(([control, disabled]) => {
+      control.disabled = disabled;
+    });
     if (label) button.textContent = caption;
   }
 }
 function closeModal() {
   const overlay = $('#overlay');
   if (overlay.hidden || modalClosing || $('#dialog').querySelector('[data-pending="true"]')) return;
+  modalEpoch++;
   if (modalBack) {
     const back = modalBack;
     modalBack = null;
@@ -379,13 +370,12 @@ function closeModal() {
   modalTask = null;
   modalFromTrace = false;
   modalOutsideDismiss = null;
-  const animation = motionAnimate(
-    overlay,
-    [{ opacity: getComputedStyle(overlay).opacity }, { opacity: 0 }],
-    { fill: 'forwards' },
-  );
+  const animation = motionAnimate(overlay, [{ opacity: getComputedStyle(overlay).opacity }, { opacity: 0 }], {
+    fill: 'forwards',
+  });
   if (!animation) {
     overlay.hidden = true;
+    clearHtml($('#dialog'));
     return;
   }
   const closing = { animation };
@@ -396,6 +386,7 @@ function closeModal() {
     () => {
       if (modalClosing !== closing) return;
       overlay.hidden = true;
+      clearHtml($('#dialog'));
       overlay.inert = false;
       delete overlay.dataset.closing;
       modalClosing = null;
@@ -416,13 +407,21 @@ async function perform(method, params = {}, notice = '已完成') {
   }
 }
 const htmlMemo = new WeakMap();
+function clearHtml(el) {
+  if (!el) return;
+  htmlMemo.get(el)?.observer.disconnect();
+  htmlMemo.delete(el);
+  el.replaceChildren();
+}
 function setHtml(selector, html, options) {
   const el = typeof selector === 'string' ? $(selector) : selector;
   if (!el) return;
   let memo = htmlMemo.get(el);
   if (!memo) {
     memo = { dirty: true };
-    memo.observer = new MutationObserver(() => { memo.dirty = true; });
+    memo.observer = new MutationObserver(() => {
+      memo.dirty = true;
+    });
     memo.observer.observe(el, { subtree: true, childList: true, attributes: true, characterData: true });
     htmlMemo.set(el, memo);
   }
@@ -446,10 +445,11 @@ function viewKey(s, p) {
     case 'tasks':
       return JSON.stringify([
         s.tag_state,
-        (s.handling || []).map(r=>[r.id,r.task_id,r.status,r.desktop_status,
-          r.desktop_control,r.waiting_on,r.restartable,r.current_source]),
+        (s.handling || []).map((r) => [r.id, r.task_id, r.status]),
         s.tasks,
         s.task_history_revision,
+        s.tasks_revision,
+        s.task_focus_counts,
         s.last_analysis_success_at,
         s.usage.day,
         s.pending,
@@ -460,7 +460,7 @@ function viewKey(s, p) {
       ]);
     case 'inbox':
       return JSON.stringify([
-        s.messages_revision ?? s.messages,
+        s.messages_revision,
         s.pending,
         s.last_scan,
         s.config.enabled,
@@ -470,22 +470,21 @@ function viewKey(s, p) {
     case 'schedules':
       return JSON.stringify(s.schedules);
     case 'reports':
-      return JSON.stringify([s.reports, s.config.work_start, s.config.work_end, s.archive_attempt, s.report_outcome]);
+      return JSON.stringify([
+        s.reports_revision,
+        s.config.work_start,
+        s.config.work_end,
+        s.archive_attempt,
+        s.report_outcome,
+      ]);
     case 'learning':
       return JSON.stringify([s.suggestions, s.rule_version, s.tag_state, s.evolution]);
     case 'logs':
-      return JSON.stringify(s.activity_day_revision ?? [s.audit, s.activity, s.usage]);
+      return JSON.stringify(s.activity_day_revision);
     case 'sources':
       return JSON.stringify([s.chat_sources, pluginCatalogRevision]);
     case 'prompts':
-      return JSON.stringify([
-        promptSection,
-        promptSection === 'advice'
-          ? [s.suggestions, s.rule_version, s.tag_state, s.evolution]
-          : promptSection === 'memory'
-            ? s.memory_state
-            : s.prompt_state,
-      ]);
+      return JSON.stringify([promptSection, promptSection === 'memory' ? s.memory_state : s.prompt_state]);
     default:
       return '';
   }
@@ -506,61 +505,42 @@ window.refreshState = function (force = false) {
         const forced = refreshForced;
         refreshForced = false;
         const requestPage = page,
-          requestTask = handlingWindow?.id || (requestPage==='tasks' ? selected || undefined : undefined),
-          requestSelected = requestPage==='tasks' ? selected || undefined : undefined,
-          requestLogDay = requestPage==='logs' ? logDay || shanghaiLogDay() : undefined;
+          requestSelected = requestPage === 'tasks' ? selected || undefined : undefined,
+          requestLogDay = requestPage === 'logs' ? logDay || shanghaiLogDay() : undefined;
         const next = await rpc('state', {
           page: requestPage,
-          task: requestTask,
           selected_task: requestSelected,
           log_day: requestLogDay,
-          activity_day_revision: page==='logs' ? state?.activity_day_revision : undefined,
-          handling_revision: !forced ? state?.handling_revision : undefined,
           core_revision: !forced && state?._page === requestPage ? state.core_revision : undefined,
         });
-        if (page !== requestPage ||
-          requestTask !== (handlingWindow?.id || (page==='tasks' ? selected || undefined : undefined)) ||
-          requestSelected !== (page==='tasks' ? selected || undefined : undefined) ||
-          requestLogDay !== (page==='logs' ? logDay || shanghaiLogDay() : undefined)) {
+        if (
+          page !== requestPage ||
+          requestSelected !== (page === 'tasks' ? selected || undefined : undefined) ||
+          requestLogDay !== (page === 'logs' ? logDay || shanghaiLogDay() : undefined)
+        ) {
           refreshQueued = true;
           refreshForced = true;
           continue;
         }
-        if (
-          next.tag_state?.unified &&
-          JSON.stringify(next.tag_state.groups) !== JSON.stringify(state?.tag_state?.groups)
-        ) {
-          selectedTags = structuredClone(next.tag_state.filters || {});
+        // An `_unchanged` snapshot carries no tag_state.
+        if (next.tag_state && JSON.stringify(next.tag_state.groups) !== JSON.stringify(state?.tag_state.groups)) {
+          selectedTags = structuredClone(next.tag_state.filters);
           selectedPriorities = [];
         }
-        state = { reports: [], audit: [], messages: [], ...state, ...next };
-        if (next.handling_live?.length) {
-          const previews = new Map(next.handling_live.map((run) => [run.id, run]));
-          state.handling = (state.handling || []).map((run) => {
-            const preview = previews.get(run.id);
-            if(!preview)return run;
-            if(preview._round_changes){
-              if(run._details===false || run._base_updated!==preview._base_updated){
-                refreshQueued=true;refreshForced=true;return run;
-              }
-              const rounds=(run.rounds||[]).slice(0,preview._round_count);
-              for(const [index,round] of preview._round_changes)rounds[index]=round;
-              return {...run,...preview,rounds};
-            }
-            return { ...run, ...preview };
-          });
-        }
+        state = next._unchanged ? { ...state, ...next } : next;
         status();
-        syncHandlingWindow();
-        updateHandlingLive();
-        syncHandlingApproval();
         syncTaskRecordPanel();
         syncUpdateNotice();
+        syncEditProgress();
+        if (
+          page === 'settings' &&
+          $('#settings-source-content') &&
+          sourceCatalogKey !== JSON.stringify([state.chat_sources, pluginCatalogRevision])
+        )
+          void renderSources();
         const active = document.activeElement,
           editing =
-            $('#view').contains(active) &&
-            active?.matches('input,textarea,select') &&
-            active.id !== 'inbox-search';
+            $('#view').contains(active) && active?.matches('input,textarea,select') && active.id !== 'inbox-search';
         const nextKey = !next._unchanged || page === 'logs' ? viewKey(state, page) : undefined;
         const changed = renderedPage !== page || (nextKey !== undefined && renderedKey !== nextKey);
         if (
@@ -570,11 +550,7 @@ window.refreshState = function (force = false) {
               renderedPage === 'settings' &&
               (settingsChanged() || settingsSavePromise || settingsQueue || connectionEditor)
             )) ||
-          (changed &&
-            page !== 'settings' &&
-            (!editing || page === 'tasks') &&
-            !settingsDirty &&
-            $('#overlay').hidden)
+          (changed && page !== 'settings' && (!editing || page === 'tasks') && !settingsDirty && $('#overlay').hidden)
         ) {
           const target = page,
             scroll = $('#view').scrollTop;
@@ -583,14 +559,7 @@ window.refreshState = function (force = false) {
         }
         if (!uiReady) {
           uiReady = true;
-          await rpc('ui_ready', {
-            rendered: !!$('#page-title')?.textContent && !!$('#view')?.children.length,
-            tag_catalog_ready: Array.isArray(state.tag_state?.groups),
-            version: state.version,
-            build_time: state.build_time,
-            task_rows: document.querySelectorAll('.task-row').length,
-            plugin_drop: typeof installPluginFile === 'function',
-          });
+          await rpc('ui_ready');
         }
       } catch (e) {
         toast(e.message);
@@ -633,20 +602,13 @@ function settingsChanged() {
 }
 async function leaveSettings() {
   if (memoryEditor && !leaveMemory()) return false;
-  if (connectionEditor?.saving || connectionEditor?.busy) {
-    toast(connectionEditor.saving ? '正在保存连接' : '正在读取连接，请稍后重试');
-    restoreConnectionFocus();
-    return false;
-  }
+  // A busy connection editor refuses before settings are flushed.
+  if (connectionEditor?.saving || connectionEditor?.busy) return leaveConnectionEditor();
   if (page === 'settings' && !(await flushSettings())) {
     toast('设置尚未保存，请修正输入或重试');
     return false;
   }
-  if (connectionDirty() && !confirm('连接修改尚未保存，放弃修改？')) {
-    restoreConnectionFocus();
-    return false;
-  }
-  closeConnectionEditor();
+  if (!leaveConnectionEditor()) return false;
   settingsDirty = false;
   return true;
 }

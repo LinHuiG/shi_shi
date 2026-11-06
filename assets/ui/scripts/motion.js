@@ -62,12 +62,7 @@ function motionExit(el) {
     });
     for (const node of copies) {
       for (const attr of [...node.attributes])
-        if (
-          attr.name === 'id' ||
-          attr.name === 'class' ||
-          attr.name === 'name' ||
-          attr.name.startsWith('data-')
-        )
+        if (attr.name === 'id' || attr.name === 'class' || attr.name === 'name' || attr.name.startsWith('data-'))
           node.removeAttribute(attr.name);
       if (node.matches('input,textarea,select,button')) node.disabled = true;
     }
@@ -107,7 +102,6 @@ function motionKey(el) {
     'data-event-key',
     'data-report-key',
     'data-advice-card',
-    'data-composer-task',
     'data-filter-group',
     'data-ai-connection',
     'data-view',
@@ -135,12 +129,9 @@ function reconcileHtml(host, html, { animate = true } = {}) {
     animate ? [...host.querySelectorAll(rowSelector)].map((el) => [el, el.getBoundingClientRect()]) : [],
   );
   for (const el of positions.keys()) motionAnimations.get(el)?.cancel();
-  const scrollers = [
-    host,
-    ...host.querySelectorAll(
-      '.task-list,.detail,.conclusion-body,.ai-live-output,[data-handling-stream],.approval-scroll',
-    ),
-  ].filter((el) => el.scrollHeight > el.clientHeight + 1);
+  const scrollers = [host, ...host.querySelectorAll('.task-list,.detail,.conclusion-body,.ai-live-output')].filter(
+    (el) => el.scrollHeight > el.clientHeight + 1,
+  );
   const anchors = scrollers.map((el) => {
     const rect = el.getBoundingClientRect(),
       node = [...el.children].find((n) => n.getBoundingClientRect().bottom > rect.top);
@@ -152,9 +143,8 @@ function reconcileHtml(host, html, { animate = true } = {}) {
         old.nodeValue = next.nodeValue;
         const parent = old.parentElement;
         if (
-          animate && parent?.matches(
-            '.badge,.task-status,.advice-status,.phase-copy,.side-pending,.usage-line b,.report-counts b',
-          )
+          animate &&
+          parent?.matches('.badge,.task-status,.advice-status,.phase-copy,.side-pending,.usage-line b,.report-counts b')
         )
           motionAnimate(parent, [{ opacity: 0.45 }, { opacity: 1 }]);
       }
@@ -173,8 +163,7 @@ function reconcileHtml(host, html, { animate = true } = {}) {
       )
         old.removeAttribute(attr.name);
     for (const attr of [...next.attributes])
-      if (attr.name !== 'open' && old.getAttribute(attr.name) !== attr.value)
-        old.setAttribute(attr.name, attr.value);
+      if (attr.name !== 'open' && old.getAttribute(attr.name) !== attr.value) old.setAttribute(attr.name, attr.value);
     if (!old.hasAttribute('data-preserve-content')) children(old, next);
     if (open !== null) old.open = open;
     if (value !== null) {
@@ -183,11 +172,13 @@ function reconcileHtml(host, html, { animate = true } = {}) {
     }
   }
   function children(parent, next) {
-    const remaining = new Set(parent.childNodes), candidates = new Map();
+    const remaining = new Set(parent.childNodes),
+      candidates = new Map();
     // Unkeyed nodes match in document order; a duplicate explicit key keeps
     // the last old node, just as the previous keyed map did.
     for (const node of [...remaining].reverse()) {
-      const key = motionKey(node), slot = key || node.nodeType + ':' + node.nodeName;
+      const key = motionKey(node),
+        slot = key || node.nodeType + ':' + node.nodeName;
       if (!candidates.has(slot)) candidates.set(slot, []);
       const group = candidates.get(slot);
       if (!key || !group.length) group.push(node);
@@ -221,24 +212,19 @@ function reconcileHtml(host, html, { animate = true } = {}) {
     if (el.isConnected) {
       const after = el.getBoundingClientRect(),
         dy = before.top - after.top;
-      if (Math.abs(dy) > 0.5)
-        motionAnimate(el, [{ transform: `translateY(${dy}px)` }, { transform: 'none' }]);
+      if (Math.abs(dy) > 0.5) motionAnimate(el, [{ transform: `translateY(${dy}px)` }, { transform: 'none' }]);
     }
-  if (active?.isConnected && document.activeElement !== active)
-    active.focus({ preventScroll: true });
-  if (selection && active?.isConnected && selection[0] != null)
-    active.setSelectionRange(...selection);
+  if (active?.isConnected && document.activeElement !== active) active.focus({ preventScroll: true });
+  if (selection && active?.isConnected && selection[0] != null) active.setSelectionRange(...selection);
 }
 // Native disclosures keep their semantics; only their brief size change animates.
 document.addEventListener(
   'click',
   (e) => {
-    const trigger = e.target.closest(
-      'summary,[data-handle="followup"],[data-advice-reply],.tag-group-title',
-    );
+    const trigger = e.target.closest('summary,[data-advice-reply],.tag-group-title');
     if (!trigger) return;
-    if (trigger.closest('.record-range,.handling-more,.handling-stream-detail')) return;
-    const box = trigger.closest('details,.handling-panel,.advice-card,.tag-group');
+    if (trigger.closest('.record-range')) return;
+    const box = trigger.closest('details,.advice-card,.tag-group');
     if (!box) return;
     const height = box.getBoundingClientRect().height;
     motionAnimations.get(box)?.cancel();
@@ -286,15 +272,10 @@ new MutationObserver((records) => {
   const changed = new Set();
   for (const r of records) {
     const el = r.target.nodeType === 1 ? r.target : r.target.parentElement;
-    if (
-      !el?.isConnected ||
-      el.closest(
-        '[data-motion-ghost],[data-handling-stream],.ai-live-output,[data-live-line],input,textarea,select',
-      )
-    )
+    if (!el?.isConnected || el.closest('[data-motion-ghost],.ai-live-output,[data-live-line],input,textarea,select'))
       continue;
     const target = el.closest(
-      '#page-subtitle,#nav-count,.side-pending,.usage-line b,.report-counts b,.advice-status,.summary-lead,.memory-prose,.handling-conclusion,#connection-status,#connection-models,#connection-candidates,#source-candidates,#settings-save-status,#plugin-drop-hint,#inbox-summary',
+      '#page-subtitle,#nav-count,.side-pending,.usage-line b,.report-counts b,.advice-status,.summary-lead,.memory-prose,#connection-status,#connection-models,#connection-candidates,#source-candidates,#settings-save-status,#plugin-drop-hint,#inbox-summary',
     );
     if (
       target &&

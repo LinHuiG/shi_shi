@@ -17,12 +17,14 @@ function showPluginSettings(settings, editor) {
   let completed = null;
   let saving = false;
   const controls = [...$('#dialog').querySelectorAll('input,button')];
-  const disabled = controls.map(control => control.disabled);
-  const setSaving = value => {
+  const disabled = controls.map((control) => control.disabled);
+  const setSaving = (value) => {
     saving = value;
     if (value) host.dataset.pending = 'true';
     else delete host.dataset.pending;
-    controls.forEach((control, i) => { control.disabled = value || disabled[i]; });
+    controls.forEach((control, i) => {
+      control.disabled = value || disabled[i];
+    });
   };
   const dispose = () => {
     if (saving && !completed) return false;
@@ -40,18 +42,24 @@ function showPluginSettings(settings, editor) {
     if (request.channel === 'shishi-plugin-completed' && completed?.id === request.id) {
       dispose();
       if (completed.action === 'cancel') editor.cancel();
-      else void editor.complete().catch(error => toast(error.message));
+      else void editor.complete().catch((error) => toast(error.message));
       return;
     }
     if (request.channel !== 'shishi-plugin' || completed) return;
     const { id, action, method, params, config, name, dirty, options, height } = request;
-    if (!Number.isSafeInteger(id) || !['call', 'complete', 'cancel', 'suggest_name', 'set_dirty', 'pick_path', 'set_content_height'].includes(action)) return;
+    if (
+      !Number.isSafeInteger(id) ||
+      !['call', 'complete', 'cancel', 'suggest_name', 'set_dirty', 'pick_path', 'set_content_height'].includes(action)
+    )
+      return;
     if (action === 'set_content_height') {
-      const valid = height === null || (typeof height === 'number' && Number.isFinite(height) && height > 0 && height <= 100_000);
+      const valid =
+        height === null || (typeof height === 'number' && Number.isFinite(height) && height > 0 && height <= 100_000);
       if (valid) {
         dialog.classList.toggle('plugin-settings-compact', height !== null);
         if (height === null) dialog.style.removeProperty('--plugin-content-height');
-        else dialog.style.setProperty('--plugin-content-height', Math.min(4000, Math.max(100, Math.ceil(height))) + 'px');
+        else
+          dialog.style.setProperty('--plugin-content-height', Math.min(4000, Math.max(100, Math.ceil(height))) + 'px');
       }
       frame.contentWindow.postMessage({ channel: 'shishi-plugin-result', id, result: valid }, '*');
       return;
@@ -72,9 +80,17 @@ function showPluginSettings(settings, editor) {
         if (!options || !['file', 'directory'].includes(options.kind)) throw Error('请选择文件或目录');
         setSaving(true);
         try {
-          const result = await rpc('pick', { type: options.kind, kind: options.title || '路径', default_path: options.defaultPath || '', filters: options.filters || [] });
-          if (!closed) frame.contentWindow.postMessage({ channel: 'shishi-plugin-result', id, result: result || null }, '*');
-        } finally { setSaving(false); }
+          const result = await rpc('pick', {
+            type: options.kind,
+            kind: options.title || '路径',
+            default_path: options.defaultPath || '',
+            filters: options.filters || [],
+          });
+          if (!closed)
+            frame.contentWindow.postMessage({ channel: 'shishi-plugin-result', id, result: result || null }, '*');
+        } finally {
+          setSaving(false);
+        }
         return;
       }
       if (action === 'set_dirty') {
@@ -90,10 +106,20 @@ function showPluginSettings(settings, editor) {
       }
       const source = action === 'complete' ? editor.source() : undefined;
       if (action === 'complete') setSaving(true);
-      const result = await rpc('plugin_settings', { session: settings.session, action, method, params, config, source });
+      const result = await rpc('plugin_settings', {
+        session: settings.session,
+        action,
+        method,
+        params,
+        config,
+        source,
+      });
       if (closed) return;
       if (action === 'complete') completed = { id, action };
-      frame.contentWindow.postMessage({ channel: 'shishi-plugin-result', id, result, complete: action === 'complete' }, '*');
+      frame.contentWindow.postMessage(
+        { channel: 'shishi-plugin-result', id, result, complete: action === 'complete' },
+        '*',
+      );
     } catch (error) {
       if (action === 'complete') setSaving(false);
       if (!closed) frame.contentWindow.postMessage({ channel: 'shishi-plugin-result', id, error: error.message }, '*');

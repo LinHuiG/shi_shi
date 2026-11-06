@@ -2,16 +2,7 @@
 // same page navigation and visible buttons a mouse user would use, so no
 // action gains a second, divergent code path. Shortcuts are listed in the
 // palette and in sidebar tooltips so they can be learned in place.
-const pageOrder = [
-  'tasks',
-  'schedules',
-  'inbox',
-  'reports',
-  'sources',
-  'prompts',
-  'logs',
-  'settings',
-];
+const pageOrder = ['tasks', 'inbox', 'review', 'sources', 'prompts', 'logs', 'settings'];
 const go = async (target) => {
   if (page !== target) {
     if (!(await leaveSettings())) return false;
@@ -22,9 +13,7 @@ const go = async (target) => {
 };
 const runAction = async (target, action) => {
   if (!(await go(target))) return;
-  document
-    .querySelector(`#top-actions [data-action="${action}"],#view [data-action="${action}"]`)
-    ?.click();
+  document.querySelector(`#top-actions [data-action="${action}"],#view [data-action="${action}"]`)?.click();
 };
 const focusSearch = async () => {
   if (!['tasks', 'inbox'].includes(page) && !(await go('tasks'))) return;
@@ -72,10 +61,7 @@ function renderPalette() {
       )
       .join('') || '<li class="palette-empty">没有匹配的命令</li>',
   );
-  $('#palette-input')?.setAttribute(
-    'aria-activedescendant',
-    paletteRows.length ? 'palette-' + paletteIndex : '',
-  );
+  $('#palette-input')?.setAttribute('aria-activedescendant', paletteRows.length ? 'palette-' + paletteIndex : '');
   $('#palette-' + paletteIndex)?.scrollIntoView({ block: 'nearest' });
 }
 function openPalette() {
@@ -157,9 +143,9 @@ document.addEventListener(
     }
     if (modal) return;
     const typing = e.target.closest?.('input,textarea,select,[contenteditable="true"]');
-    if (ctrl && !e.shiftKey && !e.altKey && /^[1-8]$/.test(key)) {
+    if (ctrl && !e.shiftKey && !e.altKey && /^[1-9]$/.test(key) && key <= pageOrder.length) {
       e.preventDefault();
-      go(pageOrder[Number(key) - 1]);
+      go(pageOrder[key - 1]);
       return;
     }
     if (ctrl && key === 'n') {

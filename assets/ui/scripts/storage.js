@@ -7,7 +7,7 @@ async function chooseDataDirectory() {
     if (!(await flushSettings())) throw Error('请先修正或保存当前设置');
     const directory = await rpc('pick', { kind: '选择新的数据目录', type: 'directory' });
     if (!directory) return;
-    const current = state.data_directory || state.root;
+    const current = state.data_directory;
     if (launcherIdentity(directory) === launcherIdentity(current)) {
       toast('数据目录未改变');
       return;

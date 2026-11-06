@@ -1,0 +1,30 @@
+[package]
+name = "shishi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+build = "build.rs"
+
+[[bin]]
+name = "shishi"
+path = "src/main.rs"
+
+[dependencies]
+shishi-core = { path = "../core" }
+shishi-acp = { path = "../providers/acp" }
+shishi-api = { path = "../providers/api" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+shishi-api = { path = "../providers/api", features = ["loopback-http"] }
+
+[target.'cfg(windows)'.dependencies]
+tao = "=0.34.8"
+wry = "=0.53.5"
+rfd = "=0.15.4"
+windows-sys = { version = "=0.59.0", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_Storage_FileSystem", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_Controls"] }

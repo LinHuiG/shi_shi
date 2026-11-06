@@ -5,7 +5,7 @@ document.addEventListener('click', async (e) => {
     if (b.dataset.taskStatusValue) {
       const group = b.closest('[role="radiogroup"]');
       $('#f-status').value = b.dataset.taskStatusValue;
-      group.querySelectorAll('[role="radio"]').forEach(button => {
+      group.querySelectorAll('[role="radio"]').forEach((button) => {
         const selected = button === b;
         button.setAttribute('aria-checked', String(selected));
         button.tabIndex = selected ? 0 : -1;
@@ -55,7 +55,6 @@ document.addEventListener('click', async (e) => {
     }
     if (b.dataset.logFilter) {
       logFilter = b.dataset.logFilter;
-      logPage = 1;
       void renderLogs();
       return;
     }
@@ -77,29 +76,19 @@ document.addEventListener('click', async (e) => {
       return;
     }
     if (b.dataset.build) {
-      const m =
-        inboxRows().find((m) => m.id === b.dataset.build) ||
-        state.messages.find((m) => m.id === b.dataset.build);
+      const m = inboxRows().find((m) => m.id === b.dataset.build);
       newModal(String(m?.text || ''), [b.dataset.build]);
       return;
     }
-    if (b.dataset.rule) {
-      await perform('rule', { id: b.dataset.rule }, '规则已更新，保留版本记录');
-      return;
-    }
     if (b.dataset.undo) {
-      await perform('undo', { index: Number(b.dataset.undo) }, '已撤销');
-      return;
-    }
-    if (b.dataset.resetPrompt) {
-      if ($('#prompt-content')) {
-        $('#prompt-content').value = promptDefaults[b.dataset.resetPrompt];
-        settingsDirty = true;
-      }
+      await perform('undo', { audit_id: b.dataset.undo }, '已撤销');
       return;
     }
     if (b.dataset.trace) {
+      const request = ++modalEpoch,
+        epoch = readerEpoch;
       const d = await rpc('ai_trace', { id: b.dataset.trace });
+      if (request !== modalEpoch || epoch !== readerEpoch || !b.isConnected) return;
       setModal(
         `<h2>AI 调用详情</h2><div class="helper">${esc(b.dataset.trace)} · 本地保存的实际输入与返回</div><div class="trace-content"><h3>实际提示词与输入数据</h3><pre>${esc(d.input || '未记录')}</pre><h3>模型输出</h3><pre>${esc(d.output || '未保存最终输出详情；可查看下方已接收事件或调用状态')}</pre>${d.error ? `<div class="error-box">${esc(d.error)}</div>` : ''}<details><summary>输出格式约束</summary><pre>${esc(d.schema)}</pre></details><details><summary>原始响应 / 已接收事件</summary><pre>${esc(d.events || '暂无事件')}</pre></details></div><div class="dialog-foot"><button data-action="close">关闭</button></div>`,
       );
@@ -120,13 +109,19 @@ document.addEventListener('click', async (e) => {
           break;
         }
         const task = readTaskForm();
-        await modalRequest(b, 'edit_ai', { task, text }, async saved => {
-          closeModal();
-          page = 'tasks';
-          selected = saved.id;
-          await refreshState(true);
-          toast('已根据你的说明更新当前事项');
-        }, { label: '正在分析并更新…', lockForm: true });
+        await modalRequest(
+          b,
+          'edit_ai',
+          { task, text },
+          async (saved) => {
+            closeModal();
+            page = 'tasks';
+            selected = saved.id;
+            await refreshState(true);
+            toast('已根据你的说明更新当前事项');
+          },
+          { label: '正在分析并更新…', lockForm: true },
+        );
         break;
       }
 
@@ -140,25 +135,33 @@ document.addEventListener('click', async (e) => {
           break;
         }
         const draft = readScheduleForm();
-        await modalRequest(b, 'schedule_format', { text }, parsed => {
-          scheduleForm(
-            {
-              ...draft,
-              ...parsed,
-              id: draft.id || '',
-              created: draft.created || 0,
-              updated: draft.updated || 0,
-              enabled: draft.enabled,
-            },
-            text,
-          );
-        }, { label: '正在填写…', lockForm: true });
+        await modalRequest(
+          b,
+          'schedule_format',
+          { text },
+          (parsed) => {
+            scheduleForm(
+              {
+                ...draft,
+                ...parsed,
+                id: draft.id || '',
+                created: draft.created || 0,
+                updated: draft.updated || 0,
+                enabled: draft.enabled,
+              },
+              text,
+            );
+          },
+          { label: '正在填写…', lockForm: true },
+        );
         break;
       }
       case 'save-schedule':
       case 'delete-schedule': {
         const saving = action === 'save-schedule';
-        const params = saving ? { schedule: readScheduleForm() } : { id: modalSchedule.id, updated: modalSchedule.updated };
+        const params = saving
+          ? { schedule: readScheduleForm() }
+          : { id: modalSchedule.id, updated: modalSchedule.updated };
         await modalRequest(b, saving ? 'schedule_edit' : 'schedule_delete', params, async () => {
           closeModal();
           if (saving) page = 'schedules';
@@ -169,8 +172,15 @@ document.addEventListener('click', async (e) => {
       }
       case 'defer': {
         b.disabled = true;
-        try { await perform('action', {id:t.id, updated:t.updated, action:'defer', choice:b.dataset.deferChoice || 'tomorrow'}, '已延后处理'); }
-        finally { b.disabled = false; }
+        try {
+          await perform(
+            'action',
+            { id: t.id, updated: t.updated, action: 'defer', choice: b.dataset.deferChoice || 'tomorrow' },
+            '已延后处理',
+          );
+        } finally {
+          b.disabled = false;
+        }
         break;
       }
 
@@ -182,16 +192,21 @@ document.addEventListener('click', async (e) => {
         break;
       }
       case 'save-archive': {
-        await modalRequest(b, 'archive_task', {
-          id: modalTask.id,
-          updated: modalTask.updated,
-          status: $('#archive-status').value,
-          note: $('#archive-note').value,
-        }, async () => {
-          closeModal();
-          await refreshState(true);
-          toast('归档已保存，等待晚间或手动归档分析');
-        });
+        await modalRequest(
+          b,
+          'archive_task',
+          {
+            id: modalTask.id,
+            updated: modalTask.updated,
+            status: $('#archive-status').value,
+            note: $('#archive-note').value,
+          },
+          async () => {
+            closeModal();
+            await refreshState(true);
+            toast('归档已保存，等待晚间或手动归档分析');
+          },
+        );
         break;
       }
       case 'toggle-scan': {
@@ -221,9 +236,7 @@ document.addEventListener('click', async (e) => {
           page = 'settings';
           render();
         }
-        document
-          .querySelector('#settings-automation')
-          ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        document.querySelector('#settings-automation')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
         break;
       }
       case 'close':
@@ -246,7 +259,7 @@ document.addEventListener('click', async (e) => {
           $('#modal-error').textContent = '请输入事项描述';
           break;
         }
-        await modalRequest(b, 'generate', { text, sources: manualSources }, async draft => {
+        await modalRequest(b, 'generate', { text, sources: manualSources }, async (draft) => {
           closeModal();
           page = 'tasks';
           tab = '待处理';
@@ -262,7 +275,7 @@ document.addEventListener('click', async (e) => {
         break;
       case 'save-task': {
         const edit = readTaskForm();
-        await modalRequest(b, 'edit', { task: edit }, async saved => {
+        await modalRequest(b, 'edit', { task: edit }, async (saved) => {
           closeModal();
           page = 'tasks';
           selected = saved.id;
@@ -275,27 +288,16 @@ document.addEventListener('click', async (e) => {
       case 'done':
       case 'reopen':
       case 'dismiss':
-      case 'unlock':
-        await perform('action', { id: t.id, updated:t.updated, action }, '已更新事项');
+        await perform('action', { id: t.id, updated: t.updated, action }, '已更新事项');
         break;
       case 'merge':
-        mergeForm(t);
+        await mergeForm(t);
         break;
       case 'apply-merge':
         await applyMerge();
         break;
-      case 'open-guide': {
-        if (!(await leaveSettings())) break;
-        page = 'guide';
-        render();
-        break;
-      }
-
       case 'backlog':
         await openBacklog();
-        break;
-      case 'backlog-preview':
-        await previewBacklog();
         break;
       case 'backlog-analyze': {
         if (state.ai_busy || state.analyzing) break;
@@ -315,26 +317,9 @@ document.addEventListener('click', async (e) => {
         toast(`已跳过 ${result.skipped_count} 条，原始消息仍保留`);
         break;
       }
-      case 'save-settings': {
-        await flushSettings();
-        break;
-      }
-      case 'codex-status': {
-        b.disabled = true;
-        try {
-          const r = await rpc('codex_status');
-          setModal(
-            `<h2>Codex 登录状态</h2><pre style="white-space:pre-wrap">${esc(r.status)}</pre><div class="dialog-foot"><button data-action="close">关闭</button></div>`,
-          );
-        } finally {
-          b.disabled = false;
-        }
-        break;
-      }
       case 'refresh-messages':
       case 'scan':
       case 'analyze':
-      case 'report':
       case 'archive':
       case 'learn': {
         const scanning = action === 'scan' || action === 'refresh-messages';
@@ -344,18 +329,14 @@ document.addEventListener('click', async (e) => {
         const original = b.innerHTML;
         b.setAttribute('aria-busy', 'true');
         b.innerHTML = b.classList.contains('icon-button')
-          ? '<span class="refresh-glyph rotating" aria-hidden="true">↻</span>'
+          ? `<span class="refresh-glyph rotating">${icon('refresh')}</span>`
           : '<span class="spin"></span>' + b.textContent;
         try {
           const r = await perform(action === 'refresh-messages' ? 'scan_only' : action, {}, '');
           toast(
             r?.skipped ||
               r?.analysis?.skipped ||
-              (action === 'scan'
-                ? '刷新与 AI 分析已完成'
-                : action === 'refresh-messages'
-                  ? '消息已刷新'
-                  : '处理完成'),
+              (action === 'scan' ? '刷新与 AI 分析已完成' : action === 'refresh-messages' ? '消息已刷新' : '处理完成'),
           );
         } finally {
           b.innerHTML = original;
@@ -396,11 +377,7 @@ document.addEventListener('compositionend', (e) => {
   }
 });
 document.addEventListener('pointerdown', (e) => {
-  if (
-    $('#backlog-panel') &&
-    !e.target.closest('#backlog-panel') &&
-    !e.target.closest('[data-action="backlog"]')
-  )
+  if ($('#backlog-panel') && !e.target.closest('#backlog-panel') && !e.target.closest('[data-action="backlog"]'))
     closeBacklog();
 });
 document.addEventListener('focusout', (e) => {
@@ -423,7 +400,9 @@ let modalPointerStartedOutside = false;
 $('#overlay').addEventListener('pointerdown', (e) => {
   modalPointerStartedOutside = e.button === 0 && e.target === $('#overlay');
 });
-$('#overlay').addEventListener('pointercancel', () => { modalPointerStartedOutside = false; });
+$('#overlay').addEventListener('pointercancel', () => {
+  modalPointerStartedOutside = false;
+});
 $('#overlay').addEventListener('click', (e) => {
   // Selecting text may end outside the dialog; that gesture is not an outside click.
   const outsideClick = e.detail === 0 || modalPointerStartedOutside;

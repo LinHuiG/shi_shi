@@ -20,6 +20,8 @@
 }
 ```
 
+也可以直接读取 [ChatLab 交换格式](https://docs.chatlab.fun)（v0.0.2）的 `.json` 或 `.jsonl` 导出：ChatLab 已有转换器的 QQ、WhatsApp、Telegram、Discord 等记录转成该格式即可接入。没有 `platformMessageId` 的消息按发送者、时间和顺序生成编号，导出文件只追加时保持稳定；JSONL 的坏行和 `#` 注释行跳过。
+
 `time` 为毫秒时间戳；演示时换为当前时刻，否则可能超出回看或保留窗口。每条消息需要稳定非空 ID 和正时间戳。示例限制文件为 24 MiB；`scan_root` 只检查给定目录的有限直接子项，不递归扫描整台电脑。
 
 在仓库根目录构建示例包，将 `target/release/shishi_json_source.dll` 与此目录的 `plugin.json` 放入空文件夹并压成 ZIP。主安装器不自动安装该插件。通过“消息来源”安装，选择消息文件，验证后启用。

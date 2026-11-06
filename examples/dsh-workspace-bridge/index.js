@@ -5,31 +5,48 @@ import { readdir, readFile, realpath, stat, writeFile, rename } from 'node:fs/pr
 import { join, isAbsolute } from 'node:path';
 
 export const name = 'shishi-workspace-bridge';
-export const inject = ['workspaceRegistry', 'sessionPersistence'];
+export const inject = ['workspaceRegistry', 'sessionPersistence', 'sessionController'];
 
 export async function reconcile(ctx, indexDir, done = new Set()) {
   let files;
   try { files = await readdir(indexDir); }
   catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  let processed = 0;
+  let processed = 0, failure;
+  const added = new Set();
   for (const file of files.sort()) {
     if (!/^[a-zA-Z0-9_-]{1,128}\.json$/.test(file) || done.has(file)) continue;
     if (++processed > 100) break;
-    const path = join(indexDir, file);
-    if ((await stat(path)).size > 4096) throw Error('SS session link is too large');
-    const link = JSON.parse(await readFile(path, 'utf8'));
-    if (link.version !== 1 || link.session_id + '.json' !== file) throw Error('Invalid SS session link');
-    // The native persisted header is authoritative, never the manifest's cwd.
-    const snapshot = await ctx.sessionPersistence.stat(link.session_id);
-    if (!snapshot) continue; // ACP has not flushed its first record yet.
-    const cwd = snapshot.header.cwd;
-    if (!cwd || !isAbsolute(cwd)) throw Error('SS session has no absolute workspace');
-    const canonical = await realpath(cwd);
-    if (!(await stat(canonical)).isDirectory()) throw Error('SS workspace is unavailable');
-    const project = await ctx.workspaceRegistry.create(canonical);
-    await project.attachSession(link.session_id);
-    done.add(file);
+    try {
+      const path = join(indexDir, file);
+      if ((await stat(path)).size > 4096) throw Error('SS session link is too large');
+      const link = JSON.parse(await readFile(path, 'utf8'));
+      if (link.version !== 1 || link.session_id + '.json' !== file) throw Error('Invalid SS session link');
+      // The native persisted header is authoritative, never the manifest's cwd.
+      const snapshot = await ctx.sessionPersistence.stat(link.session_id);
+      if (!snapshot) continue; // ACP has not flushed its first record yet.
+      const cwd = snapshot.header.cwd;
+      if (!cwd || !isAbsolute(cwd)) throw Error('SS session has no absolute workspace');
+      const canonical = await realpath(cwd);
+      if (!(await stat(canonical)).isDirectory()) throw Error('SS workspace is unavailable');
+      const project = await ctx.workspaceRegistry.create(canonical);
+      const known = project.sessionIds.includes(link.session_id);
+      await project.attachSession(link.session_id);
+      if (!known) added.add(link.session_id);
+      done.add(file);
+    } catch (error) { failure ??= error; }
   }
+  // Sessions another process wrote reach the desktop list only by notice:
+  // one native summary query per batch, one notice per new session.
+  if (added.size > 0) {
+    try {
+      const { items } = await ctx.sessionController.list({}, new AbortController().signal);
+      for (const summary of items) {
+        if (!added.has(summary.sessionId)) continue;
+        try { ctx.emit('api-session/added', summary); } catch (error) { failure ??= error; }
+      }
+    } catch (error) { failure ??= error; }
+  }
+  if (failure) throw failure;
 }
 
 export function apply(ctx, config) {

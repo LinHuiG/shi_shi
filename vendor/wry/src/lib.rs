@@ -2224,6 +2224,9 @@ pub trait WebViewExtWindows {
   /// Webview instance.
   fn webview(&self) -> ICoreWebView2;
 
+  /// Sends JSON as a WebView2 message, without compiling the payload as script.
+  fn post_web_message_as_json(&self, message: &str) -> Result<()>;
+
   /// Changes the webview2 theme.
   ///
   /// Requires WebView2 Runtime version 101.0.1210.39 or higher, returns error on older versions,
@@ -2260,6 +2263,14 @@ impl WebViewExtWindows for WebView {
 
   fn webview(&self) -> ICoreWebView2 {
     self.webview.webview.clone()
+  }
+
+  fn post_web_message_as_json(&self, message: &str) -> Result<()> {
+    unsafe {
+      self.webview.webview
+        .PostWebMessageAsJson(&windows::core::HSTRING::from(message))
+        .map_err(Into::into)
+    }
   }
 
   fn set_theme(&self, theme: Theme) -> Result<()> {

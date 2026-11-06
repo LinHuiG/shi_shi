@@ -21,9 +21,10 @@ document.addEventListener('click', async (e) => {
   }
   if (b.dataset.traceCompare) {
     b.disabled = true;
+    const request = modalEpoch;
     try {
       const d = await rpc('ai_trace', { id: b.dataset.traceCompare, previous: true });
-      if (!b.isConnected) return;
+      if (!b.isConnected || request !== modalEpoch) return;
       setModal(
         `<h2>请求内容有变化</h2><p class="helper">比较本次请求与前一份已保留的请求。文本变化不表示业务事实冲突，也不代表服务端缓存是否命中。左侧为上次，右侧为本次。</p><div class="trace-comparison">${compareTraceInputs(d.previous_input, d.input)}</div><div class="dialog-foot"><button data-action="close">关闭</button></div>`,
       );
@@ -54,8 +55,7 @@ function traceFields(text) {
   function walk(value, path) {
     if (++count > 3000) return;
     if (value && typeof value === 'object') {
-      for (const [key, v] of Object.entries(value))
-        walk(v, path + (Array.isArray(value) ? `[${key}]` : `.${key}`));
+      for (const [key, v] of Object.entries(value)) walk(v, path + (Array.isArray(value) ? `[${key}]` : `.${key}`));
     } else result.set(path, JSON.stringify(value));
   }
   const lines = text.trim().split('\n');
@@ -141,6 +141,10 @@ function updateStatusBar(html, phase) {
     setHtml(bar, html);
     statusStructure = html;
   }
+  updateStatusPhase(phase);
+}
+function updateStatusPhase(phase) {
+  const bar = $('#status');
   const host = bar.querySelector('.phase-label'),
     spinning = phase.includes('class="spin"');
   if (host) {
@@ -151,9 +155,7 @@ function updateStatusBar(html, phase) {
   }
   const speed = bar.querySelector('[data-status-speed]');
   if (speed) {
-    const rate = requestSpeed(
-      state.ai_busy ? state.ai_request_id || state.ai_live?.request_id || '' : '',
-    );
+    const rate = requestSpeed(state.ai_busy ? state.ai_request_id || state.ai_live?.request_id || '' : '');
     speed.hidden = !rate.known;
     speed.textContent = rate.known ? rate.text : '';
     speed.title = rate.tip;
@@ -209,11 +211,8 @@ function updateAiLiveDetail() {
     $('#ai-live-detail-status').textContent = '本次请求已结束';
     return;
   }
-  $('#ai-live-detail-status').textContent = state.ai_busy
-    ? live.phase || '正在处理'
-    : '本次处理已结束';
-  if (!liveScrollFrame)
-    liveFollow = output.scrollHeight - output.clientHeight - output.scrollTop < 36;
+  $('#ai-live-detail-status').textContent = state.ai_busy ? live.phase || '正在处理' : '本次处理已结束';
+  if (!liveScrollFrame) liveFollow = output.scrollHeight - output.clientHeight - output.scrollTop < 36;
   const labels = {
       reasoning: '思考进展',
       content: '正在生成',
@@ -289,7 +288,9 @@ document.addEventListener('click', (e) => {
   cancelAnimationFrame(liveScrollFrame);
   liveScrollFrame = 0;
   setModal(
-    '<div class="live-heading"><span class="live-mark" aria-hidden="true">✧</span><div><h2>AI 正在做什么</h2><p id="ai-live-detail-status" class="helper"></p></div></div><div id="ai-live-output" class="ai-live-output"></div><div class="live-reading-bar"><div class="live-metrics"><div title="从本次请求发起到首次收到 AI 公开思考或正文的耗时；阶段和工具消息不计入。"><span>首字节延迟</span><b id="ai-live-latency">—</b></div><div hidden><span id="ai-live-speed-label">速度</span><b id="ai-live-speed"></b></div></div><button id="ai-live-latest" class="quiet" hidden>回到最新 ↓</button></div><div class="dialog-foot"><button data-action="close">关闭</button></div>',
+    '<div class="live-heading"><span class="live-mark">' +
+      icon('prompts') +
+      '</span><div><h2>AI 正在做什么</h2><p id="ai-live-detail-status" class="helper"></p></div></div><div id="ai-live-output" class="ai-live-output"></div><div class="live-reading-bar"><div class="live-metrics"><div title="从本次请求发起到首次收到 AI 公开思考或正文的耗时；阶段和工具消息不计入。"><span>首字节延迟</span><b id="ai-live-latency">—</b></div><div hidden><span id="ai-live-speed-label">速度</span><b id="ai-live-speed"></b></div></div><button id="ai-live-latest" class="quiet" hidden>回到最新 ↓</button></div><div class="dialog-foot"><button data-action="close">关闭</button></div>',
   );
   $('#dialog').classList.add('live-dialog');
   updateAiLiveDetail();

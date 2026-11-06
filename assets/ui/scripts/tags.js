@@ -8,9 +8,7 @@ function rememberTagOrder(group) {
   if (key && !tagOrder.has(key))
     tagOrder.set(
       key,
-      [...group.querySelectorAll('.tag-option')].map(
-        (b) => b.dataset.tagValue || b.dataset.tagPriority || b.dataset.tab,
-      ),
+      [...group.querySelectorAll('.tag-option')].map((b) => b.dataset.tagValue || b.dataset.tab),
     );
 }
 function orderedTagValues(group) {
@@ -18,17 +16,16 @@ function orderedTagValues(group) {
   return [...group.values].sort(
     order
       ? (a, b) =>
-          (order.includes(a) ? order.indexOf(a) : order.length) -
-          (order.includes(b) ? order.indexOf(b) : order.length)
+          (order.includes(a) ? order.indexOf(a) : order.length) - (order.includes(b) ? order.indexOf(b) : order.length)
       : (a, b) => Number(group.selected.includes(b)) - Number(group.selected.includes(a)),
   );
 }
 function tagSelection() {
-  if (selectedTags === null) selectedTags = structuredClone(state?.tag_state?.filters || {});
+  if (selectedTags === null) selectedTags = structuredClone(state.tag_state.filters);
   return selectedTags;
 }
 function prioritySelection() {
-  if (selectedPriorities === null) selectedPriorities = [...(state?.tag_state?.priorities || [])];
+  if (selectedPriorities === null) selectedPriorities = [...state.tag_state.priorities];
   return selectedPriorities;
 }
 function legacyTaskTags(t) {
@@ -42,14 +39,7 @@ function legacyTaskTags(t) {
   ];
 }
 function taskTags(t) {
-  return [
-    ...new Map(
-      (t.tags || []).map((tag) => [
-        JSON.stringify([tag.kind, tag.value]),
-        tag,
-      ]),
-    ).values(),
-  ];
+  return [...new Map((t.tags || []).map((tag) => [JSON.stringify([tag.kind, tag.value]), tag])).values()];
 }
 function displayTagPriority(g) {
   return Number.isInteger(g.display_priority)
@@ -65,7 +55,7 @@ function orderedGroups(groups) {
 }
 function shownTags(t) {
   const tags = t.effective_tags || taskTags(t),
-    groups = orderedGroups(state.tag_state?.groups || []),
+    groups = filterGroups(),
     visible = tags.filter((t) => groups.some((g) => g.name === t.kind && g.values.includes(t.value)));
   return [...visible].sort((a, b) => {
     const rank = (k) => {
@@ -76,57 +66,32 @@ function shownTags(t) {
   });
 }
 function priorityKind() {
-  return state.tag_state?.priority_kind || '';
-}
-function taskRank(t) {
-  if (Number.isFinite(t.priority_rank)) return t.priority_rank;
-  const values = filterGroups().find((g) => g.name === priorityKind())?.values || [],
-    ranks = shownTags(t)
-      .filter((tag) => tag.kind === priorityKind())
-      .map((tag) => values.indexOf(tag.value))
-      .filter((v) => v >= 0);
-  return ranks.length ? Math.min(...ranks) : Number.MAX_SAFE_INTEGER;
-}
-function tagMatches(t) {
-  const tags = shownTags(t),
-    priorities = prioritySelection();
-  return (
-    (!priorities.length ||
-      tags.some((t) => t.kind === priorityKind() && priorities.includes(t.value))) &&
-    Object.entries(tagSelection()).every(
-      ([kind, values]) =>
-        !values.length ||
-        values.some((value) => tags.some((t) => t.kind === kind && t.value === value)),
-    )
-  );
+  return state.tag_state.priority_kind;
 }
 function revealTaskTags(task) {
-  const tags = shownTags(task), filters = tagSelection();
+  const tags = shownTags(task),
+    filters = tagSelection();
   let changed = false;
   for (const [kind, values] of Object.entries(filters)) {
-    if (values.length && !tags.some(tag => tag.kind === kind && values.includes(tag.value))) {
+    if (values.length && !tags.some((tag) => tag.kind === kind && values.includes(tag.value))) {
       delete filters[kind];
       changed = true;
     }
   }
   const priorities = prioritySelection();
-  if (priorities.length && !tags.some(tag => tag.kind === priorityKind() && priorities.includes(tag.value))) {
+  if (priorities.length && !tags.some((tag) => tag.kind === priorityKind() && priorities.includes(tag.value))) {
     selectedPriorities = [];
     changed = true;
   }
   return changed;
 }
 function filterGroups() {
-  return orderedGroups(state.tag_state?.groups || []);
+  return orderedGroups(state.tag_state.groups);
 }
 function tagFilterBar() {
   const selection = tagSelection(),
     priorities = prioritySelection(),
-    active =
-      Object.values(selection).some((a) => a.length) ||
-      priorities.length ||
-      tab !== '全部' ||
-      !!quickView;
+    active = Object.values(selection).some((a) => a.length) || priorities.length || tab !== '全部' || !!quickView;
   const groups = [
     {
       name: '事项范围',
@@ -143,18 +108,16 @@ function tagFilterBar() {
   return `<div class="tag-filters" data-ui-key="task-filters" aria-label="事项筛选" title="同类型任选其一，不同类型同时满足"><button class="tag-all ${active ? '' : 'selected'}" data-tag-clear aria-pressed="${!active}" title="清空范围、标签和等级筛选">全部</button><div class="tag-groups">${groups
     .map(
       (g) =>
-        `<div class="tag-slot" data-filter-slot="${esc(g.key)}"><section class="tag-group" data-filter-group="${esc(g.key)}"><button class="tag-group-title" data-tag-expand="${esc(g.name)}" data-filter-key="${esc(g.key)}" aria-expanded="false"><span>${esc(g.name)}</span><small>${g.key === 'view' ? '' : g.selected.length || ''}</small><span class="tag-chevron">＋</span></button><div class="tag-options">${orderedTagValues(
+        `<div class="tag-slot" data-filter-slot="${esc(g.key)}"><section class="tag-group" data-filter-group="${esc(g.key)}"><button class="tag-group-title" data-tag-expand="${esc(g.name)}" data-filter-key="${esc(g.key)}" aria-expanded="false"><span>${esc(g.name)}</span><small>${g.key === 'view' ? '' : g.selected.length || ''}</small><span class="tag-chevron">${icon('chevron')}</span></button><div class="tag-options">${orderedTagValues(
           g,
         )
           .map(
             (value) =>
-              `<button class="tag-option ${g.selected.includes(value) ? 'selected' : ''} ${g.key === 'view' && tab === value ? 'active' : ''}" ${g.key === 'view' ? `data-tab="${esc(value)}"` : g.key === 'priority' ? `data-tag-priority="${esc(value)}"` : `data-tag-kind="${esc(g.name)}" data-tag-value="${esc(value)}"`} aria-pressed="${g.selected.includes(value)}">${esc(value)}</button>`,
+              `<button class="tag-option ${g.selected.includes(value) ? 'selected' : ''} ${g.key === 'view' && tab === value ? 'active' : ''}" ${g.key === 'view' ? `data-tab="${esc(value)}"` : `data-tag-kind="${esc(g.name)}" data-tag-value="${esc(value)}"`} aria-pressed="${g.selected.includes(value)}">${esc(value)}</button>`,
           )
           .join('')}</div></section></div>`,
     )
-    .join(
-      '',
-    )}</div><input id="task-search" aria-label="搜索事项" placeholder="搜索事项" value="${esc(query)}"></div>`;
+    .join('')}</div><input id="task-search" aria-label="搜索事项" placeholder="搜索事项" value="${esc(query)}"></div>`;
 }
 function rememberTagBar() {
   const el = document.activeElement;
@@ -174,7 +137,6 @@ function restoreTagBar(saved) {
     if (expanded && !wasExpanded) slot.style.width = slot.getBoundingClientRect().width + 'px';
     group.classList.toggle('expanded', expanded);
     title.setAttribute('aria-expanded', String(expanded));
-    group.querySelector('.tag-chevron').textContent = expanded ? '−' : '＋';
     if (expanded) {
       const rect = group.parentElement.getBoundingClientRect(),
         width = Math.min(360, window.innerWidth - 24);
@@ -203,14 +165,17 @@ function restoreTagBar(saved) {
 function updateTagOverflow(options) {
   options.classList.toggle('has-more-options', options.scrollWidth - options.clientWidth - options.scrollLeft > 1);
 }
-const tagOverflowObserver = typeof ResizeObserver === 'function'
-  ? new ResizeObserver(entries => entries.forEach(entry => updateTagOverflow(entry.target))) : null;
-function tagOptionsScrolled(event) { updateTagOverflow(event.currentTarget); }
+const tagOverflowObserver = new ResizeObserver((entries) =>
+  entries.forEach((entry) => updateTagOverflow(entry.target)),
+);
+function tagOptionsScrolled(event) {
+  updateTagOverflow(event.currentTarget);
+}
 function observeTagOverflow() {
-  tagOverflowObserver?.disconnect();
+  tagOverflowObserver.disconnect();
   for (const options of document.querySelectorAll('.tag-options')) {
     updateTagOverflow(options);
-    tagOverflowObserver?.observe(options);
+    tagOverflowObserver.observe(options);
     options.addEventListener('scroll', tagOptionsScrolled, { passive: true });
   }
 }
@@ -269,19 +234,20 @@ function extraTagBadges(t) {
   return shownTags(t)
     .map(
       (tag) =>
-        `<span class="badge tag-extra ${tag.kind === priorityKind() ? ['urgent', 'high', 'normal', 'low'][Math.min(3, taskRank(t))] || '' : ''}" title="${esc(tag.kind)}">${esc(tag.value)}</span>`,
+        `<span class="badge tag-extra ${tag.kind === priorityKind() ? ['urgent', 'high', 'normal', 'low'][Math.min(3, t.priority_rank)] || '' : ''}" title="${esc(tag.kind)}">${esc(tag.value)}</span>`,
     )
     .join('');
 }
 function taskTagEditor(t, collapsible = false) {
-  const groups = filterGroups(), tags = taskTags(t),
-    selected = groups.some(g => tags.some(tag => tag.kind === g.name && g.values.includes(tag.value))),
+  const groups = filterGroups(),
+    tags = taskTags(t),
+    selected = groups.some((g) => tags.some((tag) => tag.kind === g.name && g.values.includes(tag.value))),
     fields = `${groups
-    .map(
-      (g) =>
-        `<div class="task-tag-field"><span>${esc(g.name)}</span><div class="row">${g.values.map((v) => `<label class="check"><input type="checkbox" data-edit-tag-kind="${esc(g.name)}" ${g.name === priorityKind() ? 'data-edit-tag-single="1"' : ''} value="${esc(v)}" ${taskTags(t).some((x) => x.kind === g.name && x.value === v) ? 'checked' : ''}>${esc(v)}</label>`).join('')}</div></div>`,
-    )
-    .join('')}<div class="helper">新枚举由 AI 从消息学习，在迭代建议中预览并采用。</div>`;
+      .map(
+        (g) =>
+          `<div class="task-tag-field"><span>${esc(g.name)}</span><div class="row">${g.values.map((v) => `<label class="check"><input type="checkbox" data-edit-tag-kind="${esc(g.name)}" ${g.name === priorityKind() ? 'data-edit-tag-single="1"' : ''} value="${esc(v)}" ${taskTags(t).some((x) => x.kind === g.name && x.value === v) ? 'checked' : ''}>${esc(v)}</label>`).join('')}</div></div>`,
+      )
+      .join('')}<div class="helper">新枚举由 AI 从消息学习，在迭代建议中预览并采用。</div>`;
   return collapsible
     ? `<details class="form-group task-tag-settings" ${selected ? 'open' : ''}><summary>标签（可留空）</summary>${fields}</details>`
     : `<div class="form-group"><label>标签（可留空）</label>${fields}</div>`;
@@ -298,9 +264,7 @@ function historicalTagBadges(t) {
     .join('');
 }
 function tagPriorityFields() {
-  return `<div class="tag-display-settings"><p class="helper">数值越小越靠前，仅调整显示顺序。</p><div class="tag-priority-grid">${orderedGroups(
-    state.tag_state?.groups || [],
-  )
+  return `<div class="tag-display-settings"><p class="helper">数值越小越靠前，仅调整显示顺序。</p><div class="tag-priority-grid">${filterGroups()
     .map(
       (g) =>
         `<label class="tag-priority-row"><span>${esc(g.name)}</span><input type="number" min="-10000" max="10000" step="1" aria-label="${esc(g.name)}显示优先级" data-tag-display-priority="${esc(g.name)}" value="${displayTagPriority(g)}"></label>`,
@@ -336,24 +300,18 @@ document.addEventListener('change', async (e) => {
 document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (!b) return;
-  if (b.hasAttribute('data-tag-clear') || b.dataset.tagKind || b.dataset.tagPriority) {
+  if (b.hasAttribute('data-tag-clear') || b.dataset.tagKind) {
     const current = tagSelection();
     if (b.hasAttribute('data-tag-clear')) {
       selectedTags = {};
       selectedPriorities = [];
       tab = '全部';
       quickView = '';
-    } else if (b.dataset.tagPriority) {
-      const p = b.dataset.tagPriority,
-        values = prioritySelection();
-      selectedPriorities = values.includes(p) ? values.filter((v) => v !== p) : [...values, p];
     } else {
       const kind = b.dataset.tagKind,
         value = b.dataset.tagValue,
         values = current[kind] || [];
-      current[kind] = values.includes(value)
-        ? values.filter((v) => v !== value)
-        : [...values, value];
+      current[kind] = values.includes(value) ? values.filter((v) => v !== value) : [...values, value];
       if (!current[kind].length) delete current[kind];
     }
     saveTagFilters();
@@ -403,7 +361,6 @@ document.addEventListener('click', async (e) => {
 document.addEventListener('change', (e) => {
   if (e.target.dataset.editTagSingle && e.target.checked) {
     for (const input of document.querySelectorAll('[data-edit-tag-single]'))
-      if (input !== e.target && input.dataset.editTagKind === e.target.dataset.editTagKind)
-        input.checked = false;
+      if (input !== e.target && input.dataset.editTagKind === e.target.dataset.editTagKind) input.checked = false;
   }
 });

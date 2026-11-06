@@ -9,28 +9,12 @@ function ruleDecision(r) {
 }
 function adviceCard(kind, r) {
   const key = adviceKey(kind, r.id),
-    status =
-      kind === 'rule'
-        ? ruleDecision(r)
-        : kind === 'handling'
-          ? r.adopted
-            ? 'adopted'
-            : r.rejected
-              ? 'rejected'
-              : 'ready'
-          : r.status,
+    status = kind === 'rule' ? ruleDecision(r) : r.status,
     ready = ['pending', 'ready'].includes(status) && !(kind === 'prompt' && status === 'pending'),
-    title =
-      kind === 'rule'
-        ? r.title
-        : kind === 'tag'
-          ? r.tag.kind + ' · ' + r.tag.value
-          : kind === 'handling'
-            ? 'AI一键处置提示词'
-            : '消息分析系统提示词',
+    title = kind === 'rule' ? r.title : kind === 'tag' ? r.tag.kind + ' · ' + r.tag.value : '消息分析系统提示词',
     body = kind === 'rule' ? r.rule : r.reason || r.error || '',
-    text = kind === 'prompt' ? r.proposed_prompt : kind === 'handling' ? r.prompt || r.policy?.prompt || '' : body;
-  return `<article class="box advice-card" data-advice-card="${esc(key)}"><div class="row"><span class="badge">${{ rule: '判断规则', tag: '标签枚举', prompt: '系统提示词', handling: '处置提示词' }[kind]}</span><span class="tiny">${esc(date(r.created))}</span><span class="advice-status">${esc({ pending: kind === 'prompt' ? '等待生成' : '待确认', ready: '待确认', enabled: '已启用', adopted: '已启用', rejected: '已拒绝', unchanged: '无需修改', superseded: '已被替代', failed: '生成失败', interrupted: '已中断' }[status] || status)}</span></div><h3>${esc(title)}</h3><p class="advice-reason">${esc(body.length > 120 ? body.slice(0, 120) + '…' : body)}</p><details class="advice-details"><summary>内容与依据</summary><p>${esc(body)}</p><pre>${esc(text)}</pre>${kind === 'tag' ? `<pre>${esc((r.excerpts || []).join('\n'))}</pre>` : ''}${kind === 'prompt' ? `<details><summary>修改前的提示词</summary><pre>${esc(r.base_prompt)}</pre></details>` : ''}<div class="helper">依据：${esc((r.evidence_ids || r.evidence || []).join('、') || '见操作记录')}</div></details>${ready ? `<div class="row advice-actions">${kind === 'tag' ? `<button data-tag-preview="${esc(r.id)}">预览并启用</button>` : kind === 'handling' ? `<button data-handle="policy-proposal" data-id="${esc(r.id)}">预览并启用</button>` : `<button class="primary" data-advice-action="enable" data-kind="${kind}" data-id="${esc(r.id)}">启用</button>`}<button data-advice-action="reject" data-kind="${kind}" data-id="${esc(r.id)}">拒绝</button>${kind === 'prompt' ? `<button data-advice-action="retry" data-kind="prompt" data-id="${esc(r.id)}">按当前版本重新生成</button>` : ''}<button class="quiet" data-advice-reply="${esc(key)}" aria-expanded="${adviceOpen.has(key)}">批复 ${adviceOpen.has(key) ? '▴' : '▾'}</button></div><div class="advice-composer" ${adviceOpen.has(key) ? '' : 'hidden'}><label>批复意见</label><textarea data-advice-text="${esc(key)}" rows="3" maxlength="4000" placeholder="说明你希望怎样调整这条建议。" ${adviceBusy.has(key) ? 'disabled' : ''}>${esc(adviceDrafts.get(key) || '')}</textarea><div class="row"><span class="helper">AI 建议可先预览，只有你手动启用后生效。</span><button data-advice-action="feedback" data-kind="${kind}" data-id="${esc(r.id)}" ${adviceBusy.has(key) ? 'disabled' : ''}>${adviceBusy.has(key) ? '正在修改…' : '提交批复'}</button></div></div>` : kind === 'prompt' && ['failed', 'interrupted'].includes(status) ? `<button data-advice-action="retry" data-kind="prompt" data-id="${esc(r.id)}">重新生成</button>` : ''}</article>`;
+    text = kind === 'prompt' ? r.proposed_prompt : body;
+  return `<article class="box advice-card" data-advice-card="${esc(key)}"><div class="row"><span class="badge">${{ rule: '判断规则', tag: '标签枚举', prompt: '系统提示词' }[kind]}</span><span class="tiny">${esc(date(r.created))}</span><span class="advice-status">${esc({ pending: kind === 'prompt' ? '等待生成' : '待确认', ready: '待确认', enabled: '已启用', adopted: '已启用', rejected: '已拒绝', unchanged: '无需修改', superseded: '已被替代', failed: '生成失败', interrupted: '已中断' }[status] || status)}</span></div><h3>${esc(title)}</h3><p class="advice-reason">${esc(body.length > 120 ? body.slice(0, 120) + '…' : body)}</p><details class="advice-details"><summary>内容与依据</summary><p>${esc(body)}</p><pre>${esc(text)}</pre>${kind === 'tag' ? `<pre>${esc((r.excerpts || []).join('\n'))}</pre>` : ''}${kind === 'prompt' ? `<details><summary>修改前的提示词</summary><pre>${esc(r.base_prompt)}</pre></details>` : ''}<div class="helper">依据：${esc((r.evidence_ids || r.evidence || []).join('、') || '见操作记录')}</div></details>${ready ? `<div class="row advice-actions">${kind === 'tag' ? `<button data-tag-preview="${esc(r.id)}">预览并启用</button>` : `<button class="primary" data-advice-action="enable" data-kind="${kind}" data-id="${esc(r.id)}">启用</button>`}<button data-advice-action="reject" data-kind="${kind}" data-id="${esc(r.id)}">拒绝</button>${kind === 'prompt' ? `<button data-advice-action="retry" data-kind="prompt" data-id="${esc(r.id)}">按当前版本重新生成</button>` : ''}<button class="quiet" data-advice-reply="${esc(key)}" aria-expanded="${adviceOpen.has(key)}">批复 ${adviceOpen.has(key) ? '▴' : '▾'}</button></div><div class="advice-composer" ${adviceOpen.has(key) ? '' : 'hidden'}><label>批复意见</label><textarea data-advice-text="${esc(key)}" rows="3" maxlength="4000" placeholder="说明你希望怎样调整这条建议。" ${adviceBusy.has(key) ? 'disabled' : ''}>${esc(adviceDrafts.get(key) || '')}</textarea><div class="row"><span class="helper">AI 建议可先预览，只有你手动启用后生效。</span><button data-advice-action="feedback" data-kind="${kind}" data-id="${esc(r.id)}" ${adviceBusy.has(key) ? 'disabled' : ''}>${adviceBusy.has(key) ? '正在修改…' : '提交批复'}</button></div></div>` : kind === 'prompt' && ['failed', 'interrupted'].includes(status) ? `<button data-advice-action="retry" data-kind="prompt" data-id="${esc(r.id)}">重新生成</button>` : ''}</article>`;
 }
 function tagHistory() {
   const s = state.tag_state;
@@ -47,23 +31,19 @@ function tagHistory() {
 }
 let promptSection = 'history';
 function systemPromptTabs() {
-  return `<div class="pills" role="tablist" aria-label="系统提示词内容" style="margin-bottom:16px"><button role="tab" data-prompt-section="history" aria-selected="${promptSection === 'history'}" class="${promptSection === 'history' ? 'active' : ''}">提示词与版本</button><button role="tab" data-prompt-section="advice" aria-selected="${promptSection === 'advice'}" class="${promptSection === 'advice' ? 'active' : ''}">迭代建议</button><button role="tab" data-prompt-section="memory" aria-selected="${promptSection === 'memory'}" class="${promptSection === 'memory' ? 'active' : ''}">AI 记忆</button></div>`;
+  return `<div class="pills" role="tablist" aria-label="系统提示词内容" style="margin-bottom:16px"><button role="tab" data-prompt-section="history" aria-selected="${promptSection === 'history'}" class="${promptSection === 'history' ? 'active' : ''}">提示词与版本</button><button role="tab" data-prompt-section="memory" aria-selected="${promptSection === 'memory'}" class="${promptSection === 'memory' ? 'active' : ''}">AI 记忆</button></div>`;
 }
 async function renderSystemPrompts() {
+  if (promptSection !== 'history' && promptHistory) releasePromptHistory();
   if (promptSection === 'memory') {
     ++promptRequest;
     await renderMemory();
-  } else if (promptSection === 'advice') {
-    ++promptRequest;
-    renderLearning();
   } else await renderPromptHistory();
 }
 function renderLearning() {
-  $('#view').dataset.contentPage = 'prompts';
-  $('#view').dataset.renderedPromptSection = 'advice';
   const rows = [
       ...(state.suggestions || []).filter((r) => !r.archived_at).map((r) => ['rule', r]),
-      ...(state.tag_state?.proposals || []).filter((r) => !r.archived_at).map((r) => ['tag', r]),
+      ...state.tag_state.proposals.filter((r) => !r.archived_at).map((r) => ['tag', r]),
       ...(state.evolution?.prompts || [])
         .filter(
           (r) =>
@@ -73,31 +53,42 @@ function renderLearning() {
             (r.status === 'unchanged' || r.proposed_prompt?.trim()),
         )
         .map((r) => ['prompt', r]),
-      ...(state.evolution?.handling || [])
-        .filter((r) => !r.archived_at)
-        .map((r) => ['handling', r]),
     ].sort((a, b) => b[1].created - a[1].created),
     settled = ([k, r]) =>
       k === 'rule'
         ? ['enabled', 'rejected', 'integrated'].includes(ruleDecision(r))
-        : k === 'handling'
-          ? r.adopted || r.rejected
-          : ['adopted', 'rejected', 'unchanged', 'superseded'].includes(r.status),
+        : ['adopted', 'rejected', 'unchanged', 'superseded'].includes(r.status),
     pending = rows.filter(([k, r]) => (k === 'prompt' ? r.status === 'ready' : !settled([k, r]))),
     done = rows.filter(settled);
   setHtml(
     '#view',
-    `<div class="page advice-page">${systemPromptTabs()}<div class="box"><h2>待确认 ${pending.length} 条</h2>${help('保留历史及手动生成的建议；可预览、启用、拒绝或批复。归档不再修改或自动采用提示词。')}<div class="row"><button data-handle="learn">从处置记录生成建议</button><button data-prompt-section="history">提示词与版本</button></div></div>${pending.map(([k, r]) => adviceCard(k, r)).join('') || empty('没有待确认的建议', '继续使用和修正事项，有充分依据时会产生新建议。')}${done.length ? `<details class="box"><summary>已处理 ${done.length} 条 · 下次归档后收起</summary>${done.map(([k, r]) => adviceCard(k, r)).join('')}</details>` : ''}${tagHistory()}</div>`,
+    `<div class="page advice-page">${reviewTabs()}<div class="box"><header class="settings-section-head"><h2>待确认 ${pending.length} 条</h2>${help('保留历史及手动生成的建议；可预览、启用、拒绝或批复。归档不再修改或自动采用提示词。')}</header><div class="row"><button data-prompt-section="history">提示词与版本</button></div></div>${pending.map(([k, r]) => adviceCard(k, r)).join('') || empty('没有待确认的建议', '继续使用和修正事项，有充分依据时会产生新建议。')}${done.length ? `<details class="box"><summary>已处理 ${done.length} 条 · 下次归档后收起</summary>${done.map(([k, r]) => adviceCard(k, r)).join('')}</details>` : ''}${tagHistory()}</div>`,
   );
 }
 let promptTarget = 'classify',
   promptEditing = false;
+const promptDrafts = new Map();
+function releasePromptHistory() {
+  rememberPromptDraft();
+  promptHistory = null;
+  promptRequest++;
+  promptEditing = false;
+}
+function rememberPromptDraft() {
+  if (promptEditing && $('#prompt-content'))
+    promptDrafts.set(promptTarget, {
+      text: $('#prompt-content').value,
+      expected: promptDrafts.get(promptTarget)?.expected || promptHistory?.current?.id,
+    });
+}
 async function renderPromptHistory() {
   const request = ++promptRequest,
-    epoch = renderEpoch;
+    epoch = renderEpoch,
+    target = promptTarget;
   if (
     $('#view').dataset.contentPage !== 'prompts' ||
-    $('#view').dataset.renderedPromptSection !== 'history'
+    $('#view').dataset.renderedPromptSection !== 'history' ||
+    $('#view').dataset.renderedPromptTarget !== target
   ) {
     setHtml(
       '#view',
@@ -105,50 +96,94 @@ async function renderPromptHistory() {
     );
     $('#view').dataset.contentPage = 'prompts';
     $('#view').dataset.renderedPromptSection = 'history';
+    $('#view').dataset.renderedPromptTarget = target;
   }
-  const result = await rpc('prompt_history');
+  const result = await rpc('prompt_history', { target });
   if (
     page !== 'prompts' ||
     promptSection !== 'history' ||
     epoch !== renderEpoch ||
-    request !== promptRequest
+    request !== promptRequest ||
+    target !== promptTarget
   )
     return;
+  rememberPromptDraft();
   promptHistory = result;
-  promptEditing = false;
   renderPromptWorkspace();
 }
 function renderPromptWorkspace() {
   const result = promptHistory,
-    versions = (result.versions || [])
-      .filter((v) => v.target === promptTarget)
-      .slice()
-      .reverse(),
-    current = versions.find((v) => v.id === result.current[promptTarget]);
+    versions = result.versions || [],
+    current = result.current;
   setHtml(
     '#view',
     `<div class="page prompt-workspace">${systemPromptTabs()}<div class="prompt-toolbar"><label>用途 <select id="prompt-target">${Object.entries(
       promptLabels,
     )
-      .map(
-        ([k, label]) =>
-          `<option value="${k}" ${k === promptTarget ? 'selected' : ''}>${label}</option>`,
-      )
+      .map(([k, label]) => `<option value="${k}" ${k === promptTarget ? 'selected' : ''}>${label}</option>`)
       .join(
         '',
-      )}</select></label>${help('系统提示词仅由你配置；编辑、手动采用和回滚保留版本。固定协议由程序追加，AI 不能修改。')}<span class="tiny">${current ? '更新于 ' + esc(date(current.created)) : ''}</span><button data-prompt-edit>编辑</button>${promptTarget === 'tool_call' ? '<button data-tool-library>工具列表</button>' : ''}</div><section class="prompt-current"><textarea id="prompt-content" readonly spellcheck="false" aria-label="当前提示词" maxlength="20000">${esc(current?.content || '')}</textarea><div class="editor-actions" id="prompt-editor-actions" hidden><button data-prompt-reset>恢复内置</button><button data-prompt-cancel>取消</button><button class="primary" data-prompt-save>保存</button></div><div class="error-box" id="prompt-error"></div></section><details class="prompt-history"><summary>历史版本 · ${versions.length}</summary>${versions.map((v) => `<details class="prompt-version"><summary><span>${esc(date(v.created))}</span><span>${esc({ initial: '初始', manual: '编辑', adopt: '采用', auto_adopt: '自动采用', consolidate: '归档', rollback: '回滚' }[v.action] || v.action)}</span>${current?.id === v.id ? '<span class="badge">当前</span>' : ''}</summary><p class="helper">${esc(v.reason || '')}</p><div class="version-compare">${current?.id !== v.id ? `<label>当前<textarea readonly rows="8">${esc(current?.content || '')}</textarea></label>` : ''}<label>此版本<textarea readonly rows="8">${esc(v.content)}</textarea></label></div>${current?.id !== v.id ? `<div class="editor-actions"><button data-prompt-rollback="${esc(v.id)}">回滚到此版本</button></div>` : ''}</details>`).join('')}</details></div>`,
+      )}</select></label>${help('系统提示词仅由你配置；编辑、手动采用和回滚保留版本。固定协议由程序追加，AI 不能修改。')}<span class="tiny">${current ? '更新于 ' + esc(date(current.created)) : ''}</span><button data-prompt-edit>编辑</button>${promptTarget === 'tool_call' ? '<button data-tool-library>工具列表</button>' : ''}</div><section class="prompt-current"><textarea id="prompt-content" readonly spellcheck="false" aria-label="当前提示词" maxlength="20000">${esc(current?.content || '')}</textarea><div class="editor-actions" id="prompt-editor-actions" hidden><button data-prompt-reset>恢复内置</button><button data-prompt-cancel>取消</button><button class="primary" data-prompt-save>保存</button></div><div class="error-box" id="prompt-error"></div></section><details class="prompt-history"><summary>历史版本 · ${versions.length}</summary>${versions.map((v) => `<details class="prompt-version" data-prompt-version="${esc(v.id)}" data-ui-key="prompt-${esc(v.id)}"><summary><span>${esc(date(v.created))}</span><span>${esc({ initial: '初始', manual: '编辑', adopt: '采用', auto_adopt: '自动采用', consolidate: '归档', rollback: '回滚' }[v.action] || v.action)}</span>${current?.id === v.id ? '<span class="badge">当前</span>' : ''}</summary><p class="helper">${esc(v.reason || '')}</p><div data-prompt-body data-preserve-content></div>${current?.id !== v.id ? `<div class="editor-actions"><button data-prompt-rollback="${esc(v.id)}">回滚到此版本</button></div>` : ''}</details>`).join('')}</details></div>`,
   );
+  for (const comparison of document.querySelectorAll('[data-prompt-current]'))
+    comparison.value = current?.content || '';
+  for (const version of document.querySelectorAll('.prompt-version[open]')) void loadPromptVersion(version);
+  const draft = promptDrafts.get(promptTarget);
+  if (draft) {
+    promptEditing = true;
+    settingsDirty = true;
+    $('#prompt-content').value = draft.text;
+    $('#prompt-content').readOnly = false;
+    $('#prompt-editor-actions').hidden = false;
+    $('[data-prompt-edit]').hidden = true;
+  }
 }
-document.addEventListener('change', (e) => {
+async function loadPromptVersion(el) {
+  const body = el.querySelector('[data-prompt-body]');
+  if (!el.open || !el.closest('.prompt-history').open) {
+    clearHtml(body);
+    return;
+  }
+  if (body.childElementCount) return;
+  const target = promptTarget,
+    id = el.dataset.promptVersion;
+  body.innerHTML = '<p class="helper">读取版本…</p>';
+  try {
+    const version =
+      promptHistory.current?.id === id ? promptHistory.current : await rpc('prompt_history', { target, version: id });
+    if (!el.isConnected || !el.open || !el.closest('.prompt-history').open || target !== promptTarget) return;
+    const current = promptHistory.current;
+    body.innerHTML = `<div class="version-compare">${current?.id !== id ? `<label>当前<textarea data-prompt-current readonly rows="8">${esc(current?.content || '')}</textarea></label>` : ''}<label>此版本<textarea readonly rows="8">${esc(version.content)}</textarea></label></div>`;
+  } catch (error) {
+    if (el.isConnected && el.open && el.closest('.prompt-history').open && target === promptTarget)
+      body.innerHTML = `<p class="error-box">${esc(error.message)}</p>`;
+  }
+}
+document.addEventListener(
+  'toggle',
+  (e) => {
+    if (e.target.matches('.prompt-version')) void loadPromptVersion(e.target);
+    if (e.target.matches('.prompt-history'))
+      for (const version of e.target.querySelectorAll('.prompt-version[open]')) void loadPromptVersion(version);
+  },
+  true,
+);
+document.addEventListener('change', async (e) => {
   if (e.target.id === 'prompt-target') {
     if (promptEditing && !confirm('放弃当前提示词编辑？')) {
       e.target.value = promptTarget;
       return;
     }
+    if (promptEditing) promptDrafts.delete(promptTarget);
     promptTarget = e.target.value;
     promptEditing = false;
     settingsDirty = false;
-    renderPromptWorkspace();
+    releasePromptHistory();
+    try {
+      await renderPromptHistory();
+    } catch (error) {
+      toast(error.message);
+    }
   }
 });
 document.addEventListener('click', async (e) => {
@@ -164,14 +199,14 @@ document.addEventListener('click', async (e) => {
       $('#prompt-content').focus();
     }
     if (b.hasAttribute('data-prompt-cancel')) {
+      promptDrafts.delete(promptTarget);
       promptEditing = false;
       settingsDirty = false;
       renderPromptWorkspace();
     }
     if (b.hasAttribute('data-prompt-reset')) {
       promptDefaults = promptDefaults || (await rpc('prompts'));
-      if (promptEditing && $('#prompt-content'))
-        $('#prompt-content').value = promptDefaults[promptTarget] || '';
+      if (promptEditing && $('#prompt-content')) $('#prompt-content').value = promptDefaults[promptTarget] || '';
     }
     if (b.hasAttribute('data-prompt-save')) {
       const controls = [...$('.prompt-workspace').querySelectorAll('button,select,textarea')];
@@ -180,9 +215,10 @@ document.addEventListener('click', async (e) => {
         await rpc('prompt_save', {
           target: promptTarget,
           text: $('#prompt-content').value,
-          expected: promptHistory.current[promptTarget],
+          expected: promptDrafts.get(promptTarget)?.expected || promptHistory.current?.id,
         });
         promptEditing = false;
+        promptDrafts.delete(promptTarget);
         settingsDirty = false;
         await refreshState(true);
         toast('提示词已保存');

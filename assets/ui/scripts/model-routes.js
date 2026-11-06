@@ -40,7 +40,7 @@ const modelFields = [
     'cfg-handling-model',
     'cfg-handling-effort',
     'AI一键处置',
-    '自动拉起所选的 Codex 或 DeepSeek Harness 桌面端，结合事项信息和相关上下文开展处置；执行过程遵循已有授权与审批设置。此入口需要外部 agent。事项分析、生成、修改和归档的注册工具调用沿用各自用途的模型。',
+    '拾事直接发起 Codex 或 DeepSeek Harness 会话，结合事项信息和相关上下文开展处置，可在对应客户端查看。这里是默认模型，发起处置时可改，只对该次会话生效。',
   ],
   [
     'review',
@@ -69,24 +69,19 @@ function defaultConnection() {
     id: '',
     name: state.config.codex_name || '默认 Codex',
     driver: 'codex',
-    executable: state.config.codex || '',
+    executable: state.config.codex,
     base_url: '',
     key_env: null,
     credential_id: null,
-    models: state.config.codex_models || [],
+    models: state.config.codex_models,
     stream: true,
   };
 }
 function draftConnections() {
-  return [
-    ...(state.config.codex ? [defaultConnection()] : []),
-    ...(state.config.ai_connections || []),
-  ];
+  return [...(state.config.codex ? [defaultConnection()] : []), ...state.config.ai_connections];
 }
 function handlingConfigured() {
-  return draftConnections().some(
-    (c) => ['codex', 'dsh'].includes(c.driver) && c.executable?.trim(),
-  );
+  return draftConnections().some((c) => ['codex', 'dsh'].includes(c.driver) && c.executable?.trim());
 }
 function refreshHandlingAvailability() {
   const unavailable = !handlingConfigured(),
@@ -109,11 +104,8 @@ function connectionOptions(selected, connections = draftConnections(), kind = ''
   return (
     `<option value="__unselected__" ${selected === '__unselected__' || !connections.some((c) => c.id === selected) ? 'selected' : ''}>未配置</option>` +
     connections
-      .filter((c) => (kind !== 'handling' || c.driver !== 'api'))
-      .map(
-        (c) =>
-          `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}</option>`,
-      )
+      .filter((c) => kind !== 'handling' || c.driver !== 'api')
+      .map((c) => `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}</option>`)
       .join('') +
     (selected && selected !== '__unselected__' && !connections.some((c) => c.id === selected)
       ? `<option selected disabled value="${esc(selected)}">连接已失效</option>`
@@ -173,9 +165,7 @@ function updateEfforts(preserve = false, only = '') {
         `<option value="${esc(previous)}">${esc(effortNames[previous] || previous)}</option>`,
       );
       select.value = previous;
-    } else
-      select.value =
-        preserve && efforts.some((v) => v.reasoningEffort === previous) ? previous : '';
+    } else select.value = preserve && efforts.some((v) => v.reasoningEffort === previous) ? previous : '';
   }
 }
 function loadModels() {
@@ -190,10 +180,7 @@ function loadModels() {
     select.innerHTML =
       '<option value="">未配置</option>' +
       modelLabels(catalog, connection?.name)
-        .map(
-          ({ m, label }) =>
-            `<option value="${esc(m.model)}">${esc(label)}</option>`,
-        )
+        .map(({ m, label }) => `<option value="${esc(m.model)}">${esc(label)}</option>`)
         .join('');
     if (previous && !catalog.some((v) => v.model === previous))
       select.insertAdjacentHTML(
@@ -201,8 +188,7 @@ function loadModels() {
         `<option disabled value="${esc(previous)}">${esc(previous)}（需检测模型）</option>`,
       );
     select.value = previous || '';
-    $('#model-status-' + kind).textContent =
-      connection && !catalog.length ? '请在 AI 接入中检测或填写模型' : '';
+    $('#model-status-' + kind).textContent = connection && !catalog.length ? '请在 AI 接入中检测或填写模型' : '';
     updateEfforts(true, m);
   }
   for (const el of document.querySelectorAll('.model-profile select:not([id$="effort"])'))

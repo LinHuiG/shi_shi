@@ -5,18 +5,18 @@ description: 使用拾事 ShiShi 的本机 CLI 查询和维护事项、记忆及
 
 # ShiShi CLI
 
-通过拾事安装目录中的 `ss.exe` 操作，与图形端共用校验、锁和持久化。不要直接修改 SQLite、状态文件或后台凭据。若本文末尾附有当前实例入口，沿用其中的路径和根目录；否则优先使用用户提供的 CLI 路径，再检查 `%LOCALAPPDATA%\Shishi\ss.exe`。不存在时通过安装信息定位，不自行安装另一份或创建新数据目录。
+通过拾事安装目录中的 `shishi.exe` 加命令操作（不带命令会打开图形界面），与图形端共用校验、锁和持久化。不要直接修改 SQLite、状态文件或后台凭据。若本文末尾附有当前实例入口，沿用其中的路径和根目录；否则优先使用用户提供的 CLI 路径，再检查 `%LOCALAPPDATA%\Shishi\shishi.exe`。不存在时通过安装信息定位，不自行安装另一份或创建新数据目录。
 
 ## 查找命令与读取数据
 
-PowerShell 使用 `& '<安装目录>\ss.exe'` 调用。先运行 `--help`，需要通用方法参数时运行 `methods`；其清单来自当前版本的业务接口。
+PowerShell 使用 `& '<安装目录>\shishi.exe' <命令>` 调用，并捕获输出（赋值给变量或接 `| Out-String`），否则 PowerShell 不等待这个图形程序结束，也拿不到 `$LASTEXITCODE`。先运行 `--help`，需要通用方法参数时运行 `methods`；其清单来自当前版本的业务接口。
 
 ```powershell
-& '<安装目录>\ss.exe' backend status
-& '<安装目录>\ss.exe' tasks list --params '{"query":"141","limit":20,"offset":0}'
-& '<安装目录>\ss.exe' tasks get '<返回的事项 id>'
-& '<安装目录>\ss.exe' memory read
-& '<安装目录>\ss.exe' methods
+& '<安装目录>\shishi.exe' backend status
+& '<安装目录>\shishi.exe' tasks list --params '{"query":"141","limit":20,"offset":0}'
+& '<安装目录>\shishi.exe' tasks get '<返回的事项 id>'
+& '<安装目录>\shishi.exe' memory read
+& '<安装目录>\shishi.exe' methods
 ```
 
 普通命令输出 UTF-8 JSON，先检查 `ok`，结果在 `data`，失败原因在 `error`。失败退出码为 1；`--help`、`--version` 输出文本。事项列表按 `limit`／`offset` 分页，可用 `focus` 筛选待处理、处理中、被阻塞、延后处理；界面 `#编号` 可搜索，但修改时必须用返回的真实 `id`。
@@ -26,10 +26,10 @@ PowerShell 使用 `& '<安装目录>\ss.exe'` 调用。先运行 `--help`，需�
 按用户已授权的范围操作，只读取所需资料。使用 `call <方法名>` 调用当前 `methods` 中的方法。复杂、多行或含引号的参数写入 UTF-8 JSON 文件，再用 `--input <文件>` 提交，避免 shell 改写内容。
 
 ```powershell
-& '<安装目录>\ss.exe' call edit --input task.json
-& '<安装目录>\ss.exe' call memory_save --input memory.json
-& '<安装目录>\ss.exe' call ai_job_start --params '{"method":"analyze","params":{}}'
-& '<安装目录>\ss.exe' job '<返回的 job_id>'
+& '<安装目录>\shishi.exe' call edit --input task.json
+& '<安装目录>\shishi.exe' call memory_save --input memory.json
+& '<安装目录>\shishi.exe' call ai_job_start --params '{"method":"analyze","params":{}}'
+& '<安装目录>\shishi.exe' job '<返回的 job_id>'
 ```
 
 - 新建事项的 JSON 为 `{"task":{"title":"示例事项","description":"需要跟进的内容","status":"待处理"}}`。修改已有事项先 `tasks get`，在 `task` 中传原 `id`、整数 `updated` 及需要修改的字段。冲突后重新读取并合并用户意图。

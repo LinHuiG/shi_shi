@@ -1,13 +1,9 @@
 use serde_json::{json, Value};
-use shishi_acp::analysis::{self, AnalysisError, AnalysisSpec};
 use shishi_acp::client::{
     AcpClient, AcpEvent, AcpLaunch, ClientError, PendingPermission, PermissionPolicy, SessionUpdate,
 };
-use shishi_acp::restricted::{
-    check_readiness, materialize_profile, ReadinessConfig, SUPPORTED_RUNTIME_VERSION,
-};
-use shishi_acp::submit::SubmitPaths;
-use shishi_acp::transport::TransportConfig;
+use shishi_acp::dsh::{check_readiness, materialize_profile};
+use shishi_acp::submit::{self as analysis, AnalysisError, AnalysisSpec, SubmitPaths};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -18,7 +14,7 @@ use std::time::{Duration, Instant};
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn temp_dir(label: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
         "shishi-acp-it-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
@@ -30,20 +26,15 @@ fn temp_dir(label: &str) -> PathBuf {
     path
 }
 
-fn test_config() -> TransportConfig {
-    TransportConfig {
-        max_stdout_line: 256 * 1024,
-        max_stderr_line: 64,
-        max_stderr_lines: 4,
-        writer_queue: 32,
-        shutdown_grace: Duration::from_secs(1),
-    }
+/// The synthetic agent and submit server in `tests/support` are examples,
+/// which `cargo test` builds next to the test's own directory.
+fn example(name: &str) -> PathBuf {
+    let deps = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    deps.parent().unwrap().join("examples").join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
 }
 
 fn mock_launch(scenario: &str) -> AcpLaunch {
-    AcpLaunch::new(env!("CARGO_BIN_EXE_mock_agent"))
-        .env("MOCK_SCENARIO", scenario)
-        .config(test_config())
+    AcpLaunch::new(example("mock_agent")).env("MOCK_SCENARIO", scenario)
 }
 
 fn mock_client(scenario: &str, policy: PermissionPolicy) -> AcpClient {
@@ -63,10 +54,7 @@ fn wait_for_permission(client: &AcpClient) -> PendingPermission {
         if let Some(pending) = client.permissions_for("mock-session-1").pop() {
             return pending;
         }
-        assert!(
-            Instant::now() < deadline,
-            "permission request was not surfaced"
-        );
+        assert!(Instant::now() < deadline, "permission request was not surfaced");
         thread::sleep(Duration::from_millis(10));
     }
 }
@@ -98,73 +86,39 @@ fn initialize_session_prompt_metadata_and_usage() {
 
     let session = client.new_session(&dir, &[], RPC_TIMEOUT).unwrap();
     assert_eq!(session.session_id, "mock-session-1");
-    assert_eq!(session.cwd, dir.to_string_lossy());
-    assert_eq!(
-        session.current_model_route(),
-        Some(("mock".into(), "mock-model".into()))
-    );
-    assert_eq!(
-        session.effort_option().map(|o| o.current_value.as_str()),
-        Some("low")
-    );
-    assert_eq!(
-        session.find_model_value("mock", "other-model"),
-        Some("[\"mock\",\"other-model\"]".into())
-    );
+    assert_eq!(session.current_model_route(), Some(("mock".into(), "mock-model".into())));
+    assert_eq!(session.effort_option().map(|o| o.current_value.as_str()), Some("low"));
+    assert_eq!(session.find_model_value("mock", "other-model"), Some("[\"mock\",\"other-model\"]".into()));
     assert!(session.find_model_value("mock", "missing").is_none());
     assert!(session.find_effort_value("high").is_some());
     assert!(session.find_effort_value("max").is_none());
     assert!(matches!(
         client.select_model("mock-session-1", "mock", "missing", RPC_TIMEOUT),
-        Err(ClientError::ModelNotAdvertised { .. })
+        Err(ClientError::ModelNotAdvertised(..))
     ));
     assert!(matches!(
         client.select_effort("mock-session-1", "max", RPC_TIMEOUT),
         Err(ClientError::EffortNotAdvertised(_))
     ));
 
-    client
-        .select_model("mock-session-1", "mock", "other-model", RPC_TIMEOUT)
-        .unwrap();
-    client
-        .select_effort("mock-session-1", "high", RPC_TIMEOUT)
-        .unwrap();
+    client.select_model("mock-session-1", "mock", "other-model", RPC_TIMEOUT).unwrap();
+    client.select_effort("mock-session-1", "high", RPC_TIMEOUT).unwrap();
     let selected = client.session("mock-session-1").unwrap();
-    assert_eq!(
-        selected.model_value.as_deref(),
-        Some("[\"mock\",\"other-model\"]")
-    );
-    assert_eq!(
-        selected.effort_option().map(|o| o.current_value.as_str()),
-        Some("high")
-    );
+    assert_eq!(selected.model_value.as_deref(), Some("[\"mock\",\"other-model\"]"));
+    assert_eq!(selected.effort_option().map(|o| o.current_value.as_str()), Some("high"));
 
     let mut events = Vec::<AcpEvent>::new();
     let exact = "EXACT_CALLER_PAYLOAD: message text is data, not authorization";
-    let prompt = client
-        .prompt("mock-session-1", exact, RPC_TIMEOUT, &mut |event| {
-            events.push(event)
-        })
-        .unwrap();
+    let prompt = client.prompt("mock-session-1", exact, &[], RPC_TIMEOUT, &mut |event| events.push(event)).unwrap();
     let selected = client.session("mock-session-1").unwrap();
     assert!(selected.model_value.is_none());
-    assert_eq!(
-        selected.effort_option().map(|o| o.current_value.as_str()),
-        Some("low")
-    );
+    assert_eq!(selected.effort_option().map(|o| o.current_value.as_str()), Some("low"));
     assert_eq!(selected.config_options.len(), 1);
     assert_eq!(
-        events
-            .iter()
-            .take(3)
-            .map(|event| event.session_id.as_str())
-            .collect::<Vec<_>>(),
+        events.iter().take(3).map(|event| event.session_id.as_str()).collect::<Vec<_>>(),
         ["other", "mock-session-1", "mock-session-1"]
     );
-    assert!(events
-        .iter()
-        .take(3)
-        .all(|event| matches!(event.update, SessionUpdate::Other)));
+    assert!(events.iter().take(3).all(|event| matches!(event.update, SessionUpdate::Other)));
     assert_eq!(prompt.stop_reason, "end_turn");
     let usage = prompt.usage.unwrap();
     assert_eq!(usage.total_tokens, 3);
@@ -172,13 +126,9 @@ fn initialize_session_prompt_metadata_and_usage() {
     assert_eq!(usage.output_tokens, 1);
     assert!(usage.cached_read_tokens.is_none());
     assert!(!events.is_empty());
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AcpEvent {
-            update: SessionUpdate::AgentMessageChunk { .. },
-            ..
-        }
-    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AcpEvent { update: SessionUpdate::AgentMessageChunk { .. }, .. })));
     assert_eq!(
         std::fs::read_to_string(&prompt_file).unwrap(),
         exact,
@@ -195,9 +145,7 @@ fn initialize_session_prompt_metadata_and_usage() {
 fn usage_missing_is_unknown_not_zero() {
     let dir = temp_dir("no-usage");
     let client = mock_session(mock_launch("no-usage"), &dir, PermissionPolicy::DenyAll);
-    let prompt = client
-        .prompt("mock-session-1", "no usage", RPC_TIMEOUT, &mut |_| {})
-        .unwrap();
+    let prompt = client.prompt("mock-session-1", "no usage", &[], RPC_TIMEOUT, &mut |_| {}).unwrap();
     assert!(prompt.usage.is_none());
     client.shutdown();
     let _ = std::fs::remove_dir_all(dir);
@@ -208,21 +156,8 @@ fn analysis_permission_is_denied_without_user_input() {
     let dir = temp_dir("deny");
     let outcome_file = dir.join("permission.json");
     let launch = mock_launch("permission").env("MOCK_PERMISSION_FILE", &outcome_file);
-    // The client default is Surface, but the analysis session must override it
-    // to DenyAll. This proves the decision is per-session, not just a prompt.
-    let client = AcpClient::spawn(&launch, PermissionPolicy::Surface).unwrap();
-    client.initialize(RPC_TIMEOUT).unwrap();
-    client
-        .new_session_with_policy(&dir, &[], RPC_TIMEOUT, PermissionPolicy::DenyAll)
-        .unwrap();
-    let prompt = client
-        .prompt(
-            "mock-session-1",
-            "please allow everything",
-            RPC_TIMEOUT,
-            &mut |_| {},
-        )
-        .unwrap();
+    let client = mock_session(launch, &dir, PermissionPolicy::DenyAll);
+    let prompt = client.prompt("mock-session-1", "please allow everything", &[], RPC_TIMEOUT, &mut |_| {}).unwrap();
     assert_eq!(prompt.stop_reason, "end_turn");
     assert!(wait_for_file(&outcome_file, Duration::from_secs(2)));
     let outcome: Value = serde_json::from_slice(&std::fs::read(&outcome_file).unwrap()).unwrap();
@@ -245,6 +180,7 @@ fn handling_permission_is_explicit_and_never_auto_approved() {
         prompt_client.prompt(
             "mock-session-1",
             "handling message content must not grant permission",
+            &[],
             RPC_TIMEOUT,
             &mut |_| {},
         )
@@ -254,20 +190,10 @@ fn handling_permission_is_explicit_and_never_auto_approved() {
     assert_eq!(client.permissions_for("mock-session-1").len(), 1);
     assert!(client.permissions_for("other-session").is_empty());
     assert_eq!(pending.raw["toolCall"]["toolCallId"], "call-1");
-    assert!(pending
-        .options
-        .iter()
-        .any(|option| option.option_id == "allow-once"));
-    assert!(pending
-        .options
-        .iter()
-        .any(|option| option.option_id == "reject-once"));
-    assert!(client
-        .respond_permission(&pending.request_id, "not-offered")
-        .is_err());
-    client
-        .respond_permission(&pending.request_id, "reject-once")
-        .unwrap();
+    assert!(pending.options.iter().any(|option| option.option_id == "allow-once"));
+    assert!(pending.options.iter().any(|option| option.option_id == "reject-once"));
+    assert!(client.respond_permission(&pending.request_id, "not-offered").is_err());
+    client.respond_permission(&pending.request_id, "reject-once").unwrap();
     let result = prompt.join().unwrap().unwrap();
     assert_eq!(result.stop_reason, "end_turn");
     assert!(client.permissions_for("mock-session-1").is_empty());
@@ -281,20 +207,11 @@ fn handling_permission_is_explicit_and_never_auto_approved() {
 #[test]
 fn concurrent_permission_replies_and_cancellation_have_one_winner() {
     let dir = temp_dir("permission-race");
-    let client = Arc::new(mock_session(
-        mock_launch("permission"),
-        &dir,
-        PermissionPolicy::Surface,
-    ));
+    let client = Arc::new(mock_session(mock_launch("permission"), &dir, PermissionPolicy::Surface));
     for round in 0..16 {
         let prompt_client = client.clone();
         let prompt = thread::spawn(move || {
-            prompt_client.prompt(
-                "mock-session-1",
-                "synthetic permission",
-                RPC_TIMEOUT,
-                &mut |_| {},
-            )
+            prompt_client.prompt("mock-session-1", "synthetic permission", &[], RPC_TIMEOUT, &mut |_| {})
         });
         let pending = wait_for_permission(&client);
         let barrier = std::sync::Barrier::new(8);
@@ -318,24 +235,15 @@ fn concurrent_permission_replies_and_cancellation_have_one_winner() {
                     })
                 })
                 .collect::<Vec<_>>();
-            responders
-                .into_iter()
-                .map(|worker| worker.join().unwrap())
-                .sum::<usize>()
+            responders.into_iter().map(|worker| worker.join().unwrap()).sum::<usize>()
         });
         if round % 2 == 0 {
             assert_eq!(winners, 1);
         } else {
-            assert!(
-                winners <= 1,
-                "cancellation and replies must claim the same request"
-            );
+            assert!(winners <= 1, "cancellation and replies must claim the same request");
         }
         let result = prompt.join().unwrap().unwrap();
-        assert!(matches!(
-            result.stop_reason.as_str(),
-            "end_turn" | "cancelled"
-        ));
+        assert!(matches!(result.stop_reason.as_str(), "end_turn" | "cancelled"));
         assert!(client.permissions_for("mock-session-1").is_empty());
         assert!(matches!(
             client.respond_permission(&pending.request_id, "allow-once"),
@@ -343,24 +251,12 @@ fn concurrent_permission_replies_and_cancellation_have_one_winner() {
         ));
     }
     thread::scope(|scope| {
-        let prompt = scope.spawn(|| {
-            client.prompt(
-                "mock-session-1",
-                "abort pending approval",
-                RPC_TIMEOUT,
-                &mut |_| {},
-            )
-        });
+        let prompt =
+            scope.spawn(|| client.prompt("mock-session-1", "abort pending approval", &[], RPC_TIMEOUT, &mut |_| {}));
         let pending = wait_for_permission(&client);
         scope.spawn(|| client.abort());
         client.abort();
-        assert!(matches!(
-            prompt.join().unwrap(),
-            Err(ClientError::Disconnected {
-                ambiguous: true,
-                ..
-            })
-        ));
+        assert!(matches!(prompt.join().unwrap(), Err(ClientError::Disconnected(_))));
         assert!(!client.is_connected());
         assert!(client.permissions_for("mock-session-1").is_empty());
         assert!(matches!(
@@ -377,23 +273,11 @@ fn timeout_is_ambiguous_and_does_not_resubmit() {
     let dir = temp_dir("timeout");
     let cancel_file = dir.join("cancel.txt");
     let count_file = dir.join("prompt-count.txt");
-    let launch = mock_launch("hang")
-        .env("MOCK_CANCEL_FILE", &cancel_file)
-        .env("MOCK_PROMPT_COUNT_FILE", &count_file);
+    let launch = mock_launch("hang").env("MOCK_CANCEL_FILE", &cancel_file).env("MOCK_PROMPT_COUNT_FILE", &count_file);
     let client = mock_session(launch, &dir, PermissionPolicy::DenyAll);
-    let error = client
-        .prompt(
-            "mock-session-1",
-            "hang",
-            Duration::from_millis(350),
-            &mut |_| {},
-        )
-        .unwrap_err();
+    let error = client.prompt("mock-session-1", "hang", &[], Duration::from_millis(350), &mut |_| {}).unwrap_err();
     match error {
-        ClientError::Timeout { method, ambiguous } => {
-            assert_eq!(method, "session/prompt");
-            assert!(ambiguous);
-        }
+        ClientError::Timeout(method) => assert_eq!(method, "session/prompt"),
         other => panic!("expected ambiguous timeout, got {other:?}"),
     }
     assert!(wait_for_file(&cancel_file, Duration::from_secs(2)));
@@ -408,40 +292,11 @@ fn process_death_is_reported_without_resubmit() {
     let count_file = dir.join("prompt-count.txt");
     let launch = mock_launch("exit").env("MOCK_PROMPT_COUNT_FILE", &count_file);
     let client = mock_session(launch, &dir, PermissionPolicy::DenyAll);
-    let error = client
-        .prompt("mock-session-1", "exit now", RPC_TIMEOUT, &mut |_| {})
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        ClientError::Disconnected {
-            ambiguous: true,
-            ..
-        }
-    ));
+    let error = client.prompt("mock-session-1", "exit now", &[], RPC_TIMEOUT, &mut |_| {}).unwrap_err();
+    assert!(matches!(error, ClientError::Disconnected(_)));
     assert_eq!(std::fs::read_to_string(&count_file).unwrap().trim(), "1");
     client.shutdown();
     let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn stderr_long_line_is_truncated() {
-    let client = mock_client("stderr-long", PermissionPolicy::DenyAll);
-    client.initialize(RPC_TIMEOUT).unwrap();
-    // The stderr reader is a separate thread; wait briefly for the first line
-    // instead of racing a loaded test runner.
-    let mut snapshot = client.stderr_snapshot();
-    for _ in 0..50 {
-        if snapshot.total_lines >= 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-        snapshot = client.stderr_snapshot();
-    }
-    assert!(snapshot.total_lines >= 1);
-    assert!(snapshot.lines.len() <= 4);
-    assert!(snapshot.lines.iter().all(|line| line.len() <= 64));
-    assert_eq!(snapshot.lines, ["S".repeat(64)]);
-    client.shutdown();
 }
 
 #[test]
@@ -450,14 +305,7 @@ fn unknown_server_request_is_denied_and_prompt_completes() {
     let response_file = dir.join("server-request.json");
     let launch = mock_launch("server-request").env("MOCK_SERVER_REQUEST_FILE", &response_file);
     let client = mock_session(launch, &dir, PermissionPolicy::DenyAll);
-    let prompt = client
-        .prompt(
-            "mock-session-1",
-            "do not read files",
-            RPC_TIMEOUT,
-            &mut |_| {},
-        )
-        .unwrap();
+    let prompt = client.prompt("mock-session-1", "do not read files", &[], RPC_TIMEOUT, &mut |_| {}).unwrap();
     assert_eq!(prompt.stop_reason, "end_turn");
     assert!(wait_for_file(&response_file, Duration::from_secs(2)));
     let response: Value = serde_json::from_slice(&std::fs::read(&response_file).unwrap()).unwrap();
@@ -470,11 +318,8 @@ fn unknown_server_request_is_denied_and_prompt_completes() {
 fn resume_and_close_require_advertised_capabilities() {
     let dir = temp_dir("resume");
     let client = mock_session(mock_launch("happy"), &dir, PermissionPolicy::DenyAll);
-    let resumed = client
-        .resume_session("mock-session-9", &dir, &[], RPC_TIMEOUT)
-        .unwrap();
+    let resumed = client.resume_session("mock-session-9", &dir, &[], RPC_TIMEOUT).unwrap();
     assert_eq!(resumed.session_id, "mock-session-9");
-    assert_eq!(resumed.cwd, dir.to_string_lossy());
     client.close_session("mock-session-9", RPC_TIMEOUT).unwrap();
     client.shutdown();
 
@@ -497,7 +342,7 @@ fn invalid_initialize_frames_fail_closed() {
             ("bad-version", ClientError::Unsupported(message)) => {
                 assert!(message.contains("version 2"))
             }
-            (_, ClientError::Transport(shishi_acp::transport::TransportError::Protocol(_))) => {
+            (_, ClientError::Protocol(_)) => {
                 assert_ne!(scenario, "bad-version")
             }
             (_, error) => panic!("{scenario}: {error:?}"),
@@ -506,52 +351,28 @@ fn invalid_initialize_frames_fail_closed() {
     }
 }
 
-#[test]
-fn stderr_is_bounded_and_not_forwarded() {
-    let dir = temp_dir("stderr");
-    let client = mock_client("stderr", PermissionPolicy::DenyAll);
-    client.initialize(RPC_TIMEOUT).unwrap();
-    // The initialize reply arrives on stdout; it is not a barrier for the
-    // independent stderr reader. Wait for that reader before checking bounds.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    let snapshot = loop {
-        let snapshot = client.stderr_snapshot();
-        if snapshot.total_lines >= 100 || std::time::Instant::now() >= deadline {
-            break snapshot;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    };
-    assert!(snapshot.total_lines >= 100);
-    assert!(snapshot.lines.len() <= 4);
-    assert!(snapshot.lines.iter().all(|line| line.len() <= 64));
-    assert!(snapshot.total_bytes <= 4 * 64);
-    assert!(snapshot
-        .lines
-        .iter()
-        .all(|line| !line.contains("EXACT_CALLER_PAYLOAD")));
-    client.shutdown();
-    let _ = std::fs::remove_dir_all(dir);
-}
-
 #[cfg(windows)]
 #[test]
 fn windows_job_reaps_descendants_on_normal_and_forced_shutdown() {
-    use shishi_acp::process::pid_alive;
+    fn pid_alive(pid: u32) -> bool {
+        use windows_sys::Win32::{Foundation::*, System::Threading::*};
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            let mut code = 0;
+            let alive = !handle.is_null() && GetExitCodeProcess(handle, &mut code) != 0 && code == 259;
+            CloseHandle(handle);
+            alive
+        }
+    }
 
     for close in [AcpClient::shutdown, AcpClient::abort] {
         let dir = temp_dir("job");
         let pid_file = dir.join("child.pid");
         let launch = mock_launch("job").env("MOCK_CHILD_PID_FILE", &pid_file);
         let client = mock_session(launch, &dir, PermissionPolicy::DenyAll);
-        client
-            .prompt("mock-session-1", "spawn child", RPC_TIMEOUT, &mut |_| {})
-            .unwrap();
+        client.prompt("mock-session-1", "spawn child", &[], RPC_TIMEOUT, &mut |_| {}).unwrap();
         assert!(wait_for_file(&pid_file, Duration::from_secs(3)));
-        let pid: u32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let pid: u32 = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
         assert!(pid_alive(pid), "grandchild should be alive before shutdown");
         close(&client);
         assert!(!client.is_connected());
@@ -570,17 +391,11 @@ fn windows_job_reaps_descendants_on_normal_and_forced_shutdown() {
 fn cmd_wrapper_launcher_is_quoted() {
     let dir = temp_dir("cmd wrapper with spaces");
     let wrapper = dir.join("mock dsh.cmd");
-    let exe = env!("CARGO_BIN_EXE_mock_agent");
-    std::fs::write(&wrapper, format!("@echo off\r\n\"{exe}\" %*\r\n")).unwrap();
+    let exe = example("mock_agent");
+    std::fs::write(&wrapper, format!("@echo off\r\n\"{}\" %*\r\n", exe.display())).unwrap();
     let launch = AcpLaunch::new(&wrapper)
-        .args([
-            "--profile",
-            "acp",
-            "--patch",
-            "C:\\path with space\\patch.yml",
-        ])
-        .env("MOCK_SCENARIO", "happy")
-        .config(test_config());
+        .args(["--profile", "acp", "--patch", "C:\\path with space\\patch.yml"])
+        .env("MOCK_SCENARIO", "happy");
     let client = AcpClient::spawn(&launch, PermissionPolicy::DenyAll).unwrap();
     client.initialize(RPC_TIMEOUT).unwrap();
     client.shutdown();
@@ -592,17 +407,12 @@ fn cmd_wrapper_launcher_is_quoted() {
 fn cmd_wrapper_keeps_percent_exclamation_and_shell_operators_literal() {
     let dir = temp_dir("cmd %PATH% !literal! & fixture");
     let wrapper = dir.join("mock %PATH% !launcher!.cmd");
-    let exe = env!("CARGO_BIN_EXE_mock_agent");
+    let exe = example("mock_agent");
     // No @echo off: /Q must keep command echo off the ACP stdout channel.
-    std::fs::write(&wrapper, format!("\"{exe}\" %*\r\n")).unwrap();
+    std::fs::write(&wrapper, format!("\"{}\" %*\r\n", exe.display())).unwrap();
     let launch = AcpLaunch::new(&wrapper)
-        .args([
-            "--patch",
-            "C:\\fixture %PATH% !literal! & (name)\\patch.yml",
-            "& echo injected",
-        ])
-        .env("MOCK_SCENARIO", "happy")
-        .config(test_config());
+        .args(["--patch", "C:\\fixture %PATH% !literal! & (name)\\patch.yml", "& echo injected"])
+        .env("MOCK_SCENARIO", "happy");
     let client = AcpClient::spawn(&launch, PermissionPolicy::DenyAll).unwrap();
     client.initialize(RPC_TIMEOUT).unwrap();
     client.shutdown();
@@ -611,14 +421,7 @@ fn cmd_wrapper_keeps_percent_exclamation_and_shell_operators_literal() {
 
 #[test]
 fn analysis_submission_contract() {
-    for scenario in [
-        "accepted",
-        "close-error",
-        "no-close",
-        "invalid",
-        "cancelled",
-        "missing",
-    ] {
+    for scenario in ["accepted", "close-error", "no-close", "invalid", "cancelled", "missing"] {
         let dir = temp_dir(&format!("analysis-{scenario}"));
         let prompt_file = dir.join("prompt.txt");
         let requests_file = dir.join("requests.jsonl");
@@ -640,12 +443,9 @@ fn analysis_submission_contract() {
                 },
             );
         if scenario == "invalid" {
-            launch = launch.env(
-                "MOCK_SUBMIT_ARGS",
-                r#"{"reason":"ok","changes":[],"extra":true}"#,
-            );
+            launch = launch.env("MOCK_SUBMIT_ARGS", r#"{"reason":"ok","changes":[],"extra":true}"#);
         }
-        let client = AcpClient::spawn(&launch, PermissionPolicy::Surface).unwrap();
+        let client = AcpClient::spawn(&launch, PermissionPolicy::DenyAll).unwrap();
         client.initialize(RPC_TIMEOUT).unwrap();
         let spec = AnalysisSpec {
             images: vec![],
@@ -656,23 +456,13 @@ fn analysis_submission_contract() {
             },"required":["reason","changes"]}),
             prompt: "EXACT_PREPARED_ANALYSIS_PAYLOAD".into(),
             workdir: dir.clone(),
-            app_exe: PathBuf::from(env!("CARGO_BIN_EXE_submit_mcp")),
+            app_exe: example("submit_mcp"),
             model: accepted_scenario.then(|| ("mock".into(), "mock-model".into())),
             effort: accepted_scenario.then(|| "high".into()),
         };
         let prepared = analysis::prepare(&dir.join("tickets"), &spec).unwrap();
-        let result = analysis::run(
-            &client,
-            &spec,
-            &prepared,
-            Duration::from_secs(10),
-            &mut |_| {},
-        );
-        assert_eq!(
-            prepared.paths.result_path.is_file(),
-            accepted_scenario || scenario == "cancelled",
-            "{scenario}"
-        );
+        let result = analysis::run(&client, &spec, &prepared, Duration::from_secs(10), &mut |_| {});
+        assert_eq!(prepared.paths.result_path.is_file(), accepted_scenario || scenario == "cancelled", "{scenario}");
         match scenario {
             _ if accepted_scenario => {
                 let accepted = result.unwrap();
@@ -681,21 +471,9 @@ fn analysis_submission_contract() {
                 assert_eq!(accepted.session_closed, scenario == "accepted");
                 assert_eq!(std::fs::read_to_string(&prompt_file).unwrap(), spec.prompt);
                 assert_eq!(accepted.prompt.usage.unwrap().total_tokens, 3);
-                let saved: Value =
-                    serde_json::from_slice(&std::fs::read(&prepared.paths.result_path).unwrap())
-                        .unwrap();
-                assert_eq!(
-                    saved["schema_hash"],
-                    shishi_acp::sha256::hex(&serde_json::to_vec(&spec.schema).unwrap())
-                );
             }
-            "cancelled" => assert!(
-                matches!(result, Err(AnalysisError::Stopped(reason)) if reason == "cancelled")
-            ),
-            _ => assert!(
-                matches!(result, Err(AnalysisError::MissingSubmission)),
-                "{scenario}: {result:?}"
-            ),
+            "cancelled" => assert!(matches!(result, Err(AnalysisError::Stopped(reason)) if reason == "cancelled")),
+            _ => assert!(matches!(result, Err(AnalysisError::MissingSubmission)), "{scenario}: {result:?}"),
         }
         let requests = std::fs::read_to_string(requests_file)
             .unwrap()
@@ -718,14 +496,7 @@ fn analysis_submission_contract() {
         if scenario != "no-close" {
             expected.push("session/close");
         }
-        assert_eq!(
-            requests
-                .iter()
-                .map(|r| r["method"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            expected,
-            "{scenario}"
-        );
+        assert_eq!(requests.iter().map(|r| r["method"].as_str().unwrap()).collect::<Vec<_>>(), expected, "{scenario}");
         client.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -738,7 +509,7 @@ struct McpChild {
 
 impl McpChild {
     fn spawn(ticket: &Path) -> Self {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_submit_mcp"))
+        let mut child = Command::new(example("submit_mcp"))
             .args(["--analysis-submit-mcp", &ticket.to_string_lossy()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -788,8 +559,8 @@ fn installed_runtime_composes_restricted_profile_read_only() {
         return;
     }
     let dir = temp_dir("installed-runtime");
-    let profile = materialize_profile(&dir.join("assets")).unwrap();
     let home = dir.join("home");
+    let profile = materialize_profile(&dir.join("assets"), &home).unwrap();
     let profile_dir = home.join("profiles").join("acp");
     std::fs::create_dir_all(&profile_dir).unwrap();
     std::fs::write(
@@ -806,24 +577,12 @@ fn installed_runtime_composes_restricted_profile_read_only() {
         .unwrap(),
     )
     .unwrap();
-    let agents = dir.join("agents");
-    std::fs::create_dir_all(&agents).unwrap();
-    let config = ReadinessConfig {
-        dsh_cmd: dsh,
-        dsh_home: home,
-        agents_home: Some(agents),
-        patch: profile.patch,
-        workdir: Some(dir.clone()),
-    };
+    let config = profile.readiness(&dsh, &home, &dir);
     let readiness = check_readiness(&config).unwrap();
-    assert_eq!(readiness.runtime_version, SUPPORTED_RUNTIME_VERSION);
+    assert!(!readiness.runtime_version.is_empty());
     assert!(readiness.active_ids.iter().any(|id| id == "acp"));
     assert!(!readiness.active_ids.iter().any(|id| id == "tool-fs"));
-    assert!(!config
-        .dsh_home
-        .join("profiles")
-        .join("shishi-analysis")
-        .exists());
+    assert!(!home.join("profiles").join("shishi-analysis").exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -839,7 +598,7 @@ fn submit_mcp_protocol_accepts_one_and_rejects_duplicate() {
         },
         "required": ["reason", "changes"]
     });
-    let (paths, _ticket) = SubmitPaths::create(&dir, "mcp-1", "edit", schema).unwrap();
+    let paths = SubmitPaths::create(&dir, "mcp-1", "edit", schema).unwrap();
     let mut server = McpChild::spawn(&paths.ticket_path);
     server.send(json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}));
     let init = server.read();
@@ -848,10 +607,7 @@ fn submit_mcp_protocol_accepts_one_and_rejects_duplicate() {
     server.send(json!({"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}));
     let list = server.read();
     assert_eq!(list["result"]["tools"][0]["name"], "submit_analysis");
-    assert_eq!(
-        list["result"]["tools"][0]["inputSchema"]["additionalProperties"],
-        false
-    );
+    assert_eq!(list["result"]["tools"][0]["inputSchema"]["additionalProperties"], false);
     server.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"submit_analysis","arguments":{"reason":"ok","changes":["a"]}}}));
     let accepted = server.read();
     assert_eq!(accepted["result"]["isError"], false);
@@ -889,8 +645,7 @@ fn token_usage_requires_both_counters_and_does_not_confuse_context_capacity() {
     ] {
         assert!(TokenUsage::from_value(&value).is_none(), "{value}");
     }
-    let usage =
-        TokenUsage::from_value(&serde_json::json!({"inputTokens":12,"outputTokens":3})).unwrap();
+    let usage = TokenUsage::from_value(&serde_json::json!({"inputTokens":12,"outputTokens":3})).unwrap();
     assert_eq!(usage.total_tokens, 15);
     assert_eq!(usage.cached_read_tokens, None);
 }

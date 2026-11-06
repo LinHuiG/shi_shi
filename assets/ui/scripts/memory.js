@@ -5,18 +5,9 @@ async function renderMemory() {
   const request = ++memoryRequest,
     epoch = renderEpoch;
   if (!memoryData)
-    setHtml(
-      '#view',
-      `<div class="page memory-page">${systemPromptTabs()}<div class="box">读取 AI 记忆…</div></div>`,
-    );
+    setHtml('#view', `<div class="page memory-page">${systemPromptTabs()}<div class="box">读取 AI 记忆…</div></div>`);
   const result = await rpc('memory_read');
-  if (
-    page !== 'prompts' ||
-    promptSection !== 'memory' ||
-    request !== memoryRequest ||
-    epoch !== renderEpoch
-  )
-    return;
+  if (page !== 'prompts' || promptSection !== 'memory' || request !== memoryRequest || epoch !== renderEpoch) return;
   memoryData = result;
   drawMemory();
 }

@@ -14,9 +14,7 @@ function editConnection(c, isNew = false) {
   };
   const host = isNew
     ? $('#new-connection-editor')
-    : [...document.querySelectorAll('[data-connection-editor]')].find(
-        (el) => el.dataset.connectionEditor === c.id,
-      );
+    : [...document.querySelectorAll('[data-connection-editor]')].find((el) => el.dataset.connectionEditor === c.id);
   host.innerHTML = `<form id="connection-form" class="connection-form" onsubmit="return false"><div class="connection-fields connection-basic"><label>名称<input data-ai-name maxlength="80" value="${esc(c.name || '')}"></label><label>类型<select data-ai-driver ${c.id === '' ? 'disabled' : ''}>${Object.entries(
     driverLabels,
   )
@@ -49,15 +47,15 @@ async function checkWorkspacePlugin(install = false) {
   label.textContent = install ? '正在安装 SS 会话插件…' : '正在检查 SS 会话接入…';
   try {
     const result = await rpc('dsh_workspace_plugin', { connection, install, confirmed: install });
-    if (
-      connectionEditor !== editor ||
-      JSON.stringify([connectionDraft().driver, connectionDraft().executable]) !== key
-    )
+    if (connectionEditor !== editor || JSON.stringify([connectionDraft().driver, connectionDraft().executable]) !== key)
       return;
     button.hidden = result.installed === true;
+    if (result.outdated) button.textContent = '更新插件';
     label.textContent = result.installed
-      ? 'SS 会话插件已安装，使用 DSH 原生工作区显示会话；安装后请重启 DSH。'
-      : '原生工作区未自动关联时，可安装最小会话桥接插件。';
+      ? 'SS 会话插件已安装，使用 DSH 原生工作区显示会话；安装或更新后，DSH 下次启动时生效。'
+      : result.outdated
+        ? 'SS 会话插件有新版本：更新后 DSH 运行期间新建的会话可直接显示，DSH 下次启动时生效。'
+        : '原生工作区未自动关联时，可安装最小会话桥接插件。';
   } catch (error) {
     if (connectionEditor === editor) label.textContent = 'SS 会话插件：' + error.message;
   } finally {
@@ -138,18 +136,11 @@ function modelLabels(catalog, connectionName = '') {
     }
     if (!Array.isArray(route) || route.length !== 2) route = null;
     const source =
-      m.providerName ||
-      m.provider ||
-      connectionName ||
-      route?.[0] ||
-      connectionEditor?.connection?.name ||
-      '当前接入';
+      m.providerName || m.provider || connectionName || route?.[0] || connectionEditor?.connection?.name || '当前接入';
     if (m.provider) {
-      if (!sources.has(source))
-        sources.set(source, { total: 0, models: new Map(), providers: new Map() });
+      if (!sources.has(source)) sources.set(source, { total: 0, models: new Map(), providers: new Map() });
       const group = sources.get(source);
-      if (!group.providers.has(m.provider))
-        group.providers.set(m.provider, { total: 0, models: new Map() });
+      if (!group.providers.has(m.provider)) group.providers.set(m.provider, { total: 0, models: new Map() });
       const provider = group.providers.get(m.provider);
       group.total++;
       provider.total++;
@@ -164,8 +155,7 @@ function modelLabels(catalog, connectionName = '') {
       provider = group?.providers.get(m.provider);
     // Exclude this provider and this model; add back their counted intersection.
     const conflict =
-      m.provider &&
-      group.total - provider.total - group.models.get(m.model) + provider.models.get(m.model) > 0;
+      m.provider && group.total - provider.total - group.models.get(m.model) + provider.models.get(m.model) > 0;
     row.source = `${row.source}${conflict ? ' (' + m.provider + ')' : ''}`;
     row.label = `${row.source} · ${row.name}`;
     return row;
@@ -175,10 +165,9 @@ function restoreConnectionFocus() {
   const form = $('#connection-form');
   const target = connectionEditor?.lastFocus;
   if (form)
-    (target?.isConnected && form.contains(target)
-      ? target
-      : form.querySelector('input,select,button')
-    )?.focus({ preventScroll: true });
+    (target?.isConnected && form.contains(target) ? target : form.querySelector('input,select,button'))?.focus({
+      preventScroll: true,
+    });
 }
 function leaveConnectionEditor() {
   const editor = connectionEditor;
@@ -196,16 +185,11 @@ function leaveConnectionEditor() {
   return true;
 }
 document.addEventListener('focusin', (e) => {
-  if (connectionEditor && e.target.closest('#connection-form'))
-    connectionEditor.lastFocus = e.target;
+  if (connectionEditor && e.target.closest('#connection-form')) connectionEditor.lastFocus = e.target;
 });
 document.addEventListener('focusout', (e) => {
   const editor = connectionEditor;
-  if (
-    editor &&
-    e.target.closest('#connection-form') &&
-    !$('#connection-form')?.contains(e.relatedTarget)
-  )
+  if (editor && e.target.closest('#connection-form') && !$('#connection-form')?.contains(e.relatedTarget))
     setTimeout(() => {
       if (
         connectionEditor === editor &&
@@ -265,8 +249,7 @@ document.addEventListener(
       editor.internalAction = true;
       setTimeout(() => {
         if (connectionEditor === editor) {
-          if (document.hasFocus() && !$('#connection-form')?.contains(document.activeElement))
-            restoreConnectionFocus();
+          if (document.hasFocus() && !$('#connection-form')?.contains(document.activeElement)) restoreConnectionFocus();
           editor.internalAction = false;
         }
       }, 0);
@@ -294,10 +277,7 @@ async function saveConnectionEditor() {
   const connection = connectionDraft();
   if (!connection.name) throw Error('请输入连接名称');
   if (!connection.models.length) throw Error('请至少勾选一个模型；可先刷新模型或手动添加');
-  if (
-    (connection.driver === 'api' && !connection.base_url) ||
-    (connection.driver !== 'api' && !connection.executable)
-  )
+  if ((connection.driver === 'api' && !connection.base_url) || (connection.driver !== 'api' && !connection.executable))
     throw Error('请填写连接地址或程序路径');
   editor.saving = true;
   editor.request++;
@@ -340,19 +320,13 @@ async function connectCandidate(path) {
     editor.connection.id = '';
     editor.expected = defaultConnection();
   }
-  if (
-    (await discoverConnectionModels()) &&
-    editor.isNew &&
-    connectionEditor === editor &&
-    editor.models.length
-  ) {
+  if ((await discoverConnectionModels()) && editor.isNew && connectionEditor === editor && editor.models.length) {
     const after = connectionValue();
     if (after === editor.discoveredValue) {
       try {
         await saveConnectionEditor();
       } catch (error) {
-        if (connectionEditor === editor)
-          $('#connection-status').textContent = '保存接入失败：' + error.message;
+        if (connectionEditor === editor) $('#connection-status').textContent = '保存接入失败：' + error.message;
       }
     }
   }
@@ -362,25 +336,19 @@ function renderConnectionModels() {
   const editor = connectionEditor,
     host = $('#connection-models');
   if (!host) return;
-  const catalog = [
-    ...new Map([...(editor.catalog || []), ...editor.models].map((m) => [m.model, m])).values(),
-  ];
+  const catalog = [...new Map([...(editor.catalog || []), ...editor.models].map((m) => [m.model, m])).values()];
   editor.catalog = catalog;
   const selected = new Set(editor.models.map((m) => m.model)),
     query = (editor.modelQuery || '').toLocaleLowerCase(),
-    visible = modelLabels(catalog)
-      .filter(({ m, label }) =>
-        [m.model, m.displayName, m.provider, m.providerName, label].some((v) =>
-          String(v || '')
-            .toLocaleLowerCase()
-            .includes(query),
-        ),
-      );
+    visible = modelLabels(catalog).filter(({ m, label }) =>
+      [m.model, m.displayName, m.provider, m.providerName, label].some((v) =>
+        String(v || '')
+          .toLocaleLowerCase()
+          .includes(query),
+      ),
+    );
   editor.visibleModels = visible.map(({ m }) => m.model);
-  if (
-    selected.size &&
-    $('#connection-status').textContent === '请至少勾选一个模型；可先刷新模型或手动添加'
-  )
+  if (selected.size && $('#connection-status').textContent === '请至少勾选一个模型；可先刷新模型或手动添加')
     $('#connection-status').textContent = `已选择 ${selected.size} 个模型`;
   $('#connection-model-controls').innerHTML = catalog.length
     ? `<div class="connection-model-controls"><span>已选 ${selected.size} / ${catalog.length} · 显示 ${visible.length}</span><button type="button" data-ai-model-all>全选当前结果</button><button type="button" data-ai-model-invert>反选当前结果</button></div>`
@@ -400,10 +368,7 @@ async function discoverConnectionModels() {
   const editor = connectionEditor;
   if (!editor) return;
   const connection = connectionDraft();
-  if (
-    (connection.driver === 'api' && !connection.base_url) ||
-    (connection.driver !== 'api' && !connection.executable)
-  )
+  if ((connection.driver === 'api' && !connection.base_url) || (connection.driver !== 'api' && !connection.executable))
     return;
   const request = connectionRequest(editor);
   editor.setup = null;
@@ -458,9 +423,7 @@ async function discoverConnectionModels() {
     if (request.unchanged())
       $('#connection-status').textContent =
         connection.driver === 'dsh'
-          ? '模型检测失败：' +
-            error.message +
-            '\n处理后点击“刷新模型”重试；手动添加模型不能修复 ACP 启动环境。'
+          ? '模型检测失败：' + error.message + '\n处理后点击“刷新模型”重试；手动添加模型不能修复 ACP 启动环境。'
           : '模型检测失败，请手动添加或重试：' + error.message;
   } finally {
     request.done();
@@ -485,8 +448,7 @@ async function initializeConnectionAcp() {
     if (!request.unchanged()) return;
     await discoverConnectionModels();
   } catch (error) {
-    if (request.unchanged())
-      $('#connection-status').textContent = 'ACP 初始化失败：' + error.message;
+    if (request.unchanged()) $('#connection-status').textContent = 'ACP 初始化失败：' + error.message;
   } finally {
     request.done();
     if (button.isConnected) {
@@ -506,11 +468,7 @@ async function detectConnection() {
     const data = await rpc('detect', { driver: c.driver, saved: original });
     if (!request.unchanged()) return;
     const rows =
-      c.driver === 'dsh'
-        ? data.candidates || []
-        : data.codex
-          ? [{ path: data.codex, label: 'Codex CLI' }]
-          : [];
+      c.driver === 'dsh' ? data.candidates || [] : data.codex ? [{ path: data.codex, label: 'Codex CLI' }] : [];
     const select = $('[data-ai-candidates]');
     select.hidden = rows.length < 2 && !original;
     select.innerHTML =
@@ -521,10 +479,7 @@ async function detectConnection() {
             `<option value="${esc(r.path)}" title="${esc(r.path)}">${esc(r.label)}${r.version ? ' ' + esc(r.version) : ''} · ${esc(r.path.replaceAll('\\', '/').split('/').slice(-2).join('/'))}</option>`,
         )
         .join('');
-    if (
-      rows.length === 1 &&
-      (!original || launcherIdentity(rows[0].path) === launcherIdentity(original))
-    ) {
+    if (rows.length === 1 && (!original || launcherIdentity(rows[0].path) === launcherIdentity(original))) {
       await connectCandidate(rows[0].path);
     } else {
       $('#connection-status').textContent = rows.length
@@ -534,8 +489,7 @@ async function detectConnection() {
         : '未找到安装，请选择新版启动器。';
     }
   } catch (error) {
-    if (request.active())
-      $('#connection-status').textContent = error.message;
+    if (request.active()) $('#connection-status').textContent = error.message;
   } finally {
     request.done();
   }
@@ -543,29 +497,20 @@ async function detectConnection() {
 function acceptConnectionConfig(config, syncProfiles = false) {
   state.config.ai_connections = config.ai_connections;
   state.config.codex = config.codex;
-  state.config.codex_models = config.codex_models || [];
-  state.config.codex_name = config.codex_name || '默认 Codex';
+  state.config.codex_models = config.codex_models;
+  state.config.codex_name = config.codex_name;
   if (!$('#ai-connections')) return;
   $('#ai-connections').innerHTML = draftConnections().map(connectionCard).join('');
   if (syncProfiles) {
     state.config.model_profiles = config.model_profiles;
     for (const [kind, m, e] of modelFields) {
       const c = modelChoice(kind);
-      $('#cfg-' + kind + '-connection').value = c.unconfigured
-        ? '__unselected__'
-        : c.connection_id || '';
-      $('#' + m).innerHTML =
-        `<option value="${esc(c.model || '')}">${esc(c.model || '未配置')}</option>`;
+      $('#cfg-' + kind + '-connection').value = c.unconfigured ? '__unselected__' : c.connection_id || '';
+      $('#' + m).innerHTML = `<option value="${esc(c.model || '')}">${esc(c.model || '未配置')}</option>`;
       $('#' + e).innerHTML = `<option value="${esc(c.reasoning_effort || '')}">默认</option>`;
     }
   }
-  const routes = modelFields.map(([kind, m, e]) => [
-    kind,
-    m,
-    e,
-    $('#' + m)?.value,
-    $('#' + e)?.value,
-  ]);
+  const routes = modelFields.map(([kind, m, e]) => [kind, m, e, $('#' + m)?.value, $('#' + e)?.value]);
   refreshConnectionOptions();
   loadModels();
   for (const [kind, m, e, model, effort] of routes) {
@@ -635,13 +580,12 @@ document.addEventListener('click', async (e) => {
   const b = e.target.closest('button');
   if (
     !b ||
-    (!b.hasAttribute('data-workspace-plugin-install') &&
-      !Object.keys(b.dataset).some((k) => k.startsWith('ai')))
+    (!b.hasAttribute('data-workspace-plugin-install') && !Object.keys(b.dataset).some((k) => k.startsWith('ai')))
   )
     return;
   try {
     if (b.hasAttribute('data-ai-add')) {
-      if ((state.config.ai_connections || []).length >= 20) throw Error('最多配置 20 个附加连接');
+      if (state.config.ai_connections.length >= 20) throw Error('最多配置 20 个附加连接');
       editConnection(
         {
           id: 'connection-' + Date.now().toString(36) + '-' + ++connectionSequence,
@@ -736,9 +680,7 @@ document.addEventListener('click', async (e) => {
         selected = new Set(editor.models.map((m) => m.model));
       const visible = new Set(editor.visibleModels || []);
       editor.models = editor.catalog.filter((m) =>
-        visible.has(m.model)
-          ? b.hasAttribute('data-ai-model-all') || !selected.has(m.model)
-          : selected.has(m.model),
+        visible.has(m.model) ? b.hasAttribute('data-ai-model-all') || !selected.has(m.model) : selected.has(m.model),
       );
       editor.request++;
       renderConnectionModels();

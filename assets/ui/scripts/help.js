@@ -19,9 +19,7 @@ function positionHelp() {
   }
   const b = box.getBoundingClientRect();
   box.style.left = Math.max(12, Math.min(r.left, innerWidth - b.width - 12)) + 'px';
-  box.style.top =
-    (r.bottom + b.height + 12 < innerHeight ? r.bottom + 8 : Math.max(12, r.top - b.height - 8)) +
-    'px';
+  box.style.top = (r.bottom + b.height + 12 < innerHeight ? r.bottom + 8 : Math.max(12, r.top - b.height - 8)) + 'px';
 }
 function showHelp(el, pin = false) {
   if (activeHelp === el) {
@@ -36,7 +34,7 @@ function showHelp(el, pin = false) {
   box.className = 'help-popover';
   box.id = 'help-popover';
   box.role = 'tooltip';
-  box.textContent = el.dataset.help || el.dataset.tip || '';
+  box.textContent = el.dataset.help || '';
   document.body.append(box);
   el.setAttribute('aria-expanded', 'true');
   el.setAttribute('aria-describedby', box.id);
@@ -47,13 +45,7 @@ document.addEventListener('pointerover', (e) => {
   if (el && !helpPinned) showHelp(el);
 });
 document.addEventListener('pointerout', (e) => {
-  if (
-    activeHelp &&
-    !helpPinned &&
-    document.activeElement !== activeHelp &&
-    e.target.closest('.help-dot')
-  )
-    hideHelp();
+  if (activeHelp && !helpPinned && document.activeElement !== activeHelp && e.target.closest('.help-dot')) hideHelp();
 });
 document.addEventListener('focusin', (e) => {
   const el = e.target.closest('.help-dot');

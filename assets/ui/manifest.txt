@@ -2,13 +2,18 @@
 # <script> (shared global scope). Used by build.rs, `--ui-dir` and UI tests.
 style styles/tokens.css
 style styles/base.css
-style styles/design.css
-style styles/experience.css
-style styles/motion.css
-style styles/task-experience.css
+style styles/shell.css
+style styles/tasks.css
+style styles/handling.css
+style styles/settings.css
+style styles/pages.css
 script scripts/motion.js
+script scripts/icons.js
 script scripts/core.js
+script scripts/page-feed.js
 script scripts/tasks.js
+script scripts/task-multi.js
+script scripts/task-feed.js
 script scripts/task-history.js
 script scripts/settings.js
 script scripts/updates.js
@@ -19,10 +24,7 @@ script scripts/forms.js
 script scripts/events.js
 script scripts/extensions.js
 script scripts/plugin-settings.js
-script scripts/approval-content.js
-script scripts/handling-reading.js
 script scripts/handling.js
-script scripts/handling-window.js
 script scripts/tags.js
 script scripts/model-routes.js
 script scripts/ai-connections.js
@@ -34,7 +36,6 @@ script scripts/work-state.js
 script scripts/help.js
 script scripts/palette.js
 script scripts/analysis-display.js
-script scripts/handling-live.js
 script scripts/memory.js
 script scripts/guide.js
 script scripts/boot.js

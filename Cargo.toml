@@ -1,34 +1,29 @@
-[package]
-name = "shishi"
-version = "1.2.4"
+[workspace]
+resolver = "2"
+members = ["core", "app", "migrate", "providers/api", "providers/acp", "plugin-sdk", "examples/json-source"]
+
+[workspace.package]
+version = "1.2.5"
 edition = "2021"
 license = "AGPL-3.0-only"
-repository = "https://github.com/LinHuiG/shi_shi"
 
-[dependencies]
-base64 = "0.22.1"
-shishi-api = { path = "providers/api" }
-shishi-acp = { path = "providers/acp" }
-serde = { version = "1", features = ["derive", "rc"] }
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
-thiserror = "2"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 uuid = { version = "1", features = ["v4"] }
-wry = "0.53"
-tao = "0.34"
-rfd = "0.15"
-fs2 = "0.4"
 rusqlite = { version = "0.40.2", features = ["bundled", "functions"] }
-windows-sys = { version = "0.59.0", features = ["Win32_Networking_WinHttp", "Win32_Foundation", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_Controls"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+miniz_oxide = "0.8.9"
+crc32fast = "1.5.3"
+base64 = "0.22.1"
 
 [profile.release]
 opt-level = "s"
 strip = true
+lto = "thin"
+codegen-units = 1
 
 [patch.crates-io]
 wry = { path = "vendor/wry" }
-
-
-[workspace]
-members = ["providers/api", "providers/acp", "plugin-sdk", "examples/json-source"]
