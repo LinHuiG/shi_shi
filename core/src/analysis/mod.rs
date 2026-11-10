@@ -232,7 +232,7 @@ pub async fn after_scan(ctx: &Arc<Ctx>, manual: bool) -> Result<Value> {
 pub fn spawn(ctx: &Arc<Ctx>) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let mut changes = ctx.db.subscribe();
+        let mut changes = ctx.db.changes();
         loop {
             let wait = match layer::model(&ctx).await {
                 Ok(m) => tick(&ctx, &m).await,

@@ -35,8 +35,8 @@ const AI_KINDS: [&str; 10] = [
     "archive_failed",
     "resume_pending",
 ];
-const RUNTIME_KINDS: [&str; 7] =
-    ["scan", "migration", "error", "request_error", "analysis_result", "analysis_skipped", "generation_failed"];
+const RUNTIME_KINDS: [&str; 6] =
+    ["scan", "error", "request_error", "analysis_result", "analysis_skipped", "generation_failed"];
 const ERROR_KINDS: [&str; 7] =
     ["error", "analysis_rejected", "request_error", "ai_failed", "ai_rejected", "generation_failed", "archive_failed"];
 const EXTERNAL_ERRORS: [&str; 8] =

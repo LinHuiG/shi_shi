@@ -1,4 +1,4 @@
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::*;
 use crate::{data, Config, Db};
@@ -25,6 +25,38 @@ fn failure_class_follows_reference_order() {
     }
     assert_eq!(purpose_label("prompt_review"), "归档分析");
     assert_eq!(purpose_label("schedule"), "事项更新");
+}
+
+#[test]
+fn purpose_rules_require_a_title_and_a_description() {
+    let fail = |kind: &str, value: Value| schema::check(kind, &value).unwrap_err().to_string();
+    let fields = |pairs: &[(&str, &str)]| -> Value {
+        pairs.iter().map(|(field, value)| json!({"field": field, "value": value})).collect()
+    };
+    let action =
+        |kind: &str, fields: Value| json!({"actions": [{"action": kind, "reason": "合成依据", "fields": fields}]});
+    let full = fields(&[("title", "合成标题"), ("description", "合成描述")]);
+    assert!(schema::check("classify", &action("create", full)).is_ok());
+    let e = fail("classify", action("create", fields(&[("title", "合成标题")])));
+    assert!(e.contains("$.actions[0].fields") && e.contains("must set description"), "{e}");
+    // An update may leave both alone but never blank them.
+    assert!(schema::check("classify", &action("update", fields(&[("status", "处理中")]))).is_ok());
+    let e = fail("classify", action("update", fields(&[("status", "处理中"), ("title", " ")])));
+    assert!(e.contains("$.actions[0].fields[1].value: title must not be blank"), "{e}");
+    let e = fail("format", json!({"tasks": [{"title": "合".repeat(201), "description": "合成描述"}]}));
+    assert!(e.contains("$.tasks[0].title") && e.contains("200"), "{e}");
+    let changes = json!([{"field": "status", "value": ""}, {"field": "description", "value": ""}]);
+    let e = fail("edit", json!({"reason": "按说明", "changes": changes}));
+    assert!(e.contains("$.changes[1].value"), "{e}");
+    // The reason is what the user reads, including why nothing changed.
+    let e = fail("edit", json!({"reason": " ", "changes": []}));
+    assert!(e.contains("$.reason: reason must not be blank"), "{e}");
+    // A schedule the model declined carries no draft; an accepted one must parse.
+    assert!(schema::check("schedule", &json!({"error": "无法识别频率", "schedule": {}})).is_ok());
+    let schedule =
+        json!({"title": "日报", "description": "写日报", "frequency": "daily", "weekdays": [], "time": "25:00"});
+    let e = fail("schedule", json!({"error": "", "schedule": schedule}));
+    assert!(e.contains("$.schedule") && e.contains("生成时间"), "{e}");
 }
 
 fn db() -> Db {
@@ -552,18 +584,14 @@ mod invoke_pipeline {
     use crate::config::Connection as AiConnection;
     use crate::{data, Config, Ctx};
 
-    fn ctx(max_input_chars: usize) -> Arc<Ctx> {
+    async fn ctx(max_input_chars: usize) -> Arc<Ctx> {
         let mut config = Config::default();
         config.ai_connections =
             vec![AiConnection { id: "c1".into(), name: "测试".into(), driver: "api".into(), ..Default::default() }];
         config.max_input_chars = max_input_chars;
         let ctx = Ctx::memory(config).unwrap();
         // The API key is resolved before the (fake) driver is called.
-        let db = ctx.db.clone();
-        std::thread::spawn(move || db.set_credential_blocking("c1".into(), "synthetic-key".into()))
-            .join()
-            .unwrap()
-            .unwrap();
+        ctx.db.set_credential("c1".into(), "synthetic-key".into()).await.unwrap();
         ctx
     }
 
@@ -583,7 +611,7 @@ mod invoke_pipeline {
 
     #[tokio::test]
     async fn oversized_request_is_rejected_before_reservation_without_changing_analysis_state() {
-        let ctx = ctx(10);
+        let ctx = ctx(10).await;
         let fake = Fake::reply(json!({}));
         ctx.ai.set_driver(Some(fake.clone()));
         let before = ctx.db.test_read(data::ai::analysis_state).await.unwrap();
@@ -599,7 +627,7 @@ mod invoke_pipeline {
 
     #[tokio::test]
     async fn tool_declarations_are_parsed_once_and_rejected_explicitly() {
-        let ctx = ctx(100_000);
+        let ctx = ctx(100_000).await;
         let tool = |name: &str| json!({"name": name, "description": "合成工具", "parameters": {"type": "object", "properties": {}}});
         let ok = invoke::build(&ctx, "classify", Mode::Manual, "", json!({"_registered_tools": [tool("lookup")]}))
             .await
@@ -630,7 +658,7 @@ mod invoke_pipeline {
 
     #[tokio::test]
     async fn accepted_reply_counts_usage_and_logs_start_and_success() {
-        let ctx = ctx(400_000);
+        let ctx = ctx(400_000).await;
         let fake = Fake::reply(json!({"report": {"summary": "完成"}}));
         ctx.ai.set_driver(Some(fake.clone()));
         let call = ctx.exec.try_call("test").unwrap();
@@ -650,7 +678,7 @@ mod invoke_pipeline {
 
     #[tokio::test]
     async fn traces_are_saved_only_when_retained() {
-        let ctx = ctx(400_000);
+        let ctx = ctx(400_000).await;
         ctx.ai.set_driver(Some(Fake::reply(json!({"report": {"summary": "完成"}}))));
         let call = ctx.exec.try_call("test").unwrap();
         let request = invoke::build(&ctx, "archive", Mode::Manual, "手动归档", json!({"changes": []})).await.unwrap();
@@ -684,7 +712,7 @@ mod invoke_pipeline {
 
     #[tokio::test]
     async fn a_missing_api_key_fails_as_a_provider_error_without_sending() {
-        let ctx = ctx(400_000);
+        let ctx = ctx(400_000).await;
         assert!(ctx.db.delete_credential("c1".into()).await.unwrap());
         let fake = Fake::reply(json!({"report": {"summary": "完成"}}));
         ctx.ai.set_driver(Some(fake.clone()));
@@ -699,11 +727,11 @@ mod invoke_pipeline {
 
     #[tokio::test]
     async fn provider_and_finalization_failures_carry_their_stage() {
-        let ctx = ctx(400_000);
+        let ctx = ctx(400_000).await;
         ctx.ai.set_driver(Some(Fake::new(vec![
             Step::Fail("API 分析失败：HTTP 504".into()),
             Step::Invalid("模型未按格式返回".into()),
-            Step::Reply(json!({"x": 1}), json!({})),
+            Step::Reply(json!({"x": 1, "reason": "合成依据"}), json!({})),
         ])));
         let call = ctx.exec.try_call("test").unwrap();
         for _ in 0..2 {
@@ -732,7 +760,7 @@ mod invoke_pipeline {
 
     #[tokio::test]
     async fn interrupt_ends_a_hanging_request_as_cancelled() {
-        let ctx = ctx(400_000);
+        let ctx = ctx(400_000).await;
         ctx.ai.set_driver(Some(Fake::new(vec![Step::Hang])));
         let call = ctx.exec.try_call("test").unwrap();
         let request = invoke::build(&ctx, "edit", Mode::Manual, "", json!({})).await.unwrap();
@@ -759,7 +787,7 @@ mod invoke_pipeline {
         assert_eq!(model::mode("archive", &json!({"_trigger": "work_end"})), Mode::Nightly);
         assert_eq!(model::mode("archive", &json!({"_trigger": "manual_archive"})), Mode::Manual);
 
-        let ctx = ctx(400_000);
+        let ctx = ctx(400_000).await;
         let layer = model::model(&ctx).await.unwrap();
         let request = Prepared { purpose: "report", payload: json!({"_trigger": "manual_report", "tasks": []}) };
         let measured = layer.measure(request).unwrap();

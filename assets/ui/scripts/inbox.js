@@ -47,7 +47,7 @@ async function renderInbox() {
   $('#inbox-sort').textContent = inboxSort === 'asc' ? '时间 ↑ 正序' : '时间 ↓ 倒序';
   $('#inbox-sort').setAttribute(
     'aria-label',
-    '收件箱' + (inboxSort === 'asc' ? '按时间正序，切换倒序' : '按时间倒序，切换正序'),
+    '消息' + (inboxSort === 'asc' ? '按时间正序，切换倒序' : '按时间倒序，切换正序'),
   );
   const key = JSON.stringify([filter, state.messages_revision, state.config.message_retention_days]);
   if (key !== inboxLoadedKey) {
@@ -81,6 +81,6 @@ let deletingMessages = [];
 function confirmMessageDelete(ids) {
   deletingMessages = ids;
   setModal(
-    `<h2>删除 ${ids.length} 条消息</h2><p>从消息收件箱和上下文查询中移除这些消息，后续扫描不会再次导入。关联事项及处理记录会保留。</p><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button data-workflow="delete-messages">确认删除</button></div>`,
+    `<h2>删除 ${ids.length} 条消息</h2><p>从消息和上下文查询中移除这些消息，后续扫描不会再次导入。关联事项及处理记录会保留。</p><div id="modal-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">取消</button><button data-workflow="delete-messages">确认删除</button></div>`,
   );
 }

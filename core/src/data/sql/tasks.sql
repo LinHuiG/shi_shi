@@ -58,8 +58,8 @@ CREATE TABLE task_evidence (
 ) STRICT;
 CREATE INDEX task_evidence_message ON task_evidence(message_id);
 
--- The change log of every domain. `seq` replaces the 1.1.68 Vec index; the
--- page addresses rows by `token`. before/after are full JSON snapshots.
+-- The change log of every domain, ordered by `seq`; the page addresses rows
+-- by `token`. before/after are full JSON snapshots.
 CREATE TABLE task_audit (
     seq INTEGER PRIMARY KEY,
     token TEXT NOT NULL UNIQUE,

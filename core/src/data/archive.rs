@@ -116,7 +116,7 @@ pub(super) fn audits(conn: &Connection, tail: &str) -> Result<Vec<Audit>> {
             kind: r.get(2)?,
             task_id: r.get(3)?,
             detail: r.get(4)?,
-            change_summary: parse(r.get(5)?),
+            change_summary: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
             before: parse(r.get(6)?),
             after: parse(r.get(7)?),
         })
@@ -219,7 +219,7 @@ pub(crate) fn load(conn: &Connection) -> Result<Material> {
         status_counts: status_counts(conn)?,
         tag_catalog: json!(super::tags::catalog(conn)?.0),
         memory: super::prompts::memory(conn, "archived")?,
-        temporary: super::prompts::memory(conn, "temporary")?.text,
+        temporary: super::prompts::memory(conn, "temporary")?,
         data_until: kv::get_i64(conn, "last_scan")?,
         pending: super::analysis::unanalyzed(conn)?,
         report_policy: super::prompts::current(conn, "report")?.map(|v| v.content).unwrap_or_default(),
@@ -284,8 +284,9 @@ fn record_batch(conn: &Connection, b: &Batch, archived: usize, report_id: &str, 
 }
 
 /// Apply the archived-memory part of a result. `Err` texts reject the
-/// whole batch; a memory edited while the model ran is skipped and logged.
-fn apply_memory(conn: &Connection, b: &Batch, result: &Value) -> Result<std::result::Result<usize, String>> {
+/// whole batch; a memory edited while the model ran is skipped and logged,
+/// and `None` tells the caller its merge did not land.
+fn apply_memory(conn: &Connection, b: &Batch, result: &Value) -> Result<std::result::Result<Option<usize>, String>> {
     if let Some(error) = result["_archived_memory_error"].as_str() {
         return Ok(Err(format!("归档记忆未保存：{error}")));
     }
@@ -293,7 +294,7 @@ fn apply_memory(conn: &Connection, b: &Batch, result: &Value) -> Result<std::res
         if result["archived_memory"].as_array().is_some_and(|r| !r.is_empty()) {
             return Ok(Err("归档记忆缺少完整读取校验，本批未提交".into()));
         }
-        return Ok(Ok(0));
+        return Ok(Ok(Some(0)));
     };
     if update["expected"].as_i64() != Some(b.memory_revision)
         || update["before"].as_str() != Some(b.memory_text.as_str())
@@ -307,14 +308,28 @@ fn apply_memory(conn: &Connection, b: &Batch, result: &Value) -> Result<std::res
     let current = super::prompts::memory(conn, "archived")?;
     if current.revision != b.memory_revision {
         conflict(conn, b, "memory", json!({"expected": b.memory_revision, "current": current.revision}))?;
-        return Ok(Ok(0));
+        return Ok(Ok(None));
     }
     if text == current.text || !super::prompts::replace_memory(conn, "archived", b.memory_revision, text)? {
-        return Ok(Ok(0));
+        return Ok(Ok(Some(0)));
     }
     let after = json!({"revision": b.memory_revision + 1, "chars": text.chars().count()});
     audit::write(conn, "archive_memory", "", "归档更新记忆正文", &Value::Null, &after)?;
-    Ok(Ok(1))
+    Ok(Ok(Some(1)))
+}
+
+/// Empty the temporary memory the batch merged; one written while the model
+/// ran is kept and logged.
+fn clear_temporary(conn: &Connection, b: &Batch) -> Result<bool> {
+    if b.temporary_text.trim().is_empty() {
+        return Ok(false);
+    }
+    if !super::prompts::replace_memory(conn, "temporary", b.temporary_revision, "")? {
+        let current = super::prompts::memory(conn, "temporary")?.revision;
+        conflict(conn, b, "temporary_memory", json!({"expected": b.temporary_revision, "current": current}))?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Store a report, trim the history and log the commit in the audit.
@@ -334,8 +349,10 @@ fn finish_batch(
 /// Commit one batch with its model result in one transaction. The inner
 /// `Err` rejects the result before anything is written.
 fn commit(conn: &Connection, b: &Batch, result: &Value, at: i64) -> Result<std::result::Result<Value, String>> {
-    let memory_changes = match apply_memory(conn, b, result)? {
-        Ok(n) => n,
+    let (memory_changes, cleared) = match apply_memory(conn, b, result)? {
+        Ok(Some(n)) => (n, clear_temporary(conn, b)?),
+        // The temporary memory stays for the next archive to merge.
+        Ok(None) => (0, false),
         Err(e) => return Ok(Err(e)),
     };
     let archived = finalize(conn, b, at)?;
@@ -354,7 +371,8 @@ fn commit(conn: &Connection, b: &Batch, result: &Value, at: i64) -> Result<std::
         ("batch_summaries", json!(summaries)),
         ("summary_status", json!("done")),
         ("suggestions", json!(suggestions)),
-        ("learning", json!({"added": 0, "updated": 0, "message": "归档仅维护归档记忆；系统提示词与临时记忆保留"})),
+        ("learning", json!({"added": 0, "updated": 0, "message": "归档仅维护归档记忆，合并后清空临时记忆；系统提示词保留"})),
+        ("temporary_memory_cleared", json!(cleared)),
         ("archived_tasks", json!(archived.len())),
         ("archive_complete", json!(b.remaining == 0)),
         ("skipped_tasks", json!(b.tasks_to_archive.len().saturating_sub(archived.len()))),
@@ -381,7 +399,7 @@ fn commit(conn: &Connection, b: &Batch, result: &Value, at: i64) -> Result<std::
         conn,
         &report,
         "archive_commit",
-        "归档结果、成功状态、游标、事项归档标记和归档记忆同次保存",
+        "归档结果、成功状态、游标、事项归档标记、归档记忆和临时记忆清空同次保存",
         json!({"attempt": b.attempt_id, "cutoff": b.cutoff}),
         json!({"report": report_id, "group": group.id, "archived_tasks": archived.len()}),
     )?;
@@ -613,8 +631,12 @@ impl Db {
 
     /// Transaction B of a report: the finished report replaces its pending
     /// row, or comes back as the newest when concurrent reports displaced it.
+    /// Only a summary moves the report cursor past its delta.
     pub async fn finish_report(&self, mut r: Value) -> Result<Value> {
         self.write(move |tx| {
+            if r["summary_status"] == "done" {
+                kv::set(tx, crate::archive::REPORT_CURSOR, &r["audit_until"])?;
+            }
             r["finished"] = json!(next_finished(tx, time::now())?);
             put_report(tx, &r)?;
             truncate(tx)?;

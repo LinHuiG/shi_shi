@@ -131,14 +131,14 @@ pub fn spawn(ctx: &Arc<Ctx>) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
         let _ = ctx.db.interrupt_generations().await;
-        let mut changes = ctx.db.subscribe();
+        let mut changes = ctx.db.changes();
         loop {
             let at = time::now();
             let wake = match ctx.db.task_wake(at).await {
-                Ok((true, _)) => {
-                    let _ = ctx.db.run_due_tasks(at).await;
-                    continue;
-                }
+                Ok((true, _)) => match ctx.db.run_due_tasks(at).await {
+                    Ok(_) => continue,
+                    Err(_) => None,
+                },
                 Ok((false, wake)) => wake,
                 Err(_) => None,
             };

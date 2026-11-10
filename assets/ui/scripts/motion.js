@@ -247,7 +247,7 @@ new MutationObserver((records) => {
         if (
           el.nodeType === 1 &&
           !el.hasAttribute('data-motion-ghost') &&
-          el.matches('.palette,.backlog-panel,.work-state-panel,.help-popover')
+          el.matches('.backlog-panel,.work-state-panel,.help-popover')
         )
           motionAnimate(el, [
             { opacity: 0, transform: 'translateY(3px)' },

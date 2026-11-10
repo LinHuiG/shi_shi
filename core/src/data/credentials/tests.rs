@@ -19,11 +19,7 @@ async fn keys_are_stored_encrypted_per_entry_and_never_shown() {
     assert!(!stored.windows(KEY.len()).any(|w| w == KEY.as_bytes()));
 
     // Replacing keeps one row; deleting reports whether one existed.
-    let d = db.clone();
-    tokio::task::spawn_blocking(move || d.set_credential_blocking(id(), "synthetic-other".into()))
-        .await
-        .unwrap()
-        .unwrap();
+    db.set_credential(id(), "synthetic-other".into()).await.unwrap();
     assert_eq!(db.credential(id()).await.unwrap().unwrap().expose_secret(), "synthetic-other");
     assert!(db.delete_credential(id()).await.unwrap());
     assert!(!db.delete_credential(id()).await.unwrap());

@@ -1,12 +1,4 @@
-//! The clients a handling session is handed to. ShiShi runs only the first
-//! turn, headless, so the chosen model and effort apply and the session id
-//! is known: Codex through `codex exec --json`, DSH through an ACP child
-//! that is shut down afterwards so the DSH client can take the session
-//! over. Neither is restricted by ShiShi: Codex runs without a sandbox and
-//! DSH permission requests are allowed.
-
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -15,7 +7,7 @@ use shishi_acp::SessionUpdate;
 
 use crate::ai::dsh as ai_dsh;
 use crate::config::Connection;
-use crate::{process, Error, Result};
+use crate::{Error, Result};
 
 const RPC: Duration = Duration::from_secs(20);
 
@@ -45,16 +37,18 @@ pub trait Backends: Send + Sync {
     fn projects(&self, driver: &str) -> Result<Vec<Value>>;
     /// Bring the session up in the desktop app; DSH only raises its window.
     fn open(&self, c: &Connection, thread: &str) -> Result<()>;
+    fn compose(&self, cwd: &Path, prompt: &str) -> Result<()>;
 }
 
 pub struct Native;
 
 impl Backends for Native {
     fn agent(&self, c: &Connection, root: &Path) -> Result<Box<dyn Agent>> {
-        Ok(match c.driver.as_str() {
-            "dsh" => Box::new(Dsh { connection: c.clone(), root: root.into() }),
-            _ => Box::new(Codex { executable: c.executable.clone() }),
-        })
+        Ok(Box::new(Dsh { connection: c.clone(), root: root.into() }))
+    }
+
+    fn compose(&self, cwd: &Path, prompt: &str) -> Result<()> {
+        crate::ai::codex::compose(cwd, prompt)
     }
 
     fn projects(&self, driver: &str) -> Result<Vec<Value>> {
@@ -75,50 +69,6 @@ impl Backends for Native {
             _ => Err(crate::ai::provider::unsupported(c)),
         }
         .map_err(Error)
-    }
-}
-
-// ---------------------------------------------------------------- Codex
-
-struct Codex {
-    executable: String,
-}
-
-impl Agent for Codex {
-    fn run(&self, turn: &Turn, thread: &mut dyn FnMut(String)) -> Result<Outcome> {
-        let mut cmd = Command::new(crate::ai::codex::resolve_cli(&self.executable).map_err(Error)?);
-        cmd.env_remove("CODEX_THREAD_ID").env_remove("CODEX_APP_TOOLS_PIPE_PATH");
-        cmd.args(["exec", "--json", "--skip-git-repo-check", "--sandbox", "danger-full-access", "-C"]).arg(&turn.cwd);
-        if !turn.model.is_empty() {
-            cmd.arg("-m").arg(&turn.model);
-        }
-        if !turn.effort.is_empty() {
-            cmd.arg("-c").arg(format!("model_reasoning_effort={}", json!(turn.effort)));
-        }
-        cmd.arg("-");
-        let (mut conclusion, mut usage, mut failed) = (String::new(), Value::Null, None);
-        let run = process::run_cancellable(cmd, Some(turn.text.as_bytes()), turn.timeout, None, &mut |line| {
-            let Ok(v) = serde_json::from_str::<Value>(line) else { return };
-            match v["type"].as_str().unwrap_or("") {
-                "thread.started" => thread(v["thread_id"].as_str().unwrap_or("").into()),
-                "turn.completed" => {
-                    let u = &v["usage"];
-                    usage = json!({"input_tokens": u["input_tokens"], "output_tokens": u["output_tokens"],
-                        "cached_input_tokens": u["cached_input_tokens"]});
-                }
-                "turn.failed" => failed = v["error"]["message"].as_str().map(String::from),
-                "error" => failed = v["message"].as_str().map(String::from),
-                "item.completed" if v["item"]["type"] == "agent_message" => {
-                    conclusion = v["item"]["text"].as_str().unwrap_or("").into();
-                }
-                _ => {}
-            }
-        });
-        if let Some(message) = failed {
-            return Err(Error(message));
-        }
-        run.map_err(Error)?;
-        Ok(Outcome { status: "completed", conclusion, usage })
     }
 }
 

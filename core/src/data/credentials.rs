@@ -24,12 +24,6 @@ impl Db {
         self.write(move |tx| upsert(tx, &id, &sealed)).await
     }
 
-    /// [`Self::set_credential`] from synchronous code (install migration).
-    pub fn set_credential_blocking(&self, id: String, secret: String) -> Result<()> {
-        let sealed = credentials::seal(&id, &secret)?;
-        self.write_blocking(move |tx| upsert(tx, &id, &sealed))
-    }
-
     /// The decrypted key under `id`; a bad entry fails only this reference.
     pub async fn credential(&self, id: String) -> Result<Option<ResolvedCredential>> {
         credentials::validate_connection_id(&id)?;

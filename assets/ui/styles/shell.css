@@ -79,6 +79,33 @@
   --btn-bg: var(--surface-selected);
   --btn-hover: var(--surface-active);
 }
+.sidebar [data-tooltip]::after {
+  content: attr(data-tooltip);
+  position: fixed;
+  z-index: 5000;
+  left: calc(var(--nav-w) + var(--sp-2));
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--text-soft);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-caption);
+  line-height: var(--lh-caption);
+  white-space: nowrap;
+  pointer-events: none;
+  visibility: hidden;
+  opacity: 0;
+  transition: opacity var(--dur-faster), visibility var(--dur-faster);
+}
+.sidebar [data-tooltip]:hover::after,
+.sidebar [data-tooltip]:focus-visible::after {
+  visibility: visible;
+  opacity: 1;
+  transition-delay: calc(4 * var(--dur-normal));
+}
+.nav-collapsed .sidebar [data-tooltip]::after {
+  left: calc(var(--rail-w) + var(--sp-2));
+}
 .palette-open kbd {
   margin-left: auto;
 }

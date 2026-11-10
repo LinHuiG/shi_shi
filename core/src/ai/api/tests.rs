@@ -39,10 +39,3 @@ async fn keys_resolve_from_one_source_and_status_never_shows_them() {
     assert_eq!(validate(&c, " ").unwrap_err(), "请选择或填写 API 模型");
     assert!(validate(&c, "m").is_ok());
 }
-
-#[test]
-fn the_old_store_still_decrypts_for_migration() {
-    let sealed = credentials::protect(br#"{"version":1,"entries":{}}"#).unwrap();
-    assert_eq!(credentials::unprotect(&sealed).unwrap(), br#"{"version":1,"entries":{}}"#);
-    assert!(credentials::unprotect(b"garbage").unwrap_err().contains("decryption failed"));
-}

@@ -128,6 +128,12 @@ fn extras(conn: &Connection, ids: &[&str]) -> Result<HashMap<String, (Counts, Ve
     Ok(out)
 }
 
+/// How a task was created: the kind of its first history row.
+fn origin(conn: &Connection, id: &str) -> Result<String> {
+    let mut stmt = conn.prepare_cached("SELECT kind FROM task_audit WHERE task_id = ?1 ORDER BY seq LIMIT 1")?;
+    Ok(stmt.query_row([id], |r| r.get(0)).optional()?.unwrap_or_default())
+}
+
 /// The `tasks` rows of the snapshot: only the tasks the page points at (its
 /// handling window and selection), each with its full payload plus the
 /// fields the list adds. Lists page through `active_tasks_query` and
@@ -151,6 +157,7 @@ pub fn snapshot_rows(conn: &Connection, scope: &Scope) -> Result<Vec<Value>> {
         row["evidence_count"] = json!(counts.0);
         row["change_count"] = json!(counts.1);
         row["has_tool_calls"] = json!(counts.2);
+        row["origin"] = json!(origin(conn, id)?);
         rows.push(row);
     }
     Ok(rows)

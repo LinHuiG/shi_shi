@@ -222,12 +222,19 @@ pub(crate) fn record(conn: &Connection, target: &str, content: &str, action: &st
     Ok(id)
 }
 
-/// First version of every target; runs once with the table layout.
+/// Record the built-in text of every target on each start: the first
+/// version, or an upgrade while the target is still on a built-in version.
+/// A version the user saved, adopted or rolled back to is kept.
 pub(super) fn seed(conn: &Connection) -> Result<()> {
     for target in TARGETS {
-        if current(conn, target)?.is_none() {
-            record(conn, target, default(target), "initial", "迁移现有提示词，保留生效内容")?;
-        }
+        let text = default(target);
+        match current(conn, target)? {
+            None => record(conn, target, text, "initial", "内置提示词")?,
+            Some(v) if ["initial", "upgrade"].contains(&v.action.as_str()) && v.content != text => {
+                record(conn, target, text, "upgrade", "内置提示词随版本更新")?
+            }
+            Some(_) => continue,
+        };
     }
     Ok(())
 }

@@ -6,6 +6,12 @@ use crate::ai::native::{self, Round, Rounds};
 use crate::ai::prompt::Route;
 use crate::config::{Config, Connection as AiConnection};
 
+#[test]
+fn composer_encodes_url_bytes() {
+    assert_eq!(encode("a b/中"), "a%20b%2F%E4%B8%AD");
+    assert_eq!(encode("AZaz09-._~'&?%\\"), "AZaz09-._~%27%26%3F%25%5C");
+}
+
 fn route(executable: &str) -> Route {
     let mut connection = AiConnection::default();
     connection.executable = executable.into();
@@ -158,26 +164,42 @@ fn launchers_resolve_to_native_programs() {
     assert!(bundled_version(std::ffi::OsStr::new("0123abcd")) && !bundled_version(std::ffi::OsStr::new("v1")));
 }
 
-struct Scripted(Vec<Value>);
+/// Replays results and keeps every round's prompt.
+struct Scripted(Vec<Value>, Vec<String>);
 
 impl Rounds for Scripted {
     fn round(&mut self, _: &Job, round: Round<'_>, _: &mut dyn FnMut(Event)) -> Reply {
         assert!(round.schema["properties"]["tool_call"].is_object(), "every round carries the envelope");
+        self.1.push(round.prompt.into());
         Ok((self.0.remove(0), json!({"input_tokens": 3, "output_tokens": 1})))
     }
 }
 
 #[test]
-fn native_rounds_reject_an_empty_envelope_without_asking_again() {
+fn native_rounds_send_an_empty_envelope_back_once() {
     let dir = crate::testing::temp_dir("native-rounds");
     let request = job(&route("codex"), &dir);
-    let mut rounds =
-        Scripted(vec![json!({"tool_call": null, "result": null}), json!({"tool_call": null, "result": {"ok": 1}})]);
+    let empty = || json!({"tool_call": null, "result": null});
+    let mut rounds = Scripted(vec![empty(), json!({"tool_call": null, "result": {"ok": 1}})], vec![]);
+    let (value, _) = native::analyze(&request, None, &mut |_| {}, "Codex", &mut rounds).unwrap();
+    assert_eq!(value["ok"], 1);
+    let mut rounds = Scripted(vec![empty(), empty(), empty()], vec![]);
     let error = native::analyze(&request, None, &mut |_| {}, "Codex", &mut rounds).unwrap_err();
     assert!(error.contains("模型必须返回一次工具请求或最终结果"), "{error}");
-    assert_eq!(rounds.0.len(), 1, "the second round is never asked");
+    assert_eq!(rounds.0.len(), 1, "only one correction is asked");
 
-    let mut rounds = Scripted(vec![json!({"tool_call": null, "result": {"ok": 1}})]);
+    // A purpose rule failure goes back with its path.
+    let mut format = route("codex");
+    format.kind = "format".into();
+    let request = job(&format, &dir);
+    let tasks = |description: &str| json!({"tool_call": null, "result": {"tasks": [{"title": "合成周报", "description": description}]}});
+    let mut rounds = Scripted(vec![tasks(" "), tasks("周五前提交")], vec![]);
+    let (value, _) = native::analyze(&request, None, &mut |_| {}, "Codex", &mut rounds).unwrap();
+    assert_eq!(value["tasks"][0]["description"], "周五前提交");
+    assert!(rounds.1[1].contains("$.tasks[0].description: description must not be blank"), "{}", rounds.1[1]);
+    let request = job(&route("codex"), &dir);
+
+    let mut rounds = Scripted(vec![json!({"tool_call": null, "result": {"ok": 1}})], vec![]);
     let mut usage = vec![];
     let (value, _) = native::analyze(
         &request,
@@ -195,7 +217,7 @@ fn native_rounds_reject_an_empty_envelope_without_asking_again() {
     assert_eq!(usage.last().unwrap()["input_tokens"], 3);
     assert!(rounds.0.is_empty());
 
-    let mut rounds = Scripted(vec![json!({"result": {}})]);
+    let mut rounds = Scripted(vec![json!({"result": {}})], vec![]);
     assert_eq!(
         native::analyze(&request, None, &mut |_| {}, "Codex", &mut rounds).unwrap_err(),
         "模型未返回有效的结构化调用或最终结果"

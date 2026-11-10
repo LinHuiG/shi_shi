@@ -116,6 +116,19 @@ fn a_rejected_batch_is_corrected_once_then_tools_close() {
 }
 
 #[test]
+fn a_rejected_final_result_goes_back_once_with_its_error() {
+    let replies = vec![Ok(answer(r#"{"ok":1}"#)), Ok(answer(r#"{"ok":true}"#))];
+    let mut script = Script(replies, vec![]);
+    let out = analyze(&mut script, &mut Pages { served: 0, pages: 1, limit: None }).unwrap();
+    assert_eq!(out.value, json!({"ok":true}));
+    let messages = script.1[1]["messages"].as_array().unwrap();
+    assert_eq!(messages[messages.len() - 2], answer(r#"{"ok":1}"#));
+    let feedback = messages.last().unwrap()["content"].as_str().unwrap();
+    assert!(feedback.contains("$.ok") && feedback.contains("nothing was applied"));
+    assert!(script.1[0]["tools"].is_array() && script.1[1].get("tools").is_none());
+}
+
+#[test]
 fn a_repeated_query_without_progress_and_a_spent_budget_close_tools() {
     let replies =
         vec![Ok(call("c1", r#"{"ref":"a"}"#)), Ok(call("c2", r#"{"ref":"a"}"#)), Ok(answer(r#"{"ok":true}"#))];
@@ -135,16 +148,17 @@ fn a_repeated_query_without_progress_and_a_spent_budget_close_tools() {
 
 #[test]
 fn failures_are_typed_and_carry_usage() {
-    for (reply, kind) in [
-        (answer("not json"), ApiErrorKind::InvalidJson),
-        (answer(r#"{"ok":1}"#), ApiErrorKind::SchemaInvalid),
-        (json!({"role":"assistant","content":null,"refusal":"no"}), ApiErrorKind::Refusal),
-        (answer(""), ApiErrorKind::InvalidJson),
+    // An invalid final result fails only after its one correction.
+    for (replies, kind, tokens) in [
+        (vec![answer("not json"), answer("not json")], ApiErrorKind::InvalidJson, 4),
+        (vec![answer(r#"{"ok":1}"#), answer(r#"{"ok":1}"#)], ApiErrorKind::SchemaInvalid, 4),
+        (vec![json!({"role":"assistant","content":null,"refusal":"no"})], ApiErrorKind::Refusal, 2),
+        (vec![answer(""), answer("")], ApiErrorKind::InvalidJson, 4),
     ] {
-        let err =
-            analyze(&mut Script(vec![Ok(reply)], vec![]), &mut Pages { served: 0, pages: 1, limit: None }).unwrap_err();
+        let mut script = Script(replies.into_iter().map(Ok).collect(), vec![]);
+        let err = analyze(&mut script, &mut Pages { served: 0, pages: 1, limit: None }).unwrap_err();
         assert_eq!(err.kind, kind);
-        assert_eq!(err.usage.unwrap().completion_tokens, Some(2));
+        assert_eq!(err.usage.unwrap().completion_tokens, Some(tokens));
     }
     let mut script = Script(vec![Err(ApiErrorKind::UnsupportedResponseFormat), Ok(answer(r#"{"ok":true}"#))], vec![]);
     assert_eq!(

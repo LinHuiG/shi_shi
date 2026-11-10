@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["core", "app", "migrate", "providers/api", "providers/acp", "plugin-sdk", "examples/json-source"]
+members = ["core", "app", "providers/api", "providers/acp", "plugin-sdk", "examples/json-source"]
 
 [workspace.package]
-version = "1.2.5"
+version = "1.2.6"
 edition = "2021"
 license = "AGPL-3.0-only"
 

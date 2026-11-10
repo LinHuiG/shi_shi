@@ -50,11 +50,16 @@ function render(s,rows){
   $('#pending').textContent=s.analyzing?`${s.analyzing} 条分析中`:s.pending?`${s.pending} 条消息等待分析`:'没有等待分析的消息';
   $('#analyze').disabled=!s.pending||s.ai_busy||!!s.analyzing;
   const c=s.task_focus_counts||{};$('#counts').textContent=`待处理 ${c['待处理']||0} · 处理中 ${c['处理中']||0} · 被阻塞 ${c['被阻塞']||0}`;
-  $('#list').innerHTML='';
-  if(!rows.length){$('#list').innerHTML='<li class="empty">没有需要跟进的事项</li>';return}
-  for(const r of rows.slice(0,20)){const li=document.createElement('li'),b=document.createElement('button');b.dataset.id=r.id;b.title=r.title;
-    b.innerHTML='<span class="n"></span><span class="t"></span><span class="s"></span>';b.children[0].textContent='#'+r.number;b.children[1].textContent=r.title;
-    b.children[2].textContent=r.due||r.status;b.children[2].classList.toggle('due',!!r.due);li.append(b);$('#list').append(li)}
+  const list=$('#list');
+  if(!rows.length){list.innerHTML='<li class="empty">没有需要跟进的事项</li>';return}
+  const empty=list.querySelector('.empty');if(empty)empty.remove();
+  for(const [i,r] of rows.slice(0,20).entries()){
+    let li=list.children[i];
+    if(!li){li=document.createElement('li');li.innerHTML='<button><span class="n"></span><span class="t"></span><span class="s"></span></button>';list.append(li)}
+    const b=li.firstElementChild;b.dataset.id=r.id;b.title=r.title;
+    b.children[0].textContent='#'+r.number;b.children[1].textContent=r.title;
+    b.children[2].textContent=r.due||r.status;b.children[2].classList.toggle('due',!!r.due)}
+  while(list.children.length>Math.min(rows.length,20))list.lastElementChild.remove();
 }
 async function load(){
   if(loading){again=true;return}loading=true;

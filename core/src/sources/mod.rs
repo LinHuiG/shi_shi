@@ -111,11 +111,11 @@ const PRUNE_AFTER_CHANGE: i64 = 15_000;
 const PRUNE_IDLE: i64 = 60 * crate::time::MINUTE;
 
 /// Start the scan loop: it sleeps until the next scan or retention pass is
-/// due, or a commit or runtime change may have moved that time.
+/// due, or a business change may have moved that time.
 pub fn spawn(ctx: &Arc<Ctx>) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let mut changes = ctx.db.subscribe();
+        let mut changes = ctx.db.changes();
         let (mut pruned, mut changed) = (0, true);
         loop {
             let scan = scan::tick(&ctx).await;

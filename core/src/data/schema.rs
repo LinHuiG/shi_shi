@@ -83,12 +83,12 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     for (index, step) in STEPS.iter().enumerate().skip(applied) {
         let tx = conn.transaction()?;
         tx.execute_batch(step)?;
-        if index == 0 {
-            super::prompts::seed(&tx)?;
-        }
         tx.pragma_update(None, "user_version", (index + 1) as i64)?;
         tx.commit()?;
     }
+    let tx = conn.transaction()?;
+    super::prompts::seed(&tx)?;
+    tx.commit()?;
     conn.execute_batch(include_str!("sql/views.sql"))?;
     Ok(())
 }

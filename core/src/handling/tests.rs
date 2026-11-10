@@ -52,6 +52,27 @@ async fn settled(ctx: &Arc<Ctx>, id: &str) -> Run {
 }
 
 #[tokio::test]
+async fn failed_project_reads_do_not_keep_background_loops_awake() {
+    let (ctx, fake) = setup().await;
+    *fake.projects_error.lock().unwrap() = true;
+    let at = time::now();
+    for year in crate::ai::calendar::wanted_years(crate::ai::work::shanghai_date(at).unwrap()) {
+        ctx.db
+            .save_holiday_year(crate::ai::calendar::Year { year, fetched_at: at, days: Default::default() })
+            .await
+            .unwrap();
+    }
+    let runtime = crate::Runtime::start(ctx.clone(), true).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let before = ctx.db.revision();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let growth = ctx.db.revision() - before;
+    drop(runtime);
+    let _ = std::fs::remove_dir_all(&ctx.root);
+    assert!(growth <= 2, "idle revision grew by {growth}");
+}
+
+#[tokio::test]
 async fn prepare_offers_conversation_connections_with_the_settings_model() {
     let (ctx, _) = setup().await;
     let p = call(&ctx, "handling_prepare", json!({"task_id": TASK})).await.unwrap();
@@ -84,9 +105,8 @@ async fn projects_come_only_from_the_chosen_connections_client() {
 }
 
 #[tokio::test]
-async fn the_session_is_handed_over_only_after_the_first_turn() {
+async fn codex_composes_then_binds_the_desktop_thread_through_its_brief() {
     let (ctx, fake) = setup().await;
-    fake.script.lock().unwrap().push(("th-1", Ok("completed")));
     let cwd = ctx.root.join("work");
     let started = call(
         &ctx,
@@ -97,12 +117,43 @@ async fn the_session_is_handed_over_only_after_the_first_turn() {
     .await
     .unwrap();
     let id = started["run_id"].as_str().unwrap().to_string();
-    let run = settled(&ctx, &id).await;
-    assert_eq!((run.status.as_str(), run.thread_id.as_str(), run.model.as_str()), ("completed", "th-1", "m2"));
-    assert!(fake.opened.lock().unwrap().is_empty(), "nothing writes the session alongside the first turn");
+    let mut run = ctx.db.handling_run(id.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        (run.status.as_str(), run.thread_id.as_str(), run.model.as_str(), run.effort.as_str()),
+        ("waiting", "", "", "")
+    );
+    assert!(fake.turns.lock().unwrap().is_empty());
+    assert!(ctx.handling.live(&id).is_none());
+    assert!(fake.opened.lock().unwrap().is_empty());
     assert_eq!(ctx.config.get().model_choice("handling").model, "m1");
-    let (text, at, model, effort) = fake.turns.lock().unwrap()[0].clone();
-    assert_eq!((at.as_str(), model.as_str(), effort.as_str()), (cwd.to_str().unwrap(), "m2", "high"));
+    let composed = fake.composed.lock().unwrap().clone();
+    assert_eq!(composed.len(), 1);
+    assert_eq!(composed[0].0, cwd);
+    let kickoff = &composed[0].1;
+    assert_eq!(started["kickoff"], *kickoff);
+    assert!(kickoff.contains(&id) && kickoff.contains("handling brief") && kickoff.contains("| Out-String"));
+    assert!(kickoff.contains("10013"));
+    assert!(kickoff.contains(&format!("--root '{}'", ctx.host.install_root().display())));
+    assert!(command(&ctx, "handling_kickoff", TASK, "r'b").contains("handling brief 'r''b'"));
+    let (calls, logs) = ctx
+        .db
+        .test_read(|c| {
+            let calls: f64 =
+                c.query_row("SELECT total(calls) FROM usage_daily WHERE purpose = 'main'", [], |r| r.get(0))?;
+            let logs: i64 =
+                c.query_row("SELECT count(*) FROM activity WHERE kind = 'handling_round'", [], |r| r.get(0))?;
+            Ok((calls, logs))
+        })
+        .await
+        .unwrap();
+    assert_eq!((calls, logs), (0.0, 0));
+    let reopened = call(&ctx, "handling_open", json!({"run_id": id})).await.unwrap();
+    assert_eq!(reopened["kickoff"], *kickoff);
+    assert_eq!(fake.composed.lock().unwrap().len(), 2);
+    call(&ctx, "handling_brief", json!({"run_id": id})).await.unwrap();
+    assert_eq!(ctx.db.handling_run(id.clone()).await.unwrap().unwrap().status, "waiting");
+    let brief = call(&ctx, "handling_brief", json!({"run_id": id, "thread_id": "th-1"})).await.unwrap();
+    let text = brief.as_str().unwrap();
     assert!(text.contains("先查报销") && text.contains("合成事项"));
     assert!(text.contains(&format!("tasks get '{TASK}'")) && text.contains("call action"), "{text}");
     // The CLI takes the installation root, never the data directory, and
@@ -113,19 +164,18 @@ async fn the_session_is_handed_over_only_after_the_first_turn() {
     assert!(text.split("& '").skip(1).all(|c| c.lines().next().unwrap().contains("| Out-String")), "{text}");
     // A sandboxed client asks once for escalation instead of giving up silently.
     assert!(text.contains("10013") && text.contains("提升权限申请一次"), "{text}");
-    let (calls, logs) = ctx
-        .db
-        .test_read(|c| {
-            let calls: i64 = c.query_row("SELECT calls FROM usage_daily WHERE purpose = 'main'", [], |r| r.get(0))?;
-            let logs: i64 =
-                c.query_row("SELECT count(*) FROM activity WHERE kind = 'handling_round'", [], |r| r.get(0))?;
-            Ok((calls, logs))
-        })
-        .await
-        .unwrap();
-    assert_eq!((calls, logs), (1, 1));
+    run = ctx.db.handling_run(id.clone()).await.unwrap().unwrap();
+    assert_eq!((run.status.as_str(), run.thread_id.as_str()), ("completed", "th-1"));
     call(&ctx, "handling_open", json!({"run_id": id})).await.unwrap();
     assert_eq!(*fake.opened.lock().unwrap(), ["th-1"]);
+    call(&ctx, "handling_brief", json!({"run_id": id, "thread_id": "th-2"})).await.unwrap();
+    assert_eq!(ctx.db.handling_run(id.clone()).await.unwrap().unwrap().thread_id, "th-2");
+    run.thread_id.clear();
+    ctx.db.save_handling_run(run).await.unwrap();
+    assert_eq!(
+        call(&ctx, "handling_open", json!({"run_id": id})).await.unwrap_err().0,
+        "没有记录到 Codex 会话编号，请在 Codex 中查找这条对话，或重新开始处置"
+    );
     let _ = std::fs::remove_dir_all(&ctx.root);
 }
 
@@ -163,37 +213,45 @@ async fn a_running_first_turn_blocks_a_second_start_and_dsh_is_raised_with_its_p
 #[tokio::test]
 async fn a_failed_turn_keeps_its_error_and_a_restart_interrupts_running_rows() {
     let (ctx, fake) = setup().await;
+    let dsh = Connection { id: "c-dsh".into(), driver: "dsh".into(), ..Default::default() };
+    ctx.config.update(&ctx.db, |c| Ok(c.ai_connections.push(dsh))).await.unwrap();
     fake.script.lock().unwrap().push(("", Err("模型不可用".into())));
-    let id = call(&ctx, "handling_start", json!({"task_id": TASK, "cwd": ctx.root.join("w")})).await.unwrap()["run_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let id =
+        call(&ctx, "handling_start", json!({"task_id": TASK, "cwd": ctx.root.join("w"), "connection_id": "c-dsh"}))
+            .await
+            .unwrap()["run_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
     let run = settled(&ctx, &id).await;
     assert_eq!((run.status.as_str(), run.error.as_str()), ("failed", "模型不可用"));
     assert_eq!(call(&ctx, "handling_open", json!({"run_id": id})).await.unwrap_err().0, "会话尚未建立，请稍候");
     let mut running = run.clone();
     running.status = "running".into();
     ctx.db.save_handling_run(running).await.unwrap();
+    let waiting = call(&ctx, "handling_start", json!({"task_id": TASK, "cwd": ctx.root.join("w")})).await.unwrap();
     ctx.db.interrupt_handling_runs().await.unwrap();
     assert_eq!(ctx.db.handling_run(id).await.unwrap().unwrap().status, "interrupted");
+    assert_eq!(
+        ctx.db.handling_run(waiting["run_id"].as_str().unwrap().into()).await.unwrap().unwrap().status,
+        "waiting"
+    );
     let _ = std::fs::remove_dir_all(&ctx.root);
 }
 
 #[tokio::test]
 async fn the_snapshot_carries_the_latest_run_head() {
-    let (ctx, fake) = setup().await;
-    fake.script.lock().unwrap().push(("th", Ok("completed")));
+    let (ctx, _) = setup().await;
     let id = call(&ctx, "handling_start", json!({"task_id": TASK, "cwd": ctx.root.join("w"), "project_name": "工作"}))
         .await
         .unwrap()["run_id"]
         .as_str()
         .unwrap()
         .to_string();
-    settled(&ctx, &id).await;
     let list = crate::state::snapshot(&ctx, &json!({"page": "tasks"})).await.unwrap();
     assert_eq!(
         list["handling"][0],
-        json!({"id": id, "task_id": TASK, "status": "completed", "thread_id": "th", "driver": "codex",
+        json!({"id": id, "task_id": TASK, "status": "waiting", "thread_id": "", "driver": "codex",
         "connection_name": "Codex", "project_name": "工作", "error": ""})
     );
     let _ = std::fs::remove_dir_all(&ctx.root);

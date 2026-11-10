@@ -22,6 +22,8 @@ pub enum ApiEvent {
     /// Raw provider JSON for the local trace only.
     Response(Value),
     ToolRejected(Value),
+    /// A final result sent back to the model for its one correction.
+    OutputRejected(Value),
 }
 
 fn receiving_tool(event: &mut dyn FnMut(ApiEvent)) {

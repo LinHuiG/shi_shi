@@ -4,7 +4,7 @@ CLI 与图形界面是同一个 `shishi.exe`：带命令（如 `shishi.exe tasks
 
 需要让 agent 操作拾事时，在「使用说明」复制 ShiShi CLI Skill，或让它读取安装目录的 `skills/shishi-cli/SKILL.md`。技能包含命令发现、查询、带版本的修改、异步任务查询及失败核对方式；读取技能本身不会执行操作。
 
-命令默认返回 UTF-8 JSON：成功时 `ok` 为 `true`、结果位于 `data`；失败时 `ok` 为 `false`、原因位于 `error`，进程退出码为 1。命令说明和版本号输出普通文本。
+命令默认返回UTF-8 JSON：成功时`ok`为`true`、结果位于`data`；失败时`ok`为`false`、原因位于`error`，进程退出码为1。命令说明、版本号和成功的`handling brief`输出普通文本。
 
 `shishi.exe` 是图形程序，PowerShell 和 cmd 直接运行它时不等它结束。脚本和 agent 应捕获输出，例如 `$r = & .\shishi.exe backend status` 或 `& .\shishi.exe methods | Out-String`，这样会等待结束并设置 `$LASTEXITCODE`；cmd 中用 `start /wait /b shishi.exe <命令>`。管道和重定向照常可用。安装器不自动修改 PATH，可使用完整路径，或自行把安装目录加入 PATH。
 
@@ -57,6 +57,8 @@ CLI 与图形界面是同一个 `shishi.exe`：带命令（如 `shishi.exe tasks
 `methods` 从同一个业务分发入口列出操作名，并提供常用参数示例。`call` 覆盖页面的业务操作，包括事项编辑与状态、合并、定时事项、标签、来源、插件、提示词、记忆、报表、归档、AI 接入、处置和工具管理。文件选择器 `pick` 属于界面交互；CLI 向对应业务方法直接传文件路径。`storage_change` 可由 CLI 发起，但沿用现有原生迁移进度窗口。
 
 ## 修改数据
+
+Codex桌面端接到处置事项后，先执行`shishi.exe handling brief <处置ID>`读取完整说明。该命令成功时直接输出UTF-8原文；如果当前进程带有`CODEX_THREAD_ID`，拾事会将其记录为这次处置的会话编号，供“继续”按钮打开。命令失败仍按上述JSON格式返回错误。PowerShell调用时保留`| Out-String`，等待命令结束并接住输出。
 
 通用形式为 `shishi.exe call <页面业务方法>`。复杂内容建议使用 JSON 文件或标准输入，避免中文、引号和多行正文在 shell 中被重新解释。
 

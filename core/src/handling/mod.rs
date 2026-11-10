@@ -1,13 +1,3 @@
-//! Handling (处置): ShiShi hands a task to Codex or DSH. It starts the
-//! session with the chosen model and effort, runs the first turn headless,
-//! and only then hands the session to the client, so the two never write it
-//! at once; the user continues there. Progress and results
-//! come back through the ShiShi CLI, which the prompt describes.
-//!
-//! While the first turn runs, the run lives in memory; the row is written
-//! when it starts, when the session id is known and when it ends. After a
-//! restart a row still marked running reads as interrupted.
-
 pub mod agent;
 #[cfg(test)]
 mod tests;
@@ -26,7 +16,8 @@ use crate::state::Scope;
 use crate::{exec, prompts, time, Ctx, Error, Result};
 pub use agent::{Agent, Backends, Native, Turn};
 
-pub const METHODS: &[&str] = &["handling_open", "handling_prepare", "handling_projects", "handling_start"];
+pub const METHODS: &[&str] =
+    &["handling_open", "handling_prepare", "handling_projects", "handling_start", "handling_brief"];
 /// The built-in Codex of the settings page, which has no connection id.
 const DEFAULT_CODEX: &str = "__default_codex";
 
@@ -43,7 +34,6 @@ pub struct Run {
     pub model: String,
     pub effort: String,
     pub instructions: String,
-    /// Of the first turn: running, completed, failed or interrupted.
     pub status: String,
     pub error: String,
     pub created: i64,
@@ -83,6 +73,18 @@ pub async fn handle(ctx: &Arc<Ctx>, method: &str, p: Value) -> Result<Value> {
         "handling_prepare" => prepare(ctx, p.need_str("task_id")?).await,
         "handling_projects" => Ok(json!(projects(ctx, p.str_of("connection_id")).await?)),
         "handling_start" => start(ctx, &p).await,
+        "handling_brief" => {
+            let mut run = load(ctx, p.str_of("run_id")).await?;
+            let (task, _, policy) = ctx.db.handling_start(run.task_id.clone()).await?;
+            let text = prompt(ctx, &policy, &run.instructions, &task);
+            if let Some(thread) = p["thread_id"].as_str() {
+                run.thread_id = thread.into();
+                run.status = "completed".into();
+                run.updated = time::now();
+                ctx.db.save_handling_run(run).await?;
+            }
+            Ok(json!(text))
+        }
         "handling_open" => {
             let run = load(ctx, p.str_of("run_id")).await?;
             open(ctx, &run).await
@@ -110,10 +112,18 @@ async fn load(ctx: &Ctx, id: &str) -> Result<Run> {
 
 /// Bring the run's session up in its client.
 async fn open(ctx: &Ctx, run: &Run) -> Result<Value> {
-    if run.thread_id.is_empty() {
+    if run.connection.driver == "codex" {
+        if run.thread_id.is_empty() {
+            if run.status != "waiting" {
+                crate::bail!("没有记录到 Codex 会话编号，请在 Codex 中查找这条对话，或重新开始处置");
+            }
+            let kickoff = command(ctx, "handling_kickoff", &run.task_id, &run.id);
+            ctx.handling.backends().compose(Path::new(&run.cwd), &kickoff)?;
+            return Ok(json!({"kickoff": kickoff}));
+        }
+    } else if run.thread_id.is_empty() {
         crate::bail!("会话尚未建立，请稍候");
-    }
-    if run.busy() {
+    } else if run.busy() {
         crate::bail!("首轮进行中，结束后即可继续");
     }
     let backends = ctx.handling.backends();
@@ -159,11 +169,7 @@ fn default_choice(config: &Config, choices: &[Connection]) -> Value {
 pub(crate) async fn projects(ctx: &Arc<Ctx>, connection_id: &str) -> Result<Vec<Value>> {
     let driver = connection(&ctx.config.get(), connection_id)?.driver;
     let backends = ctx.handling.backends();
-    let read = exec::blocking(move || backends.projects(&driver)).await;
-    if let Err(e) = &read {
-        ctx.db.record_activity("project_catalog_error", json!({"connection_id": connection_id, "error": e.0})).await;
-    }
-    read
+    exec::blocking(move || backends.projects(&driver)).await
 }
 
 /// The projects analysis may suggest for a task: those of the default
@@ -194,15 +200,20 @@ async fn prepare(ctx: &Arc<Ctx>, task: &str) -> Result<Value> {
 
 // ---------------------------------------------------------------- start
 
+fn command(ctx: &Ctx, key: &str, task: &str, run: &str) -> String {
+    let (cli, root) = (std::env::current_exe().unwrap_or_default(), ctx.host.install_root());
+    let quote = |s: &str| s.replace('\'', "''");
+    prompts::default(key)
+        .replace("{cli}", &quote(&cli.to_string_lossy()))
+        .replace("{root}", &quote(&root.to_string_lossy()))
+        .replace("{task}", &quote(task))
+        .replace("{run}", &quote(run))
+}
+
 /// The prompt of the first turn: the boundary, the editable policy, the
 /// user's note, the task and how to read and write it through the CLI.
 fn prompt(ctx: &Ctx, policy: &str, instructions: &str, task: &crate::tasks::model::Task) -> String {
-    let (cli, root) = (std::env::current_exe().unwrap_or_default(), ctx.host.install_root());
-    let quote = |s: &str| s.replace('\'', "''");
-    let writeback = prompts::default("handling_writeback")
-        .replace("{cli}", &quote(&cli.to_string_lossy()))
-        .replace("{root}", &quote(&root.to_string_lossy()))
-        .replace("{task}", &quote(&task.id));
+    let writeback = command(ctx, "handling_writeback", &task.id, "");
     let task = json!({"id": task.id, "title": task.title, "description": task.description, "status": task.status});
     let note =
         if instructions.is_empty() { String::new() } else { format!("\n\n本次调查说明：\n{instructions}") };
@@ -214,31 +225,36 @@ async fn start(ctx: &Arc<Ctx>, p: &Value) -> Result<Value> {
     let mut connection = connection(&config, p.str_of("connection_id"))?;
     connection.models.clear();
     let (task, runs, policy) = ctx.db.handling_start(p.str_of("task_id").to_owned()).await?;
-    if runs.iter().any(|r| r.busy() || ctx.handling.live(&r.id).is_some()) {
-        crate::bail!("该事项的处置正在启动，请稍候");
-    }
     let cwd = p.str_of("cwd");
     if !Path::new(cwd).is_dir() {
         crate::bail!("项目目录不存在，请在对应客户端中检查该项目");
     }
     let instructions = p.str_of("instructions").trim();
-    let text = prompt(ctx, &policy, instructions, &task);
-    ctx.db.reserve_handling_call(config.clone()).await?;
     let now = time::now();
-    let run = Run {
+    let mut run = Run {
         id: uuid::Uuid::new_v4().to_string(),
-        task_id: task.id,
+        task_id: task.id.clone(),
         connection,
         project_name: p.str_of("project_name").into(),
         cwd: cwd.into(),
-        model: p.str_of("model").into(),
-        effort: p.str_of("effort").into(),
         instructions: instructions.into(),
-        status: "running".into(),
+        status: "waiting".into(),
         created: now,
         updated: now,
         ..Default::default()
     };
+    if run.connection.driver == "codex" {
+        ctx.db.save_handling_run(run.clone()).await?;
+        return Ok(json!({"run_id": run.id, "kickoff": open(ctx, &run).await?["kickoff"]}));
+    }
+    if runs.iter().any(|r| r.busy() || ctx.handling.live(&r.id).is_some()) {
+        crate::bail!("该事项的处置正在启动，请稍候");
+    }
+    let text = prompt(ctx, &policy, instructions, &task);
+    ctx.db.reserve_handling_call(config.clone()).await?;
+    run.status = "running".into();
+    run.model = p.str_of("model").into();
+    run.effort = p.str_of("effort").into();
     ctx.db.save_handling_run(run.clone()).await?;
     let agent = ctx.handling.backends().agent(&run.connection, &ctx.root)?;
     ctx.handling.live.lock().unwrap().insert(run.id.clone(), run.clone());

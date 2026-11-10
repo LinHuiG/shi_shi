@@ -9,7 +9,7 @@ plugin.json
 参见 examples/json-source/plugin.json。必需字段：id、name、version、api_version=1、entrypoint（相对DLL路径）、files、capabilities。config_fields 可省略，默认空列表。
 id及配置字段key只允许字母、数字、短横线和下划线，1–64字符。
 配置字段：key、label、type（file/directory/text/password）、required、description。宿主据此生成表单，支持文件和目录选择。password只遮挡UI显示，配置保存在用户的本地data中，插件不要返回不必要的凭据。
-插件必须提供 discover、validate、fetch_incremental、fetch_range、lookup_messages；可选 import_legacy。
+插件必须提供 discover、validate、fetch_incremental、fetch_range、lookup_messages。
 
 页面内配置（主程序1.2.2起，可选）
 settings={"api_version":1,"entrypoint":"settings.html","methods":["ui_load","ui_validate"]}，HTML必须列入files，最多2 MiB，方法名最多32个且不重复。
@@ -44,7 +44,6 @@ fetch_incremental: params {"cursor":上次游标或null,"since":毫秒,"until":�
 fetch_range: params {"since":毫秒,"until":毫秒}，包含首尾，返回同格式；宿主不会提交此游标。
 lookup_messages: params {"ids":[原始消息编号],"until":当前毫秒}，返回 {"messages":[...]}，用于更新仍被事项跟踪的消息和撤回状态。未找到的ID可省略，不推断撤回。
 fetch_scan（可选）: capabilities 声明后，宿主用一次隔离读取替代扫描时的 validate、fetch_incremental 和分批 lookup_messages；上述必需接口仍保留供旧宿主和配置页面调用。首次 params {"cursor":上次游标或null,"since":毫秒,"until":毫秒,"tracked":[去重后的原始消息编号]}，插件必须在同一冻结读取中校验配置与账号、读增量并补齐跟踪证据（含编辑和撤回）；增量已返回的证据无需重读。返回 {"valid":true,"account_key":"稳定身份","messages":[...],"cursor":新游标,"until":检查点,"next_page":"续页令牌或null"}。续页仍调用 fetch_scan，params 仅为 {"page":"上次返回的令牌"}；每页身份、游标和检查点必须相同，令牌不可重复，未结束页必须含消息，整轮消息身份（chat+id）不得重复。令牌最多128个ASCII字母、数字、短横线、下划线或冒号。插件应复用本轮冻结读取，不在每页重启读取环境；可将有界响应页放到 work_dir，不使用跨账号全局缓存。每次扫描使用独立UUID工作子目录，宿主在完成、失败或取消后清理；插件不得在调用返回后留存访问临时目录的后台任务。单轮最多100000条消息、少于10000次续页，单次请求/响应仍不超过32 MiB。失败不提交任何页或游标；旧插件继续使用原接口。
-import_legacy（可选）: params.state为宿主保留的升级前原始JSON。插件解读自己的旧格式，返回 {"config":{...},"account_key":"...","cursor":...,"last_scan":毫秒,"message_ids":[旧编号],"messages":[旧消息的可读文本转换结果]}。宿主迁移仍无source_id的缓存、任务引用和审计中的sources，保留原始副本；导入后默认关闭，用户校验启用。
 
 统一消息
 必需 id（来源内稳定字符串）、time（Unix毫秒）、text（已经提取的可读文本）。建议完整提供：

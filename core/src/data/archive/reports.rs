@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::{audits, in_scope, max_seq, scope_since, scope_sql, status_counts};
-use crate::archive::{new_id, pick, Attempt, Audit, MorningJob, REPORT_CURSOR};
+use crate::archive::{new_id, pick, Attempt, Audit, MorningJob, ARCHIVE_CURSOR, REPORT_CURSOR};
 use crate::data::{kv, rows};
 use crate::{time, Error, Result};
 
@@ -256,6 +256,7 @@ fn summary(report: &Value) -> Value {
             "archived_tasks",
             "skipped_tasks",
             "remaining_events",
+            "delta_omitted",
             "data_until",
             "pending_analysis",
         ],
@@ -313,18 +314,19 @@ pub(super) fn detail(conn: &Connection, p: &Value) -> Result<Value> {
     Ok(json!({"revision": revision, "rows": rows, "total": total, "offset": offset, "next_offset": end}))
 }
 
-/// Transaction A of a report: collect the delta since the last report,
-/// store a pending (or reused) report and move the report cursor. Returns
-/// the report with its full rows.
+/// Transaction A of a report: collect the delta since the last summarized
+/// report or archive, whichever came later, and store a pending (or reused)
+/// report. Returns the report with its full rows.
 pub(crate) fn prepare(conn: &Connection, label: &str, at: i64) -> Result<Value> {
     let since = scope_since(conn)?;
-    let delta =
-        audits(conn, &format!("seq > {} AND {} ORDER BY seq", kv::get_i64(conn, REPORT_CURSOR)?, in_scope(since)))?;
+    let cursor = kv::get_i64(conn, REPORT_CURSOR)?.max(kv::get_i64(conn, ARCHIVE_CURSOR)?);
+    let delta = audits(conn, &format!("seq > {cursor} AND {} ORDER BY seq", in_scope(since)))?;
     let previous = first_report(conn)?;
     let mut r = json!({
         "id": new_id(),
         "previous_report": previous.as_ref().map(|p| json!({"id": p["id"], "time": p["time"], "label": p["label"]})),
-        "delta": delta.iter().map(Audit::json).collect::<Vec<_>>(),
+        "delta": delta.iter().map(Audit::change).collect::<Vec<_>>(),
+        "audit_until": max_seq(conn)?,
         "suggestions": crate::data::rules::list(conn)?,
         "time": at,
         "label": label,
@@ -344,10 +346,10 @@ pub(crate) fn prepare(conn: &Connection, label: &str, at: i64) -> Result<Value> 
         r["ai_summary"] = old["ai_summary"].clone();
         r["summary_status"] = json!("reused");
         r["finished"] = json!(next_finished(conn, at)?);
+        kv::set(conn, REPORT_CURSOR, &r["audit_until"])?;
     } else {
         r["summary_status"] = json!("pending");
     }
-    kv::set(conn, REPORT_CURSOR, &max_seq(conn)?)?;
     put_report(conn, &r)?;
     truncate(conn)?;
     Ok(r)

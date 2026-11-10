@@ -51,9 +51,6 @@ areas!(
     traces,
 );
 
-#[cfg(feature = "import")]
-pub mod import;
-
 pub use config::ConfigStore;
 
 /// The data directory of an install: `data-location.json` when the user
@@ -140,13 +137,13 @@ impl Db {
         Self::finish(self.submit(move |conn| f(conn)).await)
     }
 
-    /// Run one business transaction and publish a new revision on commit.
+    /// Run one business transaction and publish a revision only when rows changed.
     async fn write<R: Send + 'static>(&self, f: impl FnOnce(&Transaction) -> Result<R> + Send + 'static) -> Result<R> {
-        let result = Self::finish(self.submit(move |conn| transact(conn, f)).await);
-        if result.is_ok() {
+        let (value, changed) = Self::finish(self.submit(move |conn| transact(conn, f)).await)?;
+        if changed {
             self.bump();
         }
-        result
+        Ok(value)
     }
 
     /// Blocking variants for code already off the executor (AI workers,
@@ -159,11 +156,11 @@ impl Db {
         &self,
         f: impl FnOnce(&Transaction) -> Result<R> + Send + 'static,
     ) -> Result<R> {
-        let result = Self::finish(self.submit(move |conn| transact(conn, f)).blocking_recv());
-        if result.is_ok() {
+        let (value, changed) = Self::finish(self.submit(move |conn| transact(conn, f)).blocking_recv())?;
+        if changed {
             self.bump();
         }
-        result
+        Ok(value)
     }
 
     /// Move the WAL into the main file and truncate it, so a closed data
@@ -187,12 +184,14 @@ impl Db {
         *self.revision.borrow()
     }
 
-    /// Changes on every business revision and every runtime [`poke`].
-    /// The host turns each change into one `window.stateChanged(n)`.
-    ///
-    /// [`poke`]: Db::poke
+    /// For the UI: wakes on business changes and runtime state updates.
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.pulse.subscribe()
+    }
+
+    /// Wakes only when business data changes.
+    pub fn changes(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
     }
 
     /// Publish a business change that did not go through `write`, such as a
@@ -248,11 +247,12 @@ impl From<rusqlite::Error> for Error {
     }
 }
 
-fn transact<R>(conn: &mut Connection, f: impl FnOnce(&Transaction) -> Result<R>) -> Result<R> {
+fn transact<R>(conn: &mut Connection, f: impl FnOnce(&Transaction) -> Result<R>) -> Result<(R, bool)> {
+    let before = conn.total_changes();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let value = f(&tx)?;
     tx.commit()?;
-    Ok(value)
+    Ok((value, conn.total_changes() != before))
 }
 
 #[cfg(test)]

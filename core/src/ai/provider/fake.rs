@@ -107,8 +107,12 @@ impl Driver for Fake {
                 if let Some(trace) = &job.trace {
                     trace.put("output.txt", value.to_string());
                 }
+                // The shared loop's final check, as Tools runs it.
+                if let Err(e) = crate::ai::schema::check(&job.kind, &value) {
+                    event(Event::OutputValidationFailed);
+                    return Err(format!("AI 输出校验失败：{e}"));
+                }
                 if let Some(context) = context.as_deref_mut() {
-                    // The shared loop's final check, as Tools runs it.
                     let had = value.get("_analysis_degraded").is_some();
                     if let Err(e) = context.validate_output(&job.kind, &mut value) {
                         event(Event::OutputValidationFailed);

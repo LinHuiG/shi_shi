@@ -9,7 +9,7 @@ function syncNav() {
     label = collapsed ? '展开导航' : '收起导航';
   toggle.setAttribute('aria-expanded', String(!collapsed));
   toggle.setAttribute('aria-label', label);
-  toggle.title = label;
+  toggle.dataset.tooltip = label;
 }
 $('#nav-toggle').addEventListener('click', () => {
   navChoice = !$('.app').classList.contains('nav-collapsed');

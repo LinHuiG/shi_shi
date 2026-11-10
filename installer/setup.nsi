@@ -112,9 +112,6 @@ FunctionEnd
 Function WaitFree
  !insertmacro Free "$INSTDIR\shishi.exe"
  ${If} $0 == 1
-  !insertmacro Free "$INSTDIR\ss.exe"
- ${EndIf}
- ${If} $0 == 1
   Return
  ${EndIf}
  IfSilent silent ask
@@ -131,25 +128,18 @@ Function WaitFree
  System::Call 'rstrtmgr::RmStartSession(*i .r1, i 0, w .r2) i.r0'
  ${If} $0 == 0
   System::Call '*(&w${NSIS_MAX_STRLEN} "$INSTDIR\shishi.exe") p.r3'
-  System::Call '*(&w${NSIS_MAX_STRLEN} "$INSTDIR\ss.exe") p.r4'
-  System::Call '*(p r3, p r4) p.r5'
-  System::Call 'rstrtmgr::RmRegisterResources(i r1, i 2, p r5, i 0, p 0, i 0, p 0) i.r0'
+  System::Call '*(p r3) p.r5'
+  System::Call 'rstrtmgr::RmRegisterResources(i r1, i 1, p r5, i 0, p 0, i 0, p 0) i.r0'
   System::Free $5
-  System::Free $4
   System::Free $3
   ${If} $0 == 0
    System::Call 'rstrtmgr::RmShutdown(i r1, i 1, p 0) i.r0'
   ${EndIf}
   System::Call 'rstrtmgr::RmEndSession(i r1)'
  ${EndIf}
- ${If} $0 == 0
-  !insertmacro Free "$INSTDIR\shishi.exe"
-  ${If} $0 == 1
-   !insertmacro Free "$INSTDIR\ss.exe"
-  ${EndIf}
-  ${If} $0 == 1
-   Return
-  ${EndIf}
+ !insertmacro Free "$INSTDIR\shishi.exe"
+ ${If} $0 == 1
+  Return
  ${EndIf}
  DetailPrint "拾事未能退出，安装已停止。"
  MessageBox MB_ICONEXCLAMATION "拾事未能退出，安装已停止。请结束占用后重新运行安装包。" /SD IDOK
@@ -251,17 +241,7 @@ Section "拾事" SEC_MAIN
   SetErrorLevel 1
   Abort
  ${EndIf}
- ; The rewrite merged ss.exe into shishi.exe.
- Delete "$INSTDIR\ss.exe"
  CreateDirectory "$INSTDIR\data"
- ; One-time conversion of 1.1.68 data; the tool is not kept afterwards.
- File "${STAGE}\shishi-migrate.exe"
- nsExec::ExecToLog '"$INSTDIR\shishi-migrate.exe" "$INSTDIR"'
- Pop $0
- Delete "$INSTDIR\shishi-migrate.exe"
- ${If} $0 != 0
-  DetailPrint "1.1.68数据迁移未完成（$0），旧数据仍在原处"
- ${EndIf}
  WriteUninstaller "$INSTDIR\Uninstall.exe"
  FileOpen $0 "$INSTDIR\install-info.txt" w
  FileWrite $0 "Shishi ${VERSION}$\r$\n$INSTDIR$\r$\n"
@@ -307,8 +287,6 @@ Section "Uninstall"
   Abort
  ${EndIf}
  Delete "$INSTDIR\shishi.exe"
- Delete "$INSTDIR\ss.exe"
- Delete "$INSTDIR\shishi-migrate.exe"
  Delete "$INSTDIR\WebView2Loader.dll"
  Delete "$INSTDIR\README.txt"
  Delete "$INSTDIR\CLI.md"

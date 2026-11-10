@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-CRATES = ["shishi-core", "shishi", "shishi-api", "shishi-acp", "shishi-plugin-sdk", "shishi-json-source", "shishi-migrate"]
+CRATES = ["shishi-core", "shishi", "shishi-api", "shishi-acp", "shishi-plugin-sdk", "shishi-json-source"]
 
 
 def run(cmd, env=None):
@@ -39,7 +39,6 @@ def main():
         triple = ["--target", "x86_64-pc-windows-gnu"]
         run(["cargo", "check", "--offline", "--locked", "-p", "shishi", *triple], env)
         run(["cargo", "check", "--offline", "--locked", "-p", "shishi-core", "--tests", *triple], env)
-        run(["cargo", "check", "--offline", "--locked", "-p", "shishi-migrate", *triple], env)
     print("all checks passed")
 
 

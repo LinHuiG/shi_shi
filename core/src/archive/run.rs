@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::{Attempt, Audit, Measured, Mode, Model, Prepared};
+use super::{task_brief, Attempt, Audit, Measured, Mode, Model, Prepared};
 use crate::ai::prompt::require_purpose;
 use crate::prompts::memory;
 use crate::tasks::model as tasks;
@@ -53,7 +53,7 @@ pub struct Material {
     pub(crate) status_counts: Value,
     pub(crate) tag_catalog: Value,
     pub(crate) memory: memory::Memory,
-    pub(crate) temporary: String,
+    pub(crate) temporary: memory::Memory,
     pub(crate) data_until: i64,
     pub(crate) pending: i64,
     pub(crate) report_policy: String,
@@ -113,6 +113,9 @@ pub struct Batch {
     pub remaining: i64,
     pub memory_revision: i64,
     pub memory_text: String,
+    /// The temporary memory the request showed; a committed result clears it.
+    pub temporary_revision: i64,
+    pub temporary_text: String,
 }
 
 impl Batch {
@@ -122,6 +125,7 @@ impl Batch {
                 .iter()
                 .any(|k| self.payload[*k].as_array().is_some_and(|r| !r.is_empty()))
             || self.manual && !self.memory_text.trim().is_empty()
+            || !self.temporary_text.trim().is_empty()
     }
 }
 
@@ -140,10 +144,7 @@ pub fn build(m: &Material, attempt: &Attempt, mode: Mode, at: i64, count: usize,
     let mut rows = Vec::new();
     let mut learning = Vec::new();
     for a in taken {
-        let mut event = a.event();
-        if let Some(n) = note(a) {
-            event["archive_note"] = json!(n);
-        }
+        let event = super::event(&a.change());
         rows.push(json!({"audit_index": a.seq, "evidence_id": format!("audit:{}", a.seq), "event": event}));
         if a.learning() {
             learning.push(a.seq);
@@ -185,10 +186,10 @@ pub fn build(m: &Material, attempt: &Attempt, mode: Mode, at: i64, count: usize,
         "_trigger": attempt.trigger,
         "_archive_attempt_id": attempt.id,
         "_data_until": m.data_until,
-        "report_tasks": related.iter().map(|t| super::task_brief(t)).collect::<Vec<_>>(),
-        "current_tasks": current.iter().map(super::task_brief).collect::<Vec<_>>(),
+        "report_tasks": related.iter().map(|t| task_brief(&t.payload())).collect::<Vec<_>>(),
+        "current_tasks": current.iter().map(|t| task_brief(&t.payload())).collect::<Vec<_>>(),
         "_archived_memory": m.memory.text,
-        "_temporary_memory": m.temporary,
+        "_temporary_memory": m.temporary.text,
         "_local_context": {"archived_memory": {"revision": m.memory.revision}, "memory": {"writable": false}},
         "memory": {"writable": false},
         "_context_frozen": true,
@@ -204,7 +205,7 @@ pub fn build(m: &Material, attempt: &Attempt, mode: Mode, at: i64, count: usize,
         "trigger": trigger,
         "tasks": reported.iter().map(|t| t.payload()).collect::<Vec<_>>(),
         "status_counts": m.status_counts,
-        "delta": taken.iter().map(Audit::json).collect::<Vec<_>>(),
+        "delta": taken.iter().map(Audit::change).collect::<Vec<_>>(),
         "suggestions": [],
         "summary_status": "pending",
         "data_until": m.data_until,
@@ -225,6 +226,8 @@ pub fn build(m: &Material, attempt: &Attempt, mode: Mode, at: i64, count: usize,
         remaining,
         memory_revision: m.memory.revision,
         memory_text: m.memory.text.clone(),
+        temporary_revision: m.temporary.revision,
+        temporary_text: m.temporary.text.clone(),
     }
 }
 

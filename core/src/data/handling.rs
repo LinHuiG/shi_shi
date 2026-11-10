@@ -53,7 +53,7 @@ impl Db {
     /// First turns a previous process left running were cut off with it.
     pub async fn interrupt_handling_runs(&self) -> Result<()> {
         self.write(|tx| {
-            for mut run in query(tx, "status IN ('running', 'waiting')", &[])? {
+            for mut run in query(tx, "status = 'running'", &[])? {
                 run.status = "interrupted".into();
                 save(tx, &run)?;
             }

@@ -40,6 +40,27 @@ pub(super) fn round_corners(window: &Window) -> bool {
     }
     true
 }
+/// A builder on the shared profile. WebViews on one data folder share a browser
+/// process and its runtime version, so a new one joins a live one's environment:
+/// a fresh environment takes the newest installed runtime, which after an update
+/// cannot start beside the running browser.
+pub(super) fn builder<'a>(context: &'a mut WebContext, live: Option<&WebView>) -> WebViewBuilder<'a> {
+    let builder = WebViewBuilder::new_with_web_context(context);
+    match live {
+        Some(webview) => builder.with_environment(webview.environment()),
+        None => builder,
+    }
+}
+
+/// Any WebView still open, for a new one to join.
+fn live<'a>(
+    view: Option<&'a View>,
+    panel: Option<&'a panel::Panel>,
+    surface: Option<&'a Surface>,
+) -> Option<&'a WebView> {
+    view.map(|v| &v.webview).or(panel.map(|p| &p.webview)).or(surface.and_then(Surface::webview))
+}
+
 const STARTUP_LIMIT: Duration = Duration::from_secs(60);
 const STARTUP_STALLED: &str = "界面初始化超过60秒，页面未完成加载。";
 
@@ -59,6 +80,7 @@ impl View {
     fn create(
         target: &EventLoopWindowTarget<UiEvent>,
         context: &mut WebContext,
+        live: Option<&WebView>,
         owner: &Arc<Owner>,
         proxy: &EventLoopProxy<UiEvent>,
     ) -> Result<Self, String> {
@@ -85,7 +107,7 @@ impl View {
         let handler = owner.clone();
         let proxy = proxy.clone();
         let first = std::sync::atomic::AtomicBool::new(true);
-        let webview = WebViewBuilder::new_with_web_context(context)
+        let webview = builder(context, live)
             .with_html(super::page(owner.args.ui_dir.as_deref())?)
             .with_focused(false)
             .with_theme(wry::Theme::Dark)
@@ -196,13 +218,14 @@ fn show(
     view: &mut Option<View>,
     target: &EventLoopWindowTarget<UiEvent>,
     context: &mut WebContext,
+    live: Option<&WebView>,
     owner: &Arc<Owner>,
     proxy: &EventLoopProxy<UiEvent>,
 ) {
     match view {
         Some(v) if v.ready => v.reveal(),
         Some(_) => {}
-        None => match View::create(target, context, owner, proxy) {
+        None => match View::create(target, context, live, owner, proxy) {
             Ok(v) => *view = Some(v),
             Err(error) => crate::fail(&error, Some(&owner.data), true),
         },
@@ -275,7 +298,7 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
         match event {
             Event::NewEvents(cause) => {
                 if cause == StartCause::Init && gui() {
-                    show(&mut view, target, &mut context, &owner, &proxy);
+                    show(&mut view, target, &mut context, live(None, panel.as_ref(), surface.as_ref()), &owner, &proxy);
                 }
                 if view.as_ref().is_some_and(|v| !v.ready && Instant::now() >= v.deadline) {
                     crate::fail(STARTUP_STALLED, Some(&owner.data), gui());
@@ -305,7 +328,7 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
             Event::UserEvent(UiEvent::Ticked(remind)) => {
                 ticking = false;
                 if remind && gui() {
-                    show(&mut view, target, &mut context, &owner, &proxy);
+                    show(&mut view, target, &mut context, live(None, panel.as_ref(), surface.as_ref()), &owner, &proxy);
                 }
             }
             Event::UserEvent(UiEvent::Ready) => {
@@ -339,7 +362,14 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                         panel::Command::Open(task) => {
                             p.hide();
                             if owner.owners.acquire(true).is_ok() {
-                                show(&mut view, target, &mut context, &owner, &proxy);
+                                show(
+                                    &mut view,
+                                    target,
+                                    &mut context,
+                                    live(None, panel.as_ref(), surface.as_ref()),
+                                    &owner,
+                                    &proxy,
+                                );
                                 match (view.as_ref().filter(|v| v.ready), task) {
                                     (Some(v), Some(id)) => open_task(v, &id),
                                     (None, task) => opening = task,
@@ -365,7 +395,7 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
             }
             Event::UserEvent(UiEvent::Signal(Signal::Show)) => {
                 if gui() {
-                    show(&mut view, target, &mut context, &owner, &proxy);
+                    show(&mut view, target, &mut context, live(None, panel.as_ref(), surface.as_ref()), &owner, &proxy);
                 }
             }
             Event::UserEvent(UiEvent::Signal(Signal::Hide)) => {
@@ -400,7 +430,9 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                         queue.push(notice);
                     }
                     let s = surface.get_or_insert_with(Surface::default);
-                    if s.prepare(queue.count(), target, &mut context, &proxy).is_err() {
+                    if s.prepare(queue.count(), target, &mut context, live(view.as_ref(), panel.as_ref(), None), &proxy)
+                        .is_err()
+                    {
                         queue.dismiss();
                     }
                     s.refresh(&mut queue, view.as_ref().map(|v| &v.window));
@@ -420,7 +452,7 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                 if let Some(s) = surface.as_mut() {
                     if let Some(notice) = s.command(&command, &mut queue) {
                         if owner.owners.acquire(true).is_ok() {
-                            show(&mut view, target, &mut context, &owner, &proxy);
+                            show(&mut view, target, &mut context, live(None, panel.as_ref(), Some(s)), &owner, &proxy);
                             match (view.as_ref().filter(|v| v.ready), notice.task) {
                                 (Some(v), Some(id)) => open_task(v, &id),
                                 (None, Some(id)) => opening = Some(id),
@@ -439,7 +471,13 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
             }
             Event::UserEvent(UiEvent::Tray(tray::Action::Panel)) => {
                 if panel.is_none() {
-                    match panel::Panel::create(target, &mut context, &owner, &proxy) {
+                    match panel::Panel::create(
+                        target,
+                        &mut context,
+                        live(view.as_ref(), None, surface.as_ref()),
+                        &owner,
+                        &proxy,
+                    ) {
                         Ok(p) => panel = Some(p),
                         Err(error) => super::fatal(&format!("面板启动失败：{error}")),
                     }
@@ -453,7 +491,7 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                     p.hide();
                 }
                 if owner.owners.acquire(true).is_ok() {
-                    show(&mut view, target, &mut context, &owner, &proxy);
+                    show(&mut view, target, &mut context, live(None, panel.as_ref(), surface.as_ref()), &owner, &proxy);
                 }
             }
             Event::UserEvent(UiEvent::Tray(tray::Action::Exit)) => {
@@ -472,9 +510,9 @@ pub fn run(owner: Arc<Owner>) -> Result<(), String> {
                     }
                 }
             }
-            Event::WindowEvent {
-                window_id, event: WindowEvent::Focused(false) | WindowEvent::CloseRequested, ..
-            } if panel.as_ref().is_some_and(|p| p.contains(window_id)) => {
+            Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. }
+                if panel.as_ref().is_some_and(|p| p.contains(window_id)) =>
+            {
                 if let Some(p) = panel.as_mut() {
                     p.hide();
                 }

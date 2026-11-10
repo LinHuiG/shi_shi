@@ -1,8 +1,7 @@
-// AI 处置: ShiShi starts the task's session in Codex or DSH with the chosen
-// model, effort and project, runs its first turn and hands it over; the
-// user continues in that client, which writes back through the CLI.
+// Codex starts in the desktop composer; DSH hands over after its first turn.
 
 const handlingLabels = {
+  waiting: '等你在 Codex 按回车',
   running: '首轮进行中',
   completed: '已交给客户端',
   failed: '启动失败',
@@ -17,7 +16,7 @@ const handlingStarting = new Set();
 function handlingButton(id) {
   const r = taskRun(id);
   if (handlingStarting.has(id) || r?.status === 'running') return 'AI 处置中';
-  return r?.thread_id ? `在 ${handlingClient(r)} 中继续` : 'AI一键处置';
+  return r && (r.thread_id || r.status === 'waiting') ? `在 ${handlingClient(r)} 中继续` : 'AI一键处置';
 }
 function handlingBadge(id) {
   const r = taskRun(id);
@@ -49,8 +48,9 @@ function handlingEfforts(pick) {
   return efforts;
 }
 function handlingChip(pick) {
-  const c = handlingConnection(pick.connection),
-    m = c?.models.find((m) => m.model === pick.model);
+  const c = handlingConnection(pick.connection);
+  if (c.driver === 'codex') return `<button type="button" class="handling-chip" data-handling-menu="model" aria-haspopup="listbox" aria-expanded="false"><span>${esc(c.name)}</span>${icon('chevron')}</button>`;
+  const m = c?.models.find((m) => m.model === pick.model);
   const model = m ? m.displayName || m.model : pick.model || '默认模型';
   const effort = pick.effort ? effortNames[pick.effort] || pick.effort : '默认强度';
   const title = [c?.name || handlingClient(c), m ? handlingModelName(m) : model, effort].join(' · ');
@@ -95,15 +95,15 @@ function handlingMenuItems(kind, host, query) {
     connections = handlingChoices.connections;
   const groups = connections
     .map((c) => {
-      const items = [
+      const items = (c.driver === 'codex' ? [{ model: '', label: c.name }] : [
         { model: '', label: '接入默认模型' },
         ...c.models.map((m) => ({ model: m.model, label: handlingModelName(m) })),
-      ]
+      ])
         .filter((m) => hit(m.label, m.model, c.name))
         .map((m) =>
           option(
             `data-connection="${esc(c.id)}" data-model="${esc(m.model)}"`,
-            c.id === pick.connection && m.model === (pick.model || ''),
+            c.id === pick.connection && (c.driver === 'codex' || m.model === (pick.model || '')),
             `<span>${esc(m.label)}</span>`,
             m.label,
           ),
@@ -115,6 +115,7 @@ function handlingMenuItems(kind, host, query) {
       );
     })
     .join('');
+  if (handlingConnection(pick.connection).driver === 'codex') return groups;
   const efforts = ['', ...handlingEfforts(pick)]
     .map(
       (e) =>
@@ -252,6 +253,9 @@ function syncHandlingStart() {
       : '';
   note.hidden = !note.textContent;
   note.classList.toggle('error-text', !!c.error);
+  $('#handling-start-note').textContent = client === 'Codex'
+    ? '拾事会在 Codex 桌面端新建对话并填好第一句，按回车即开始，过程中可随时中断、追加。'
+    : '拾事用所选模型在 Codex 或 DSH 中跑完首轮调查，再把会话交给客户端继续；进展和结论由客户端通过拾事 CLI 写回事项。';
   $('#dialog [data-handle="submit"]').disabled = !project;
 }
 async function beginHandling(id) {
@@ -260,7 +264,7 @@ async function beginHandling(id) {
   const d = p.default;
   handlingChoices = { ...p, task: id, pick: { connection: d.connection_id, model: d.model, effort: d.effort } };
   setModal(
-    `<h2>AI一键处置</h2><p class="subtitle">拾事用所选模型在 Codex 或 DSH 中跑完首轮调查，再把会话交给客户端继续；进展和结论由客户端通过拾事 CLI 写回事项。</p><div class="form-group"><label id="handling-project-label">项目</label><button type="button" class="handling-select" id="handling-project" data-handling-menu="project" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="handling-project-label"></button><p class="helper" id="handling-project-note" hidden></p></div><div class="form-group"><label for="handling-instructions">本次补充说明（可选）</label><textarea id="handling-instructions" maxlength="2000" placeholder="例如：先核对复现步骤和相关日志。"></textarea></div><details class="handling-prompt"><summary>查看当前通用调查提示词</summary><pre>${esc(p.prompt)}</pre></details><div id="modal-error" class="error-box"></div><div class="dialog-foot handling-start-foot"><span class="handling-chip-host" data-handling-picker>${handlingChip(handlingChoices.pick)}</span><button data-action="close">取消</button><button class="primary" data-handle="submit" data-task-id="${esc(id)}" disabled>开始调查</button></div>`,
+    `<h2>AI一键处置</h2><p class="subtitle" id="handling-start-note"></p><div class="form-group"><label id="handling-project-label">项目</label><button type="button" class="handling-select" id="handling-project" data-handling-menu="project" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="handling-project-label"></button><p class="helper" id="handling-project-note" hidden></p></div><div class="form-group"><label for="handling-instructions">本次补充说明（可选）</label><textarea id="handling-instructions" maxlength="2000" placeholder="例如：先核对复现步骤和相关日志。"></textarea></div><details class="handling-prompt"><summary>查看当前通用调查提示词</summary><pre>${esc(p.prompt)}</pre></details><div id="modal-error" class="error-box"></div><div class="dialog-foot handling-start-foot"><span class="handling-chip-host" data-handling-picker>${handlingChip(handlingChoices.pick)}</span><button data-action="close">取消</button><button class="primary" data-handle="submit" data-task-id="${esc(id)}" disabled>开始调查</button></div>`,
   );
   syncHandlingStart();
   await chooseHandlingConnection(d.connection_id);
@@ -268,12 +272,22 @@ async function beginHandling(id) {
 
 // ---------------------------------------------------------------- actions
 
+async function handlingKickoff(kickoff) {
+  await copyText(kickoff);
+  toast('已在 Codex 新建对话并填好第一句，按回车开始（第一句也已复制）');
+}
+
 const handlingActions = {
   async start(id) {
     const r = taskRun(id);
     if (handlingStarting.has(id) || r?.status === 'running')
       return toast(r?.thread_id ? `${handlingClient(r)} 正在执行首轮，完成后即可继续` : '正在启动处置，请稍候');
-    if (r?.thread_id) return rpc('handling_open', { run_id: r.id }).then((v) => v?.hint && toast(v.hint));
+    if (r && (r.thread_id || r.status === 'waiting')) {
+      const v = await rpc('handling_open', { run_id: r.id });
+      if (v && v.kickoff) await handlingKickoff(v.kickoff);
+      else if (v && v.hint) toast(v.hint);
+      return;
+    }
     return beginHandling(id);
   },
   restart: (id) => beginHandling(id),
@@ -293,9 +307,10 @@ const handlingActions = {
     handlingStarting.add(id);
     closeModal();
     try {
-      await rpc('handling_start', params);
+      const v = await rpc('handling_start', params);
       await refreshState(true);
-      toast(`已开始，首轮结束后会提醒，再到 ${handlingClient(handlingConnection(c.pick.connection))} 中继续`);
+      if (v.kickoff) await handlingKickoff(v.kickoff);
+      else toast(`已开始，首轮结束后会提醒，再到 ${handlingClient(handlingConnection(c.pick.connection))} 中继续`);
     } finally {
       handlingStarting.delete(id);
     }

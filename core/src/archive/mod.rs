@@ -27,13 +27,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 pub use crate::ai::invoke::Measured;
 use crate::ai::prompt::require_purpose;
 use crate::exec::Cancel;
 use crate::exec::ARCHIVE_BUSY;
-use crate::tasks::model::Task;
 use crate::tasks::rules;
 use crate::{time, Config, Ctx, Error, Result};
 
@@ -187,24 +186,17 @@ pub struct Audit {
     pub kind: String,
     pub task_id: String,
     pub detail: String,
-    pub change_summary: Value,
+    pub change_summary: String,
     pub before: Value,
     pub after: Value,
 }
 
 impl Audit {
-    pub fn json(&self) -> Value {
+    /// The row as reports keep it: what it changed, not the snapshots.
+    pub fn change(&self) -> Value {
         json!({
-            "seq": self.seq, "time": self.time, "kind": self.kind, "task_id": self.task_id,
-            "detail": self.detail, "change_summary": self.change_summary, "before": self.before, "after": self.after,
-        })
-    }
-
-    /// The compact event the model reads.
-    pub fn event(&self) -> Value {
-        json!({
-            "time": time::stamp(self.time), "kind": self.kind, "task_id": self.task_id, "detail": self.detail,
-            "change_summary": self.change_summary,
+            "time": self.time, "kind": self.kind, "task_id": self.task_id, "detail": self.detail,
+            "change_summary": self.change_summary, "changes": changes(&self.task_id, &self.before, &self.after),
         })
     }
 
@@ -213,13 +205,101 @@ impl Audit {
     }
 }
 
-/// The task fields the model reads.
-pub fn task_brief(t: &Task) -> Value {
-    json!({
-        "id": t.id, "title": t.title, "description": t.description, "status": t.status, "tags": t.tags,
-        "due": t.due, "blocker": t.blocker, "waiting_for": t.waiting_for, "archive_note": t.archive_note,
-        "updated": t.updated,
-    })
+/// The event the model reads of an [`Audit::change`] row.
+pub fn event(change: &Value) -> Value {
+    let mut event = change.clone();
+    event["time"] = json!(time::stamp(change["time"].as_i64().unwrap_or(0)));
+    event
+}
+
+/// Task fields whose changes the model reads; the rest is bookkeeping or
+/// follows from these.
+const CHANGED: [&str; 11] = [
+    "title",
+    "description",
+    "status",
+    "blocker",
+    "waiting_for",
+    "due",
+    "tags",
+    "evidence",
+    "archive_note",
+    "archived",
+    "reason",
+];
+
+/// The fields a row changed in its task. `null` for a creation or removal,
+/// whose result the task itself shows. A merge row holds every merged task;
+/// only the row's own one counts.
+fn changes(task_id: &str, before: &Value, after: &Value) -> Value {
+    let own = |v: &Value| match v.as_array() {
+        Some(rows) => rows.iter().find(|r| r["id"] == task_id).cloned().unwrap_or(Value::Null),
+        None => v.clone(),
+    };
+    let (before, after) = (own(before), own(after));
+    if before.is_null() || after.is_null() {
+        return Value::Null;
+    }
+    fields(&CHANGED, &before, &after)
+}
+
+/// The changed ones of the named fields: lists as the items added and
+/// removed, objects field by field, other values as both.
+fn fields(names: &[&str], before: &Value, after: &Value) -> Value {
+    let mut out = Map::new();
+    for name in names {
+        let (b, a) = (&before[*name], &after[*name]);
+        let change = match (b, a) {
+            (Value::Array(old), Value::Array(new)) => {
+                let added: Vec<&Value> = new.iter().filter(|v| !old.contains(v)).collect();
+                let removed: Vec<&Value> = old.iter().filter(|v| !new.contains(v)).collect();
+                let mut change = Map::new();
+                for (key, items) in [("added", added), ("removed", removed)] {
+                    if !items.is_empty() {
+                        change.insert(key.into(), json!(items));
+                    }
+                }
+                Value::Object(change)
+            }
+            (Value::Object(old), Value::Object(new)) => {
+                let inner: std::collections::BTreeSet<&str> =
+                    old.keys().chain(new.keys()).map(String::as_str).collect();
+                fields(&inner.into_iter().collect::<Vec<_>>(), b, a)
+            }
+            _ if b == a => continue,
+            _ => json!({"before": b, "after": a}),
+        };
+        if change.as_object().is_none_or(|c| !c.is_empty()) {
+            out.insert((*name).into(), change);
+        }
+    }
+    Value::Object(out)
+}
+
+/// The task fields the model reads. Message evidence is ids only; a
+/// summary that merely cuts the description short is left out.
+pub fn task_brief(t: &Value) -> Value {
+    let mut brief = pick(
+        t,
+        &[
+            "id",
+            "title",
+            "description",
+            "summary",
+            "status",
+            "tags",
+            "due",
+            "blocker",
+            "waiting_for",
+            "archive_note",
+            "evidence",
+            "updated",
+        ],
+    );
+    if t["summary_fallback"] == true {
+        brief.as_object_mut().map(|b| b.remove("summary"));
+    }
+    brief
 }
 
 pub fn new_id() -> String {
@@ -258,12 +338,12 @@ pub async fn handle(ctx: &Arc<Ctx>, method: &str, p: Value) -> Result<Value> {
 pub fn spawn(ctx: &Arc<Ctx>) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        let mut changes = ctx.db.subscribe();
-        let mut pruned = i64::MIN;
+        let mut changes = ctx.db.changes();
+        let mut pruned: Option<i64> = None;
         loop {
             let at = time::now();
-            if at - pruned >= time::HOUR {
-                pruned = at;
+            if pruned.is_none_or(|p| at - p >= time::HOUR) {
+                pruned = Some(at);
                 let days = ctx.config.get().message_retention_days;
                 let _ = ctx.db.prune_archive(days, at).await;
             }

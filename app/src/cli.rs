@@ -41,7 +41,7 @@ pub fn skill(root: &Path) -> Value {
     json!({"text":format!("{}\n\n## 当前实例的 CLI\n\n以下路径和根目录对应当前打开的拾事。后续命令沿用此入口和 `--root`，将 `--help` 替换为业务命令。\n\n```powershell\n& '{}' --root '{}' --help\n```\n", include_str!("../../docs/skills/shishi-cli/SKILL.md"), path, root)})
 }
 
-const HELP: &str = "拾事 CLI\n\nshishi.exe backend start|status|stop [--force]\nshishi.exe ui open|close [--force]\nshishi.exe methods\nshishi.exe tasks list [--params JSON]\nshishi.exe tasks get <事项ID>\nshishi.exe memory read\nshishi.exe memory save --input <JSON文件>\nshishi.exe call <页面业务方法> [--params JSON | --input <JSON文件或->]\nshishi.exe job <操作编号>\n\n全局：--root <安装/隔离目录>，--version，--help\n普通命令自动启动并保持后台；backend stop 释放 CLI 常驻标识。\n输出为 UTF-8 JSON；--input - 从标准输入读取 JSON，避免命令行转义。\n长操作可用 call ai_job_start 提交，再用 job 查询，不重复提交。\n退出默认保留另一端，只有 --force 或明确回答 y 才同时关闭。\n不带命令启动图形界面。";
+const HELP: &str = "拾事 CLI\n\nshishi.exe backend start|status|stop [--force]\nshishi.exe ui open|close [--force]\nshishi.exe methods\nshishi.exe tasks list [--params JSON]\nshishi.exe tasks get <事项ID>\nshishi.exe handling brief <处置ID>\nshishi.exe memory read\nshishi.exe memory save --input <JSON文件>\nshishi.exe call <页面业务方法> [--params JSON | --input <JSON文件或->]\nshishi.exe job <操作编号>\n\n全局：--root <安装/隔离目录>，--version，--help\n普通命令自动启动并保持后台；backend stop 释放 CLI 常驻标识。\nhandling brief 输出 UTF-8 原文，其余命令输出 JSON；--input - 从标准输入读取 JSON，避免命令行转义。\n长操作可用 call ai_job_start 提交，再用 job 查询，不重复提交。\n退出默认保留另一端，只有 --force 或明确回答 y 才同时关闭。\n不带命令启动图形界面。";
 
 /// Options of the desktop and helper modes that take a value.
 const DESKTOP_VALUES: [&str; 5] = ["--root", "--ui-dir", "--analysis-submit-mcp", "--apply-update", "--data-transfer"];
@@ -333,6 +333,11 @@ fn run(o: Options) -> Result<Value, String> {
             p["id"] = json!(id);
             "task_get"
         }
+        ["handling", "brief", id] => {
+            p["run_id"] = json!(id);
+            p["thread_id"] = json!(std::env::var("CODEX_THREAD_ID").ok());
+            "handling_brief"
+        }
         ["memory", "read"] => "memory_read",
         ["memory", "save"] => "memory_save",
         ["job", id] => {
@@ -374,6 +379,7 @@ fn run(o: Options) -> Result<Value, String> {
 pub fn main(args: Vec<String>) -> i32 {
     #[cfg(windows)]
     attach_console();
+    let mut brief = false;
     let result = parse(args).and_then(|o| {
         if o.words.is_empty() || o.words == ["help"] {
             println!("{HELP}");
@@ -383,9 +389,11 @@ pub fn main(args: Vec<String>) -> i32 {
             println!("{}", env!("CARGO_PKG_VERSION"));
             return Ok(None);
         }
+        brief = o.words[0] == "handling";
         run(o).map(Some)
     });
     match result {
+        Ok(Some(value)) if brief => println!("{}", value.as_str().unwrap()),
         Ok(Some(value)) => println!("{}", serde_json::to_string_pretty(&json!({"ok":true,"data":value})).unwrap()),
         Ok(None) => {}
         Err(error) => {

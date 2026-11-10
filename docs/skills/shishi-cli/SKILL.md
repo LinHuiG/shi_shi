@@ -19,7 +19,7 @@ PowerShell 使用 `& '<安装目录>\shishi.exe' <命令>` 调用，并捕获输
 & '<安装目录>\shishi.exe' methods
 ```
 
-普通命令输出 UTF-8 JSON，先检查 `ok`，结果在 `data`，失败原因在 `error`。失败退出码为 1；`--help`、`--version` 输出文本。事项列表按 `limit`／`offset` 分页，可用 `focus` 筛选待处理、处理中、被阻塞、延后处理；界面 `#编号` 可搜索，但修改时必须用返回的真实 `id`。
+普通命令输出UTF-8 JSON，先检查`ok`，结果在`data`，失败原因在`error`。失败退出码为1；`--help`、`--version`和成功的`handling brief <处置ID>`输出文本。`handling brief`读取处置说明，并在存在`CODEX_THREAD_ID`时绑定当前Codex会话；失败仍返回JSON。事项列表按`limit`／`offset`分页，可用`focus`筛选待处理、处理中、被阻塞、延后处理；界面`#编号`可搜索，但修改时必须用返回的真实`id`。
 
 ## 修改与长操作
 

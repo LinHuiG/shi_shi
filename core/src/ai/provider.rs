@@ -222,6 +222,7 @@ impl ToolHandler for Tools<'_, '_> {
     }
 
     fn validate_output(&mut self, value: &mut Value) -> std::result::Result<(), ValidationError> {
+        super::schema::check(&self.job.kind, value)?;
         let Some(context) = self.context.as_deref_mut() else { return Ok(()) };
         let had = value.get("_analysis_degraded").is_some();
         context.validate_output(&self.job.kind, value)?;
@@ -330,6 +331,11 @@ pub fn tool_loop(
             if let Some(Err(error)) = job.session.as_ref().map(|s| s.record_rejection(&value)) {
                 event(Event::Stream { kind: "diagnostic".into(), text: error.0 });
             }
+            record_response(trace, value, secret, true);
+        }
+        ApiEvent::OutputRejected(value) => {
+            let text = format!("结果未通过校验，已交回模型修正：{}", value["error"].as_str().unwrap_or(""));
+            event(Event::Stream { kind: "diagnostic".into(), text });
             record_response(trace, value, secret, true);
         }
         _ => {}

@@ -803,6 +803,21 @@ fn fail<T>(kind: ApiErrorKind) -> Result<T, ApiError> {
     Err(ApiError::simple(kind))
 }
 
+/// The final result of a reply without tool calls, after the schema and the
+/// handler's business checks.
+fn accept(reply: &ModelReply, schema: &Value, handler: &mut dyn ToolHandler) -> Result<Value, ApiError> {
+    let schema_error = |e| ApiError::with(ApiErrorKind::SchemaInvalid, e);
+    if let Some(error) = &reply.output_error {
+        return Err(schema_error(ValidationError::new("$", error)));
+    }
+    let content = reply.message["content"].as_str().ok_or_else(|| ApiError::simple(ApiErrorKind::EmptyResponse))?;
+    let value =
+        serde_json::from_str::<Value>(content.trim()).map_err(|_| ApiError::simple(ApiErrorKind::InvalidJson))?;
+    let mut value = validate_output(schema, value).map_err(schema_error)?;
+    handler.validate_output(&mut value).map_err(schema_error)?;
+    Ok(value)
+}
+
 fn close_tools(messages: &mut Vec<Value>, reason: &str) {
     messages.push(json!({"role":"user","content":format!("{reason} No further tools are available for this analysis. Return the final JSON required by the schema using the information already provided. State any missing evidence honestly; do not invent results or repeat operations.")}));
 }
@@ -838,7 +853,7 @@ fn run(
         initial_request_body(request.model, request.reasoning_effort, request.prompt, request.schema, request.tools);
     let (handler, limit) = (request.tool_handler, request.continuation_limit);
     let (mut used, mut first) = (0usize, true);
-    let (mut fallback, mut corrected, mut final_only) = (false, false, false);
+    let (mut fallback, mut corrected, mut revised, mut final_only) = (false, false, false, false);
     let (mut seen_calls, mut seen_ids) = (BTreeSet::<String>::new(), BTreeSet::<String>::new());
     loop {
         alive()?;
@@ -869,21 +884,31 @@ fn run(
         if reply.finish_reason.as_deref() == Some("length") {
             return fail(ApiErrorKind::Truncated);
         }
-        if let Some(error) = &reply.output_error {
-            return Err(ApiError::with(ApiErrorKind::SchemaInvalid, ValidationError::new("$", error)));
-        }
         let messages = body["messages"].as_array_mut().unwrap();
         if reply.tool_calls.is_empty() {
-            let content =
-                reply.message["content"].as_str().ok_or_else(|| ApiError::simple(ApiErrorKind::EmptyResponse))?;
             event(ApiEvent::Phase("校验结果"));
-            let value = serde_json::from_str::<Value>(content.trim())
-                .map_err(|_| ApiError::simple(ApiErrorKind::InvalidJson))?;
-            let schema_error = |e| ApiError::with(ApiErrorKind::SchemaInvalid, e);
-            let mut value = validate_output(request.schema, value).map_err(schema_error)?;
-            handler.validate_output(&mut value).map_err(schema_error)?;
-            alive()?;
-            return Ok(AnalysisOutput { value, usage: *usage });
+            let rejected = match accept(&reply, request.schema, handler) {
+                Ok(value) => {
+                    alive()?;
+                    return Ok(AnalysisOutput { value, usage: *usage });
+                }
+                Err(e) => e,
+            };
+            // One correction: the rejected reply and its error go back to the model.
+            let chars = message_input_chars(&reply.message) + 1;
+            if revised
+                || rejected.kind == ApiErrorKind::EmptyResponse
+                || limit.is_some_and(|l| chars > l.saturating_sub(used))
+            {
+                return Err(rejected);
+            }
+            let reason = rejected.detail.clone().unwrap_or_else(|| "the reply was not one valid JSON object".into());
+            event(ApiEvent::OutputRejected(json!({"response":reply.message,"error":reason})));
+            event(ApiEvent::Phase("结果未通过校验，等待模型修正"));
+            (revised, final_only, used) = (true, true, used + chars);
+            messages.push(reply.message.clone());
+            messages.push(json!({"role":"user","content":format!("The result above was rejected and nothing was applied: {reason}. Return the complete corrected final JSON that satisfies the schema and every rule of the task. No further tools are available; do not invent evidence.")}));
+            continue;
         }
 
         // A final-only turn cannot reopen tools; call ids never replay.

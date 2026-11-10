@@ -169,7 +169,8 @@ async fn task_count(ctx: &Ctx) -> i64 {
 fn create(source: &str, title: &str) -> Value {
     json!({"actions": [{
         "action": "create", "sources": [source], "confidence": 0.8, "reason": "合成测试",
-        "fields": [{"field": "title", "value": title}, {"field": "status", "value": "待处理"}],
+        "fields": [{"field": "title", "value": title}, {"field": "description", "value": "合成描述"},
+            {"field": "status", "value": "待处理"}],
         "tag_changes": [],
     }], "no_action_reason": ""})
 }
@@ -224,14 +225,6 @@ async fn unadopted_sources_stay_pending_for_retry() {
     let r = manual(&ctx, &m).await.unwrap();
     assert_eq!(r["applied"], 0);
     assert!(!pending(&ctx, "m1").await);
-    // An action with a blank title is not adopted: its source is retried.
-    put(&ctx, message("m2", "另一条", time::now())).await;
-    let m = Stub::new(&ctx).ok(create("m2", " ")).arc();
-    let r = manual(&ctx, &m).await.unwrap();
-    assert_eq!(r["applied"], 0);
-    assert_eq!(r["remaining"], 1);
-    assert!(pending(&ctx, "m2").await);
-    assert_eq!(column(&ctx, "m2", "error_hash").await, column(&ctx, "m2", "content_hash").await);
 }
 
 #[tokio::test]

@@ -11,6 +11,8 @@ pub struct Fake {
     /// The turns run: text, cwd, model and effort.
     pub turns: Mutex<Vec<(String, String, String, String)>>,
     pub opened: Mutex<Vec<String>>,
+    pub composed: Mutex<Vec<(PathBuf, String)>>,
+    pub projects_error: Mutex<bool>,
     /// A run blocks until released when set.
     pub hold: Mutex<Option<mpsc::Receiver<()>>>,
 }
@@ -22,12 +24,19 @@ impl Backends for Backend {
         Ok(Box::new(Handle(self.0.clone())))
     }
     fn projects(&self, driver: &str) -> Result<Vec<Value>> {
+        if *self.0.projects_error.lock().unwrap() {
+            return Err(Error::new("项目目录不可读"));
+        }
         Ok(vec![
             json!({"id": format!("{driver}:p"), "name": format!("{driver} 项目"), "cwd": format!("/synthetic/{driver}")}),
         ])
     }
     fn open(&self, _: &Connection, thread: &str) -> Result<()> {
         self.0.opened.lock().unwrap().push(thread.into());
+        Ok(())
+    }
+    fn compose(&self, cwd: &Path, prompt: &str) -> Result<()> {
+        self.0.composed.lock().unwrap().push((cwd.into(), prompt.into()));
         Ok(())
     }
 }

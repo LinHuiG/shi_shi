@@ -20,7 +20,7 @@ function drawMemory() {
   const card = (k) => {
     const data = memoryData[k],
       editing = kind === k,
-      caption = k === 'temporary' ? '保留本轮分析笔记，供下一轮参考' : '归档时结合操作记录，统一整理长期经验和偏好',
+      caption = k === 'temporary' ? '分析之间的交接笔记，归档时并入归档记忆后清空' : '归档时结合操作记录和临时记忆，整理长期经验和偏好',
       text = editing ? edit.text : data.text || '',
       count = [...text].length,
       countLabel = `${count} / ${data.max_chars} 字符`,

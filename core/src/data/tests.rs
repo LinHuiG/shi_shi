@@ -22,6 +22,8 @@ async fn write_commits_and_bumps_revision_but_failure_rolls_back() {
     assert_eq!(db.revision(), 1);
     let count: i64 = db.read(|c| Ok(c.query_row("SELECT count(*) FROM kv", [], |r| r.get(0))?)).await.unwrap();
     assert_eq!(count, 1);
+    db.write(|tx| Ok(tx.execute("DELETE FROM kv WHERE key = 'none'", [])?)).await.unwrap();
+    assert_eq!(db.revision(), 1);
 }
 
 #[tokio::test]

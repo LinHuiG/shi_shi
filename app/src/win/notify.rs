@@ -10,7 +10,7 @@ use tao::{
     platform::windows::{WindowBuilderExtWindows, WindowExtWindows},
     window::{Theme, Window, WindowBuilder, WindowId},
 };
-use wry::{WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
+use wry::{WebContext, WebView, WebViewBuilderExtWindows};
 
 const WIDTH: f64 = 320.;
 const HEIGHT: f64 = 140.;
@@ -40,6 +40,7 @@ impl Toast {
     fn new(
         target: &EventLoopWindowTarget<UiEvent>,
         context: &mut WebContext,
+        live: Option<&WebView>,
         proxy: EventLoopProxy<UiEvent>,
     ) -> Result<Self, String> {
         let window = WindowBuilder::new()
@@ -58,7 +59,7 @@ impl Toast {
             .map_err(|e| e.to_string())?;
         let id = window.id();
         let first = std::sync::atomic::AtomicBool::new(true);
-        let webview = WebViewBuilder::new_with_web_context(context)
+        let webview = super::window::builder(context, live)
             .with_html(html())
             .with_focused(false)
             .with_theme(wry::Theme::Dark)
@@ -105,12 +106,18 @@ impl Surface {
         count: usize,
         target: &EventLoopWindowTarget<UiEvent>,
         context: &mut WebContext,
+        live: Option<&WebView>,
         proxy: &EventLoopProxy<UiEvent>,
     ) -> Result<(), String> {
         while self.windows.len() < count.min(MAX_VISIBLE) {
-            self.windows.push(Toast::new(target, context, proxy.clone())?);
+            let toast = Toast::new(target, context, live.or(self.webview()), proxy.clone())?;
+            self.windows.push(toast);
         }
         Ok(())
+    }
+
+    pub fn webview(&self) -> Option<&WebView> {
+        self.windows.first().map(|t| &t.webview)
     }
 
     pub fn contains(&self, id: WindowId) -> bool {

@@ -5,26 +5,64 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use super::{pick, Mode, Model, MorningJob, Prepared};
+use super::{event, task_brief, Measured, Mode, Model, MorningJob, Prepared};
 use crate::ai::prompt::require_purpose;
 use crate::{exec, time, Ctx, Error, Result};
 
-/// What the report model reads.
-pub fn request(r: &Value, mode: Mode) -> Prepared {
-    let tasks: Vec<Value> = r["tasks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|t| {
-            pick(t, &["id", "title", "description", "status", "tags", "due", "blocker", "waiting_for", "archive_note"])
+/// Days of changes a report keeps however large its delta grows.
+const KEPT_DAYS: i64 = 7;
+
+/// What the report model reads: the tasks and the delta from row `from` on.
+/// It cannot read messages, so it gets no message ids.
+pub fn request(r: &Value, mode: Mode, from: usize) -> Prepared {
+    let rows = |section: &str| r[section].as_array().map_or(&[][..], Vec::as_slice);
+    let tasks: Vec<Value> = rows("tasks").iter().map(|t| without(task_brief(t), "evidence")).collect();
+    let delta: Vec<Value> = rows("delta")
+        .iter()
+        .skip(from)
+        .map(|e| {
+            let mut e = event(e);
+            e["changes"] = without(e["changes"].take(), "evidence");
+            e
         })
         .collect();
     Prepared {
         purpose: "report",
         payload: json!({
-            "report_tasks": tasks, "delta": r["delta"], "label": r["label"], "time": time::stamp(time::now()),
+            "report_tasks": tasks, "delta": delta, "label": r["label"], "time": time::stamp(time::now()),
             "_trigger": if mode == Mode::Manual { "manual_report" } else { "scheduled_report" },
         }),
+    }
+}
+
+fn without(mut v: Value, key: &str) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        o.remove(key);
+    }
+    v
+}
+
+/// The request with as much of the newest delta as fits `limit`: whole days
+/// go oldest first, never the last [`KEPT_DAYS`]. One still too large is
+/// sent as it is, for the call layer to reject and log. Returns it with the
+/// number of rows left out.
+fn fit(model: &dyn Model, r: &Value, mode: Mode, limit: usize) -> Result<(Measured<Prepared>, usize)> {
+    let days: Vec<String> = r["delta"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .map(|e| time::date_from(e["time"].as_i64().unwrap_or(0)))
+        .collect();
+    let kept = time::date_from(r["time"].as_i64().unwrap_or(0) - (KEPT_DAYS - 1) * time::DAY);
+    let mut from = 0;
+    loop {
+        let measured = model.measure(request(r, mode, from))?;
+        match days.get(from) {
+            Some(day) if measured.total > limit && *day < kept => {
+                from += days[from..].iter().take_while(|d| *d == day).count();
+            }
+            _ => return Ok((measured, from)),
+        }
     }
 }
 
@@ -52,9 +90,15 @@ async fn summarize(ctx: &Ctx, model: &dyn Model, mut r: Value, mode: Mode) -> Re
     let result = match super::archive_blocks(ctx).await {
         Err(e) => Err(e),
         Ok(()) => {
-            let timeout = Duration::from_secs(ctx.config.get().ai_timeout_seconds.max(1));
-            match model.measure(request(&r, mode)) {
-                Ok(measured) => super::ask(ctx, model, measured, timeout).await,
+            let config = ctx.config.get();
+            let timeout = Duration::from_secs(config.ai_timeout_seconds.max(1));
+            match fit(model, &r, mode, config.max_input_chars) {
+                Ok((measured, omitted)) => {
+                    if omitted > 0 {
+                        r["delta_omitted"] = json!(omitted);
+                    }
+                    super::ask(ctx, model, measured, timeout).await
+                }
                 Err(e) => Err(e),
             }
         }

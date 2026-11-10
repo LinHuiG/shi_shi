@@ -1,6 +1,6 @@
 //! System prompts and AI memory. Prompts are versioned in the database;
-//! `config/prompts.json` only seeds the first version and supplies the fixed
-//! protocol fragments. The AI never adopts a prompt by itself: a stored
+//! `config/prompts.json` supplies the fixed protocol fragments and the
+//! built-in versions, which replace only a built-in version on upgrade. The AI never adopts a prompt by itself: a stored
 //! suggestion only changes the active prompt through `prompt_adopt`.
 
 pub mod learning;

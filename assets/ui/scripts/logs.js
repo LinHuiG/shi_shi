@@ -182,10 +182,6 @@ function logEntry(a) {
     title = '继续上次未完成工作';
     body = `待生成 ${d.tasks} 个事项${d.scan ? ' · 重新扫描' : ''}${d.analysis ? ' · 重新分析' : ''}`;
   }
-  if (a.kind === 'migration') {
-    title = '1.1.68数据迁移';
-    body = [d.message, ...d.skipped].join('；');
-  }
   if (a.kind === 'scan_clock') body = d.message;
   if (a.kind === 'scan') {
     const errors = d.errors;

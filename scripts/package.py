@@ -34,13 +34,10 @@ def build():
     env = dict(os.environ)
     if TRIPLE:
         env.setdefault("WINDRES", "x86_64-w64-mingw32-windres")
-    # Separate builds, so the migration tool's `import` feature stays out of
-    # shishi.exe.
-    for package in ["shishi", "shishi-migrate"]:
-        cmd = ["cargo", "build", "--release", "--locked", "-p", package]
-        if TRIPLE:
-            cmd += ["--target", TRIPLE]
-        subprocess.run(cmd, cwd=ROOT, env=env, check=True)
+    cmd = ["cargo", "build", "--release", "--locked", "-p", "shishi"]
+    if TRIPLE:
+        cmd += ["--target", TRIPLE]
+    subprocess.run(cmd, cwd=ROOT, env=env, check=True)
 
 
 def loader(release):
@@ -60,7 +57,6 @@ def main():
     stage.mkdir(parents=True)
     files = {
         "shishi.exe": release / "shishi.exe",
-        "shishi-migrate.exe": release / "shishi-migrate.exe",
         "WebView2Loader.dll": loader(release),
         "shishi.ico": ROOT / "assets/shishi.ico",
         "README.txt": ROOT / "README.txt",

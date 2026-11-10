@@ -2,6 +2,7 @@
 //! retrieval tool declarations. Field order is part of the model contract.
 
 use serde_json::{json, Value};
+use shishi_api::schema_validate::ValidationError;
 
 use crate::prompts::memory::{ARCHIVED_LIMIT, TEMPORARY_LIMIT};
 
@@ -79,6 +80,61 @@ pub fn schema(kind: &str) -> Value {
         });
     }
     schema
+}
+
+/// Rules of a purpose's result that the schema cannot state. A violation
+/// goes back to the model for its one correction.
+pub fn check(kind: &str, value: &Value) -> Result<(), ValidationError> {
+    let text = |path: String, value: &Value, field: &str| match value.as_str().map(str::trim) {
+        Some("") | None => Err(ValidationError::new(path, format!("{field} must not be blank"))),
+        Some(t) if field == "title" && t.chars().count() > 200 => {
+            Err(ValidationError::new(path, "title must be at most 200 characters"))
+        }
+        _ => Ok(()),
+    };
+    let rows = |key: &str| value[key].as_array().into_iter().flatten().enumerate();
+    match kind {
+        "classify" => {
+            for (i, action) in rows("actions") {
+                text(format!("$.actions[{i}].reason"), &action["reason"], "reason")?;
+                let fields = action["fields"].as_array().map(Vec::as_slice).unwrap_or_default();
+                for field in ["title", "description"] {
+                    match fields.iter().position(|c| c["field"] == field) {
+                        Some(j) => text(format!("$.actions[{i}].fields[{j}].value"), &fields[j]["value"], field)?,
+                        None if action["action"] == "create" => {
+                            return Err(ValidationError::new(
+                                format!("$.actions[{i}].fields"),
+                                format!("a create action must set {field}"),
+                            ))
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
+        "format" => {
+            for (i, task) in rows("tasks") {
+                for field in ["title", "description"] {
+                    text(format!("$.tasks[{i}].{field}"), &task[field], field)?;
+                }
+            }
+        }
+        "edit" => {
+            text("$.reason".into(), &value["reason"], "reason")?;
+            for (i, change) in rows("changes") {
+                if let Some(field) = change["field"].as_str().filter(|f| ["title", "description"].contains(f)) {
+                    text(format!("$.changes[{i}].value"), &change["value"], field)?;
+                }
+            }
+        }
+        "schedule" if value["error"].as_str().unwrap_or("").trim().is_empty() => {
+            text("$.schedule.description".into(), &value["schedule"]["description"], "description")?;
+            crate::tasks::schedule::parse(&value["schedule"])
+                .map_err(|e| ValidationError::new("$.schedule", e.to_string()))?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn all_required_object(properties: Value) -> Value {

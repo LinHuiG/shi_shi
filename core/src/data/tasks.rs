@@ -35,7 +35,7 @@ impl Db {
             let rows = super::archive::audits(c, &tail)?;
             Ok(rows
                 .into_iter()
-                .map(|a| (a.task_id, a.before, a.after, a.change_summary.as_str().unwrap_or("").to_owned()))
+                .map(|a| (a.task_id, a.before, a.after, a.change_summary))
                 .collect())
         })
         .await
@@ -543,6 +543,7 @@ pub fn ai_edit_prepare(conn: &Connection, v: &Value) -> Result<AiEdit> {
 /// while the model was working.
 pub fn ai_edit_complete(conn: &Connection, edit: AiEdit, result: &Value) -> Result<Value> {
     let AiEdit { original, mut draft, text, .. } = edit;
+    let submitted = draft.clone();
     let changes = result["changes"].as_array().ok_or("AI结果缺少修改内容")?;
     let mut fields = BTreeSet::new();
     for change in changes {
@@ -561,6 +562,12 @@ pub fn ai_edit_complete(conn: &Connection, edit: AiEdit, result: &Value) -> Resu
     let (groups, _) = super::tags::catalog(conn)?;
     let catalog = tags::result_catalog(&groups, result);
     draft.tags = tags::apply_changes(&draft.tags, &result["tag_changes"], &catalog, true)?;
+    let reason = result["reason"].as_str().unwrap_or("").trim();
+    // The form's own edits are not saved without an AI change either.
+    if draft == submitted {
+        let why = if reason.is_empty() { String::new() } else { format!("：{reason}") };
+        crate::bail!("AI未修改事项，原事项和表单改动均未保存{why}");
+    }
     tags::sanitize(&mut draft, Some(&original), &catalog);
     draft.updated = bump(original.updated);
     if draft.title != original.title || draft.description != original.description {
@@ -580,7 +587,7 @@ pub fn ai_edit_complete(conn: &Connection, edit: AiEdit, result: &Value) -> Resu
     draft.suggested_project_id = result["suggested_project_id"].as_str().unwrap_or("").into();
     draft.suggested_project_reason = result["suggested_project_reason"].as_str().unwrap_or("").into();
     draft.manual = true;
-    draft.reason = result["reason"].as_str().unwrap_or("根据你的修改说明更新").chars().take(1000).collect();
+    draft.reason = reason.chars().take(1000).collect();
     let task = store(conn, &draft)?;
     super::tools::link_tool_calls(conn, result, std::slice::from_ref(&task.id))?;
     audit::write(
@@ -655,9 +662,6 @@ pub fn generation_complete(conn: &Connection, draft: &Task, result: Result<Value
         let mut tasks = Vec::new();
         for row in rows {
             let mut t: Task = from_json(row)?;
-            if t.title.trim().is_empty() {
-                crate::bail!("AI生成了空标题，请重试");
-            }
             if !t.due.is_empty() && model::deadline_ms(&t.due).is_none() {
                 t.due.clear();
             }

@@ -22,7 +22,8 @@ use windows_sys::Win32::Security::Cryptography::{
 const MAX_CONNECTION_ID_BYTES: usize = 128;
 const MAX_SECRET_BYTES: usize = 4096;
 const MAX_ENV_NAME_BYTES: usize = 64;
-/// The entropy of 1.1.68's store, kept so its file can still be decrypted.
+/// Every stored secret is sealed with this entropy; changing it makes them
+/// unreadable.
 #[cfg_attr(not(windows), allow(dead_code))]
 const DPAPI_ENTROPY: &[u8] = b"ShiShi/credential-store/v1";
 
@@ -131,12 +132,6 @@ pub(crate) fn open(sealed: &[u8]) -> Result<ResolvedCredential, CredentialError>
         return Err(CredentialError::new(CredentialErrorKind::CorruptEntry));
     }
     Ok(ResolvedCredential { secret })
-}
-
-/// Decrypt bytes protected by 1.1.68's credential store (the install
-/// migration reads `credentials.bin` with it).
-pub fn unprotect(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-    unprotect_bytes(ciphertext).map_err(|e| e.to_string())
 }
 
 pub(crate) fn validate_connection_id(connection_id: &str) -> Result<(), CredentialError> {

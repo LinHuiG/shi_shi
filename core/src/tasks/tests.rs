@@ -430,7 +430,19 @@ fn ai_halves_validate_and_commit() {
     assert_eq!(prepared.request["user_instruction"], "改成已完成");
     let result = json!({"changes": [{"field": "status", "value": "已完成"}], "tag_changes": [], "reason": "按说明"});
     edit::ai_edit_complete(&c, prepared, &result).unwrap();
-    assert_eq!(get(&c, &t.id).status, "已完成");
+    assert_eq!((get(&c, &t.id).status.as_str(), get(&c, &t.id).reason.as_str()), ("已完成", "按说明"));
+    // Without an AI change nothing is saved, the form's own edits included.
+    for changes in [json!([]), json!([{"field": "status", "value": "已完成"}])] {
+        let mut form = get(&c, &t.id).payload();
+        form["description"] = json!("表单里改的描述");
+        let prepared = edit::ai_edit_prepare(&c, &json!({"task": form, "text": "查一下进度"})).unwrap();
+        let result = json!({"changes": changes, "tag_changes": [], "reason": "没有可用的查询结果"});
+        let e = edit::ai_edit_complete(&c, prepared, &result).unwrap_err().0;
+        assert_eq!(e, "AI未修改事项，原事项和表单改动均未保存：没有可用的查询结果");
+        assert_eq!(get(&c, &t.id).description, "");
+    }
+    let scope = crate::state::Scope::from(&json!({"selected_task": t.id}));
+    assert_eq!(query::snapshot_rows(&c, &scope).unwrap()[0]["origin"], "manual_edit");
     let stale = edit::ai_edit_prepare(&c, &json!({"task": get(&c, &t.id).payload(), "text": "改回"})).unwrap();
     let now = get(&c, &t.id);
     crate::data::tasks::edit(&c, &json!({"task": {"id": t.id, "updated": now.updated, "title": "写新方案"}})).unwrap();
@@ -520,12 +532,16 @@ fn runtime_ai_methods_call_the_model_and_persist() {
     let t = rt.call("edit", json!({"task": {"title": "旧标题", "status": "待处理"}})).unwrap();
     let id = t["id"].as_str().unwrap().to_string();
     let fake = Fake::new(vec![
-        reply(json!({"changes": [{"field": "title", "value": "新标题"}], "tag_changes": [],
+        reply(json!({"reason": "按说明改标题", "changes": [{"field": "title", "value": "新标题"}], "tag_changes": [],
             "tag_suggestions": [{"kind": "客户", "value": "甲方", "reason": "说明里提到", "evidence_ids": ["input"]},
                 {"kind": "客户", "value": "乙方", "reason": "无据", "evidence_ids": ["audit:9"]}]})),
-        reply(json!({"schedule": {"title": "日报", "frequency": "daily", "time": "09:00"}})),
+        reply(
+            json!({"schedule": {"title": "日报", "description": "写当天日报", "frequency": "daily", "time": "09:00"}}),
+        ),
         reply(json!({"title": "新规则", "rule": "先看截止", "reason": "按批复"})),
-        reply(json!({"tasks": [{"title": "开会"}, {"title": "写纪要"}]})),
+        reply(
+            json!({"tasks": [{"title": "开会", "description": "明天开会"}, {"title": "写纪要", "description": "会后写纪要"}]}),
+        ),
     ]);
     rt.ctx.ai.set_driver(Some(fake.clone()));
 

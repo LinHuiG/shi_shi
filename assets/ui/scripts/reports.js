@@ -48,7 +48,7 @@ function reportPart(r, section, title, unit) {
 function reportCard(r) {
   const ai = r.ai_summary,
     count = (status) => r.status_counts?.[status] ?? 0;
-  return `<div class="report-body">${r.remaining_events ? `<p class="helper archive-coverage">本批已提交，仍有${r.remaining_events}条变更待处理；请以最近一次归档状态为准。</p>` : ''}<p class="helper">本批归档${r.archived_tasks || 0}个事项${r.skipped_tasks ? ` · ${r.skipped_tasks}个事项处理期间发生变化，保留到下次归档` : ''}</p><div class="report-counts"><span><b>${count('待处理')}</b> 待处理</span><span><b>${count('处理中')}</b> 处理中</span><span><b>${count('已完成')}</b> 已完成</span><span>${reportCount(r, 'delta')}条新增变更</span></div><section class="report-summary"><div class="row"><h3>AI汇总</h3><span class="tiny">${r.summary_status === 'reused' ? '无新增变化 · 沿用上次汇总' : ''}</span></div>${
+  return `<div class="report-body">${r.remaining_events ? `<p class="helper archive-coverage">本批已提交，仍有${r.remaining_events}条变更待处理；请以最近一次归档状态为准。</p>` : ''}${r.delta_omitted ? `<p class="helper">变更超出输入上限，最早的${r.delta_omitted}条未交给AI汇总。</p>` : ''}<p class="helper">本批归档${r.archived_tasks || 0}个事项${r.skipped_tasks ? ` · ${r.skipped_tasks}个事项处理期间发生变化，保留到下次归档` : ''}</p><div class="report-counts"><span><b>${count('待处理')}</b> 待处理</span><span><b>${count('处理中')}</b> 处理中</span><span><b>${count('已完成')}</b> 已完成</span><span>${reportCount(r, 'delta')}条新增变更</span></div><section class="report-summary"><div class="row"><h3>AI汇总</h3><span class="tiny">${r.summary_status === 'reused' ? '无新增变化 · 沿用上次汇总' : ''}</span></div>${
     ai
       ? `<p class="summary-lead">${esc(ai.summary)}</p><div class="report-columns">${[
           ['completed', '已完成', 'green'],

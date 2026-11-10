@@ -444,7 +444,7 @@ pub fn spawn(ctx: &std::sync::Arc<crate::Ctx>) {
     let boundary = ctx.clone();
     tokio::spawn(async move {
         let ctx = boundary;
-        let mut changes = ctx.db.subscribe();
+        let mut changes = ctx.db.changes();
         let mut previous: Option<i64> = None;
         let mut failed_since: Option<i64> = None;
         loop {

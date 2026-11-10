@@ -205,7 +205,7 @@ const names = {
   tasks: '事项',
   review: '回顾',
   schedules: '回顾',
-  inbox: '消息收件箱',
+  inbox: '消息',
   reports: '回顾',
   learning: '回顾',
   logs: '系统日志',

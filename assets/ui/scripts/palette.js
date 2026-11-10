@@ -76,7 +76,7 @@ function openPalette() {
   panel.setAttribute('role', 'dialog');
   panel.setAttribute('aria-label', '命令面板');
   panel.innerHTML =
-    '<input id="palette-input" role="combobox" aria-expanded="true" aria-controls="palette-list" autocomplete="off" placeholder="输入命令，例如：新建、收件箱、归档"><ul id="palette-list" role="listbox"></ul>';
+    '<input id="palette-input" role="combobox" aria-expanded="true" aria-controls="palette-list" autocomplete="off" placeholder="输入命令，例如：新建、消息、归档"><ul id="palette-list" role="listbox"></ul>';
   document.body.append(panel);
   paletteIndex = 0;
   renderPalette();
@@ -168,7 +168,8 @@ document.addEventListener(
 for (const [i, p] of pageOrder.entries()) {
   const b = document.querySelector(`aside [data-page="${p}"]`);
   if (b) {
-    b.title = `${names[p]}（Ctrl+${i + 1}）`;
+    b.dataset.tooltip = `${names[p]}（Ctrl+${i + 1}）`;
+    b.setAttribute('aria-label', names[p]);
     b.setAttribute('aria-keyshortcuts', `Control+${i + 1}`);
   }
 }

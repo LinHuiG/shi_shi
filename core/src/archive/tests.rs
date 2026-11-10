@@ -17,13 +17,15 @@ use crate::{dispatch, exec, Config, Ctx, Db};
 type Edit = Box<dyn FnOnce(&Connection) -> Result<()> + Send>;
 
 /// A model that answers from a queue, records every request, can run an
-/// edit while "thinking" and accepts at most `max_evidence` evidence rows.
+/// edit while "thinking" and accepts at most `max_evidence` evidence rows
+/// and `max_delta` report changes.
 #[derive(Default)]
 struct Stub {
     replies: Mutex<VecDeque<Result<Value>>>,
     seen: Mutex<Vec<Prepared>>,
     edits: Mutex<VecDeque<Option<Edit>>>,
     max_evidence: Option<usize>,
+    max_delta: Option<usize>,
     db: Option<Db>,
 }
 
@@ -51,7 +53,9 @@ impl Model for Stub {
     fn measure(&self, request: Prepared) -> Result<Measured<Prepared>> {
         let n = request.payload["evidence"].as_array().map_or(0, Vec::len)
             + request.payload["current_tasks"].as_array().map_or(0, Vec::len);
-        let total = if self.max_evidence.is_none_or(|m| n <= m) { 0 } else { usize::MAX };
+        let delta = request.payload["delta"].as_array().map_or(0, Vec::len);
+        let fits = self.max_evidence.is_none_or(|m| n <= m) && self.max_delta.is_none_or(|m| delta <= m);
+        let total = if fits { 0 } else { usize::MAX };
         Ok(Measured::new(request, total))
     }
 
@@ -215,6 +219,32 @@ async fn manual_archive_may_call_the_model_only_to_consolidate_memory() {
 }
 
 #[tokio::test]
+async fn archive_merges_the_temporary_memory_then_clears_it() {
+    let ctx = ctx();
+    let temporary = |text: &'static str, expected: i64| {
+        move |c: &Connection| crate::data::prompts::replace_memory(c, "temporary", expected, text).map(drop)
+    };
+    write(&ctx, temporary("- 合成客户周五前答复", 0)).await;
+    let stub = Stub::new(&ctx).reply(Ok(json!({
+        "report": {"summary": "合并临时记忆"},
+        "_archived_memory_update": {"expected": 0, "before": "", "text": "合成客户通常周五答复"},
+    })));
+    let r = manual(&ctx, &stub).await.unwrap();
+    assert_eq!(stub.seen.lock().unwrap()[0].payload["_temporary_memory"], "- 合成客户周五前答复");
+    assert_eq!((r["memory_changes"].as_u64(), r["temporary_memory_cleared"].as_bool()), (Some(1), Some(true)));
+    let m = read(&ctx, |c| crate::data::prompts::memory(c, "temporary")).await;
+    assert_eq!((m.text.as_str(), m.revision), ("", 2));
+
+    // A note written while the model ran was not merged and is kept.
+    write(&ctx, temporary("- 合成旧笔记", 2)).await;
+    let stub = Stub::new(&ctx).during(temporary("- 合成新笔记", 3)).reply(Ok(summary("s")));
+    let r = manual(&ctx, &stub).await.unwrap();
+    assert_eq!(r["temporary_memory_cleared"], false);
+    assert_eq!(read(&ctx, |c| crate::data::prompts::memory(c, "temporary")).await.text, "- 合成新笔记");
+    assert_eq!(logs(&ctx, "archive_conflict").await[0]["kind"], "temporary_memory");
+}
+
+#[tokio::test]
 async fn all_batches_of_one_attempt_finish_in_that_attempt() {
     let ctx = ctx();
     for i in 0..5 {
@@ -304,6 +334,7 @@ async fn edits_during_the_model_call_are_skipped_and_logged_not_overwritten() {
     let ctx = ctx();
     let edited = task(&ctx, "会被改", "已完成").await;
     let kept = task(&ctx, "照常归档", "已完成").await;
+    write(&ctx, |c| crate::data::prompts::replace_memory(c, "temporary", 0, "- 合成线索").map(drop)).await;
     let id = edited.id.clone();
     let stub = Stub::new(&ctx)
         .during(move |c| {
@@ -321,7 +352,10 @@ async fn edits_during_the_model_call_are_skipped_and_logged_not_overwritten() {
     assert!(!after.archived && after.title == "人工改名", "the manual edit wins");
     assert!(get_task(&ctx, &kept.id).await.archived);
     assert_eq!(read(&ctx, |c| crate::data::prompts::memory(c, "archived")).await.text, "人工记忆");
+    // The merge did not land, so the temporary memory waits for the next archive.
+    assert_eq!(read(&ctx, |c| crate::data::prompts::memory(c, "temporary")).await.text, "- 合成线索");
     assert_eq!((r["skipped_tasks"].as_u64(), r["memory_changes"].as_u64()), (Some(1), Some(0)));
+    assert_eq!(r["temporary_memory_cleared"], false);
     let conflicts = logs(&ctx, "archive_conflict").await;
     let kinds: Vec<&str> = conflicts.iter().map(|c| c["kind"].as_str().unwrap()).collect();
     assert_eq!(kinds, ["memory", "tasks"]);
@@ -612,6 +646,140 @@ async fn report_details_are_paged_frozen_and_revision_checked() {
     assert_eq!(catalog[0]["summary_status"], "reused");
     assert_eq!(catalog[1].as_object().unwrap().keys().collect::<Vec<_>>(), ["date", "id", "label", "time"]);
     assert_ne!(read(&ctx, store::reports_revision).await, revision);
+}
+
+/// Store `t` as `change` leaves it, audited like an analysis round with
+/// its change summary.
+async fn ai_update(
+    ctx: &Ctx,
+    t: &tasks::Task,
+    summary: &'static str,
+    change: impl FnOnce(&mut tasks::Task) + Send + 'static,
+) -> tasks::Task {
+    let mut t = t.clone();
+    write(ctx, move |c| {
+        let before = t.payload();
+        change(&mut t);
+        t.updated += 1;
+        let stored = crate::data::tasks::store(c, &t)?;
+        let seq = crate::data::audit::write(c, "ai_update", &stored.id, "AI更新事项", &before, &stored.payload())?;
+        c.execute("UPDATE task_audit SET change_summary = ?2 WHERE seq = ?1", rusqlite::params![seq, summary])?;
+        Ok(stored)
+    })
+    .await
+}
+
+fn ids(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| id.to_string()).collect()
+}
+
+#[tokio::test]
+async fn reports_read_each_task_once_and_of_each_change_what_changed_without_message_ids() {
+    let ctx = ctx();
+    let t = task(&ctx, "整理周报", "待处理").await;
+    let t = ai_update(&ctx, &t, "", |t| t.evidence.direct = ids(&["m1", "m2"])).await;
+    ai_update(&ctx, &t, "开始整理周报", |t| {
+        t.status = "处理中".into();
+        t.evidence.direct.push("m3".into());
+        t.evidence.background = ids(&["b1"]);
+    })
+    .await;
+    let stub = Stub::new(&ctx).reply(Ok(json!({"summary": "周报整理中"})));
+    report_now(&ctx, &stub).await.unwrap();
+    let sent = stub.seen.lock().unwrap()[0].payload.clone();
+    let delta = sent["delta"].as_array().unwrap();
+    assert_eq!(delta.len(), 3);
+    assert!(delta.iter().all(|e| e.get("before").is_none() && e.get("after").is_none()), "no snapshots");
+    assert!(delta[0]["changes"].is_null(), "the task itself shows what a creation made");
+    assert_eq!(delta[1]["changes"], json!({}));
+    assert_eq!(delta[2]["changes"], json!({"status": {"before": "待处理", "after": "处理中"}}));
+    assert_eq!(delta[2]["change_summary"], "开始整理周报");
+    assert!(delta[2]["time"].is_string());
+    let brief = &sent["report_tasks"][0];
+    assert!(brief.get("evidence").is_none());
+    assert_eq!((brief["title"].as_str(), brief["status"].as_str()), (Some("整理周报"), Some("处理中")));
+}
+
+#[test]
+fn task_briefs_keep_a_real_summary_and_drop_a_cut_description() {
+    let t =
+        json!({"id": "t", "description": "很长的内容", "summary": "很长的…", "summary_fallback": true, "manual": true});
+    assert_eq!(task_brief(&t), json!({"id": "t", "description": "很长的内容"}));
+    let t = json!({"id": "t", "summary": "AI摘要", "summary_fallback": false});
+    assert_eq!(task_brief(&t), json!({"id": "t", "summary": "AI摘要"}));
+}
+
+#[tokio::test]
+async fn reports_start_after_the_last_archive_and_keep_an_unsummarized_delta() {
+    let ctx = ctx();
+    task(&ctx, "核对合同", "待处理").await;
+    manual(&ctx, &Stub::new(&ctx)).await.unwrap();
+    write(&ctx, |c| task_edit(c, "跟进发票")).await;
+    let only_new = |stub: &Stub| {
+        let sent = stub.seen.lock().unwrap()[0].payload.clone();
+        let delta = sent["delta"].as_array().unwrap().clone();
+        assert_eq!(delta.len(), 1, "changes before the archive stay out");
+        assert_eq!(sent["report_tasks"].as_array().unwrap().len(), 2, "open tasks are all read");
+        delta[0]["task_id"].clone()
+    };
+
+    let stub = Stub::new(&ctx).reply(Err(Error::new("模型超时")));
+    assert_eq!(report_now(&ctx, &stub).await.unwrap()["summary_status"], "failed");
+    let failed = only_new(&stub);
+    assert_eq!(cursor(&ctx, REPORT_CURSOR).await, 0, "a failed summary keeps its delta");
+
+    let stub = Stub::new(&ctx).reply(Ok(json!({"summary": "跟进发票"})));
+    assert_eq!(report_now(&ctx, &stub).await.unwrap()["summary_status"], "done");
+    assert_eq!(only_new(&stub), failed);
+    assert_eq!(cursor(&ctx, REPORT_CURSOR).await, read(&ctx, store::max_seq).await);
+    assert_eq!(report_now(&ctx, &stub).await.unwrap()["summary_status"], "reused");
+}
+
+#[tokio::test]
+async fn reports_over_the_limit_drop_whole_old_days_but_keep_the_last_seven() {
+    let ctx = ctx();
+    let now = time::now();
+    for (i, days) in [10, 10, 8, 3, 0].into_iter().enumerate() {
+        task(&ctx, &format!("事项{i}"), "待处理").await;
+        let at = now - days * time::DAY;
+        write(&ctx, move |c| {
+            c.execute("UPDATE task_audit SET time = ?1 WHERE seq = (SELECT max(seq) FROM task_audit)", [at])?;
+            Ok(())
+        })
+        .await;
+    }
+    let sent = |stub: &Stub| stub.seen.lock().unwrap()[0].payload["delta"].as_array().unwrap().len();
+
+    let stub = Stub { max_delta: Some(3), ..Stub::new(&ctx) }.reply(Err(Error::new("模型超时")));
+    let r = report_now(&ctx, &stub).await.unwrap();
+    assert_eq!(sent(&stub), 3, "the oldest day goes whole");
+    assert_eq!(r["delta_omitted"], 2);
+
+    let stub = Stub { max_delta: Some(1), ..Stub::new(&ctx) };
+    let r = report_now(&ctx, &stub).await.unwrap();
+    assert_eq!(sent(&stub), 2, "the last seven days are sent even when too large");
+    assert_eq!(r["delta_omitted"], 3);
+}
+
+#[tokio::test]
+async fn archive_events_carry_changed_fields_and_their_summaries() {
+    let ctx = ctx();
+    let t = task(&ctx, "整理周报", "待处理").await;
+    ai_update(&ctx, &t, "开始整理周报", |t| {
+        t.status = "处理中".into();
+        t.evidence.direct = ids(&["m1"]);
+    })
+    .await;
+    let stub = Stub::new(&ctx);
+    manual(&ctx, &stub).await.unwrap();
+    let sent = stub.seen.lock().unwrap()[0].payload.clone();
+    let event = &sent["evidence"][1]["event"];
+    assert_eq!(event["change_summary"], "开始整理周报");
+    assert_eq!(
+        event["changes"],
+        json!({"status": {"before": "待处理", "after": "处理中"}, "evidence": {"direct": {"added": ["m1"]}}})
+    );
+    assert_eq!(sent["report_tasks"][0]["evidence"]["direct"], json!(["m1"]));
 }
 
 #[tokio::test]

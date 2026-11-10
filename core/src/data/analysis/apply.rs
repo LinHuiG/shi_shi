@@ -217,10 +217,6 @@ impl Applier<'_> {
         model::merge_evidence(&mut t, &added);
         preserve_model_summary(&mut t);
         model::normalize(&mut t);
-        if t.title.trim().is_empty() {
-            out.retry.extend(sources);
-            return Ok(());
-        }
 
         if !updating {
             if !t.evidence.direct.iter().any(|id| self.allowed.get(id).is_some_and(Message::relevant)) {

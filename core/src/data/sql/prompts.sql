@@ -1,6 +1,6 @@
 -- prompts
 -- System prompt versions. The latest row (by rowid) of a target is the
--- policy in effect; `config/prompts.json` only seeds the first version.
+-- policy in effect; `config/prompts.json` adds the built-in versions.
 CREATE TABLE prompt_versions (
     id TEXT PRIMARY KEY,
     target TEXT NOT NULL,

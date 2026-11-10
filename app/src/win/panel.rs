@@ -1,6 +1,6 @@
 //! The tray panel: a small borderless window by the tray icon, created on
-//! the first click and kept hidden between uses. It closes when it loses
-//! focus or on Esc, and reads state only while it is shown.
+//! the first click and kept hidden between uses. It closes when it is
+//! deactivated or on Esc, and reads state only while it is shown.
 use super::{window::SOLID, UiEvent};
 use crate::{owner::Owner, placement};
 use serde_json::Value;
@@ -11,13 +11,20 @@ use std::{
 use tao::{
     dpi::{LogicalSize, PhysicalPosition, PhysicalSize},
     event_loop::{EventLoopProxy, EventLoopWindowTarget},
-    platform::windows::{MonitorHandleExtWindows, WindowBuilderExtWindows},
+    platform::windows::{MonitorHandleExtWindows, WindowBuilderExtWindows, WindowExtWindows},
     window::{Theme, Window, WindowBuilder, WindowId},
 };
-use wry::{MemoryUsageLevel, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows, WebViewExtWindows};
+use windows_sys::Win32::{
+    Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+    UI::{
+        Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
+        WindowsAndMessaging::{WA_INACTIVE, WM_ACTIVATE, WM_NCDESTROY},
+    },
+};
+use wry::{MemoryUsageLevel, WebContext, WebView, WebViewBuilderExtWindows, WebViewExtWindows};
 
 const SIZE: (f64, f64) = (360., 520.);
-/// A click on the icon that closed the panel by taking its focus must not
+/// A click on the icon that closed the panel by deactivating it must not
 /// open it again at once.
 const REOPEN_GUARD: Duration = Duration::from_millis(300);
 
@@ -36,12 +43,15 @@ pub struct Panel {
     /// Show once the page answered.
     pending: bool,
     hidden_at: Option<Instant>,
+    /// Read by `deactivated` until the window above is destroyed.
+    _proxy: Box<EventLoopProxy<UiEvent>>,
 }
 
 impl Panel {
     pub fn create(
         target: &EventLoopWindowTarget<UiEvent>,
         context: &mut WebContext,
+        live: Option<&WebView>,
         owner: &Arc<Owner>,
         proxy: &EventLoopProxy<UiEvent>,
     ) -> Result<Self, String> {
@@ -58,11 +68,13 @@ impl Panel {
             .with_inner_size(LogicalSize::new(SIZE.0, SIZE.1))
             .build(target)
             .map_err(|e| e.to_string())?;
+        let deactivate = Box::new(proxy.clone());
+        unsafe { SetWindowSubclass(window.hwnd() as _, Some(deactivated), 0, &*deactivate as *const _ as usize) };
         let html = include_str!("../../../assets/tray-panel.html")
             .replace("/* THEME */", include_str!("../../../assets/ui/styles/tokens.css"));
         let (handler, proxy) = (owner.clone(), proxy.clone());
         let first = std::sync::atomic::AtomicBool::new(true);
-        let webview = WebViewBuilder::new_with_web_context(context)
+        let webview = super::window::builder(context, live)
             .with_html(html)
             .with_theme(wry::Theme::Dark)
             .with_background_color(SOLID)
@@ -83,7 +95,7 @@ impl Panel {
             })
             .build(&window)
             .map_err(|e| e.to_string())?;
-        Ok(Self { window, webview, ready: false, pending: true, hidden_at: None })
+        Ok(Self { window, webview, ready: false, pending: true, hidden_at: None, _proxy: deactivate })
     }
 
     pub fn contains(&self, id: WindowId) -> bool {
@@ -136,6 +148,25 @@ impl Panel {
         let _ = self.webview.set_visible(false);
         let _ = self.webview.set_memory_usage_level(MemoryUsageLevel::Low);
     }
+}
+
+/// tao reports focus moving into the WebView child as `Focused(false)` and
+/// then misses the real deactivation, so the panel follows `WM_ACTIVATE`.
+unsafe extern "system" fn deactivated(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    id: usize,
+    proxy: usize,
+) -> LRESULT {
+    if message == WM_ACTIVATE && wparam & 0xffff == WA_INACTIVE as usize {
+        let _ = (*(proxy as *const EventLoopProxy<UiEvent>)).send_event(UiEvent::Panel(Command::Hide));
+    }
+    if message == WM_NCDESTROY {
+        RemoveWindowSubclass(hwnd, Some(deactivated), id);
+    }
+    DefSubclassProc(hwnd, message, wparam, lparam)
 }
 
 /// The panel rectangle for a click at `at`, on that point's monitor.

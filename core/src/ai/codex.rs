@@ -1,7 +1,7 @@
 //! Codex driver. Analysis signs in the way yetone/magpie (MIT) does: the
 //! login Codex keeps in `$CODEX_HOME/auth.json` calls the ChatGPT Codex
 //! backend's Responses API through the shared SS tool loop, and an API-key
-//! login calls api.openai.com. Handling still runs `codex exec`.
+//! login calls api.openai.com. Handling starts in the desktop composer.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,6 +42,23 @@ pub fn open_session(thread: &str) -> Result<(), String> {
         return Ok(());
     }
     Err("无法打开 Codex；会话已保存，可在 Codex 中按会话编号查找".into())
+}
+
+pub fn compose(cwd: &Path, prompt: &str) -> crate::Result<()> {
+    let url = format!("codex://threads/new?path={}&prompt={}", encode(&cwd.to_string_lossy()), encode(prompt));
+    if crate::process::shell_open(&url) {
+        return Ok(());
+    }
+    Err(crate::Error::new("无法打开 Codex，请确认已安装 Codex 桌面端"))
+}
+
+fn encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => char::from(b).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 /// Where the sign-in lives and the services it talks to.
