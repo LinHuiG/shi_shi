@@ -36,7 +36,7 @@ use crate::{time, Ctx, Error, Result};
 pub const METHODS: &[&str] = &["analyze", "analysis_backlog"];
 
 pub const FILTER_TIMEOUT: &str = "消息过滤总时限已到，未完成批次保留";
-pub const COMMAND_RETRY_REASON: &str = "本批存在已执行或结果未知的命令，须核对命令记录后手动重试，未标为已分析";
+pub const COMMAND_RETRY_REASON: &str = "本批存在已执行或结果未知的命令，未标为已分析，等待后续自动分析";
 pub const ROUND_DEADLINE: &str = "分析总时限已到，未提交的消息保留待下一轮处理";
 pub const BATCH_DEADLINE: &str = "分析总时限已到，本批未调用 AI";
 pub const LATE_RESULT: &str = "分析总时限已到，本批未提交";

@@ -405,7 +405,7 @@ pub(crate) fn part(conn: &Connection, scope: &Scope, out: &mut Map<String, Value
     out.insert("prompt_pending".into(), pending.into());
     out.insert(RULE_VERSION.into(), kv::get_i64(conn, RULE_VERSION)?.into());
     out.insert("memory_state".into(), memory_revisions(conn)?);
-    if ["prompts", "learning"].contains(&scope.page.as_str()) {
+    if scope.page == "learning" {
         let shown: Vec<Value> = reviews
             .iter()
             .filter(|r| r.archived_at == 0 && has_result(r))

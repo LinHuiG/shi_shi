@@ -1,5 +1,5 @@
 // Local tool library, draft testing and bounded execution history.
-let toolLibrary = [],
+let toolQuery = '',
   toolDraft = null,
   toolTestId = '',
   toolEditorSequence = 0;
@@ -29,31 +29,24 @@ const toolStatus = {
 function toolSwitch(attribute, id, enabled, label, disabled = false) {
   return `<button type="button" class="mini-switch ${enabled ? 'on' : ''}" role="switch" aria-label="${esc(label)}" aria-checked="${!!enabled}" ${attribute}="${esc(id)}" ${disabled ? 'disabled' : ''}><i></i></button>`;
 }
-async function openToolLibrary() {
-  toolLibrary = await rpc('tool_list');
-  toolDraft = null;
-  showToolLibrary();
-}
-function showToolLibrary(search = '') {
-  toolDraft = null;
-  $('#dialog').classList.remove('tool-editor-dialog');
-  setModal(
-    `<div class="tool-library"><div class="tool-heading"><h2>工具列表</h2><button data-tool-history>调用记录</button></div><div class="tool-toolbar"><button class="primary" data-tool-new>新增工具</button><input id="tool-search" placeholder="搜索工具名或说明……" value="${esc(search)}" aria-label="搜索工具"></div><div id="tool-list-rows"></div><div id="tool-error" class="error-box"></div><div class="dialog-foot"><button data-action="close">关闭</button></div></div>`,
+function showToolLibrary() {
+  setHtml(
+    '#view',
+    `<div class="tool-toolbar"><input type="search" id="tool-search" placeholder="搜索工具名或说明" value="${esc(toolQuery)}" aria-label="搜索工具"><span id="tool-count" class="tiny" role="status"></span></div><div class="page tool-library"><div id="tool-list-rows" data-preserve-content></div></div>`,
   );
-  $('#dialog').classList.add('wide-dialog');
-  modalOutsideDismiss = () => true;
-  renderToolRows(search);
+  renderToolRows();
 }
-function renderToolRows(search = '') {
-  const terms = search.trim().toLowerCase().split(/\s+/).filter(Boolean),
-    rows = toolLibrary.filter((t) =>
+function renderToolRows() {
+  const terms = toolQuery.trim().toLowerCase().split(/\s+/).filter(Boolean),
+    rows = state.config.tools.filter((t) =>
       terms.every((q) => `${t.name} ${t.display_name} ${t.description}`.toLowerCase().includes(q)),
     );
-  $('#tool-list-rows').innerHTML = !toolLibrary.length
-    ? '<p class="helper">尚未注册工具。</p>'
+  $('#tool-count').textContent = `${rows.length} / ${state.config.tools.length}个工具`;
+  setHtml('#tool-list-rows', !state.config.tools.length
+    ? empty('还没有工具', '点击“新增工具”，配置AI可调用的本地命令。')
     : !rows.length
-      ? '<p class="helper">没有匹配的工具。</p>'
-      : `<div class="tool-table">${rows.map((t) => `<article class="tool-library-row"><div><b>${esc(t.display_name || t.name || '未命名草稿')}</b><div class="tiny">${esc(t.name)}</div></div><div class="tool-description">${esc(t.description || '尚未填写说明')}<div class="tiny">${esc(t.parameters.map((p) => p.name).join(' · ') || '无参数')}</div></div>${toolSwitch('data-tool-toggle', t.id, t.enabled, `启用 ${t.display_name || t.name}`)}<div class="tool-row-actions"><button data-tool-edit="${esc(t.id)}">编辑</button><button class="quiet" data-tool-delete="${esc(t.id)}">删除</button></div></article>`).join('')}</div>`;
+      ? empty('没有匹配的工具', '换个关键词，或清空搜索查看全部工具。')
+      : `<div class="tool-table">${rows.map((t) => `<article class="tool-library-row" data-ui-key="tool-${esc(t.id)}"><div><b>${esc(t.display_name || t.name || '未命名草稿')}</b><div class="tiny">${esc(t.name)}</div></div><div class="tool-description">${esc(t.description || '尚未填写说明')}<div class="tiny">${esc(t.parameters.map((p) => p.name).join(' · ') || '无参数')}</div></div><div class="tool-enabled"><span>启用</span>${toolSwitch('data-tool-toggle', t.id, t.enabled, `启用 ${t.display_name || t.name}`)}</div><div class="tool-row-actions"><button data-tool-edit="${esc(t.id)}">编辑</button><button class="quiet" data-tool-delete="${esc(t.id)}">删除</button></div></article>`).join('')}</div>`);
 }
 function newTool() {
   return {
@@ -76,7 +69,7 @@ function showToolEditor(tool = newTool()) {
   toolDraft.sampleKey = tool.id || globalThis.crypto?.randomUUID?.() || String(Date.now());
   ++toolEditorSequence;
   setModal(
-    `<div class="tool-editor"><div class="tool-heading"><h2>${tool.id ? '编辑工具' : '新增工具'}</h2><div class="tool-enabled"><span>启用</span>${toolSwitch('data-tool-draft-enabled', '', tool.enabled, '启用此工具')}</div></div><label>工具名<input id="tool-name" maxlength="64" value="${esc(tool.name)}" placeholder="如 query_records，可根据命令自动填写"></label><label>使用说明<textarea id="tool-description" rows="2" maxlength="1024" placeholder="告诉 AI 什么时候使用这个工具">${esc(tool.description)}</textarea></label><label>CMD 命令<textarea id="tool-command" rows="2" placeholder="如 python C:\\tools\\query.py {{keyword}}">${esc(tool.command_template)}</textarea></label><div class="tool-heading"><h3>参数</h3><button data-param-add>＋ 添加参数</button></div><div id="tool-parameters">${tool.parameters.map((p) => parameterFields(p)).join('')}</div><details class="tool-test"><summary>测试运行</summary><div id="tool-samples"></div><div class="row"><button data-tool-command-preview>预览命令</button><button data-tool-test>测试运行</button><button data-tool-test-cancel hidden>取消测试</button></div><pre id="tool-command-output"></pre><div id="tool-test-result"></div></details><div id="tool-error" class="error-box"></div><div class="tool-editor-footer"><button data-tool-copy>复制工具制作提示词</button><div class="dialog-foot"><button data-tool-back>取消</button><button class="primary" data-tool-save>保存工具</button></div></div></div>`,
+    `<div class="tool-editor"><div class="tool-heading"><h2>${tool.id ? '编辑工具' : '新增工具'}</h2><div class="tool-enabled"><span>启用</span>${toolSwitch('data-tool-draft-enabled', '', tool.enabled, '启用此工具')}</div></div><label>工具名<input id="tool-name" maxlength="64" value="${esc(tool.name)}" placeholder="如 query_records，可根据命令自动填写"></label><label>使用说明<textarea id="tool-description" rows="2" maxlength="1024" placeholder="告诉 AI 什么时候使用这个工具">${esc(tool.description)}</textarea></label><label>CMD 命令<textarea id="tool-command" rows="2" placeholder="如 python C:\\tools\\query.py {{keyword}}">${esc(tool.command_template)}</textarea></label><div class="tool-heading"><h3>参数</h3><button data-param-add>＋ 添加参数</button></div><div id="tool-parameters">${tool.parameters.map((p) => parameterFields(p)).join('')}</div><details class="tool-test"><summary>测试运行</summary><div id="tool-samples"></div><div class="row"><button data-tool-command-preview>预览命令</button><button data-tool-test>测试运行</button><button data-tool-test-cancel hidden>取消测试</button></div><pre id="tool-command-output"></pre><div id="tool-test-result"></div></details><div id="tool-error" class="error-box"></div><div class="tool-editor-footer"><button data-tool-copy>复制工具制作提示词</button><div class="dialog-foot"><button data-action="close">取消</button><button class="primary" data-tool-save>保存工具</button></div></div></div>`,
   );
   $('#dialog').classList.add('wide-dialog');
   $('#dialog').classList.add('tool-editor-dialog');
@@ -187,7 +180,7 @@ async function refreshToolHistory(page = 1) {
     });
     if (sequence !== toolHistorySequence || !list.isConnected || $('#overlay').hidden) return;
     const historyTools = [
-      ...new Map([...(result.tools || []), ...toolLibrary].map((tool) => [tool.id, tool])).values(),
+      ...new Map([...(result.tools || []), ...state.config.tools].map((tool) => [tool.id, tool])).values(),
     ];
     $('#tool-history-filter').innerHTML = [['', '全部工具'], ...historyTools.map((t) => [t.id, t.name])]
       .map(
@@ -293,7 +286,10 @@ document.addEventListener('input', (e) => {
     if (e.target.dataset.param === 'name') renderToolSamples();
     if (e.target.hasAttribute('data-tool-sample')) rememberToolSamples();
   }
-  if (e.target.id === 'tool-search') renderToolRows(e.target.value);
+  if (e.target.id === 'tool-search') {
+    toolQuery = e.target.value;
+    renderToolRows();
+  }
 });
 document.addEventListener('change', async (e) => {
   if (['tool-history-filter', 'tool-history-purpose', 'tool-history-day'].includes(e.target.id)) {
@@ -332,10 +328,8 @@ document.addEventListener('click', async (e) => {
       toolHistoryFilters = { tool_id: b.dataset.toolHistory };
       return await openToolRunHistory('');
     }
-    if (b.hasAttribute('data-tool-library')) return await openToolLibrary();
     if (b.hasAttribute('data-tool-new')) return showToolEditor();
-    if (b.hasAttribute('data-tool-edit')) return showToolEditor(toolLibrary.find((t) => t.id === b.dataset.toolEdit));
-    if (b.hasAttribute('data-tool-back')) return showToolLibrary();
+    if (b.hasAttribute('data-tool-edit')) return showToolEditor(state.config.tools.find((t) => t.id === b.dataset.toolEdit));
     if (b.hasAttribute('data-param-add')) {
       ++toolEditorSequence;
       return $('#tool-parameters').insertAdjacentHTML('beforeend', parameterFields());
@@ -354,25 +348,21 @@ document.addEventListener('click', async (e) => {
       return;
     }
     if (b.hasAttribute('data-tool-toggle')) {
-      const tool = toolLibrary.find((t) => t.id === b.dataset.toolToggle);
+      const tool = state.config.tools.find((t) => t.id === b.dataset.toolToggle);
       b.disabled = true;
       try {
-        const saved = await rpc('tool_toggle', { id: tool.id, updated: tool.updated, enabled: !tool.enabled });
-        toolLibrary = toolLibrary.map((t) => (t.id === saved.id ? saved : t));
-        await refreshState(false);
-        renderToolRows($('#tool-search').value);
+        await rpc('tool_toggle', { id: tool.id, updated: tool.updated, enabled: !tool.enabled });
+        await refreshState(true);
       } finally {
         b.disabled = false;
       }
       return;
     }
     if (b.hasAttribute('data-tool-delete')) {
-      const tool = toolLibrary.find((t) => t.id === b.dataset.toolDelete);
+      const tool = state.config.tools.find((t) => t.id === b.dataset.toolDelete);
       if (!confirm('删除此工具？历史调用记录会保留。')) return;
       await rpc('tool_delete', { id: tool.id, updated: tool.updated });
-      toolLibrary = toolLibrary.filter((t) => t.id !== tool.id);
-      renderToolRows($('#tool-search').value);
-      await refreshState(false);
+      await refreshState(true);
       return;
     }
     if (b.hasAttribute('data-tool-save')) {
@@ -382,14 +372,13 @@ document.addEventListener('click', async (e) => {
       editor.dataset.pending = 'true';
       controls.forEach((el) => (el.disabled = true));
       try {
-        const saved = await rpc('tool_save', { tool: draft });
-        toolLibrary = toolLibrary.filter((t) => t.id !== saved.id).concat(saved);
-        await refreshState(false);
-        showToolLibrary();
+        await rpc('tool_save', { tool: draft });
+        await refreshState(true);
       } finally {
         delete editor.dataset.pending;
         controls.forEach((el) => (el.disabled = false));
       }
+      closeModal();
       return;
     }
     if (b.hasAttribute('data-tool-copy')) {

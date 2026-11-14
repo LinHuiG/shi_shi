@@ -2,7 +2,7 @@
 // same page navigation and visible buttons a mouse user would use, so no
 // action gains a second, divergent code path. Shortcuts are listed in the
 // palette and in sidebar tooltips so they can be learned in place.
-const pageOrder = ['tasks', 'inbox', 'review', 'sources', 'prompts', 'logs', 'settings'];
+const pageOrder = ['tasks', 'inbox', 'review', 'sources', 'tools', 'logs', 'settings'];
 const go = async (target) => {
   if (page !== target) {
     if (!(await leaveSettings())) return false;

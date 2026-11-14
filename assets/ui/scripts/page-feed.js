@@ -159,7 +159,7 @@ function syncReaderPage() {
   if (previous === 'inbox') releaseInbox();
   if (previous === 'logs') releaseLogs();
   if (previous === 'reports') releaseReports();
-  if (previous === 'prompts') releasePromptHistory();
+  if (previous === 'settings') releasePromptHistory();
   if (previous === 'tasks' && taskFeed) releaseTaskFeed();
   if (previous && modalFromTrace) closeModal();
 }

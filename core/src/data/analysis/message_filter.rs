@@ -232,14 +232,14 @@ fn boundary(conn: &Connection, config: &Config, gate: &Gate, now: i64) -> Result
     {
         return Ok(None);
     }
-    let backlog = pending_stats(conn, config, false, &BTreeMap::new(), None)?.backlog;
+    let backlog = pending_stats(conn, config, &BTreeMap::new(), None)?.backlog;
     if progress::automatic_due(&analysis, false, config, backlog, gate.message_budget, now) {
         return Ok(None);
     }
     let sql = format!(
         "SELECT m.id, m.content_hash FROM messages m WHERE {} AND m.filter_hash IS NOT m.content_hash \
          ORDER BY m.updated_at, m.time, m.id",
-        pending_where(config, false)
+        pending_where(config)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let pending: VecDeque<(String, String)> =

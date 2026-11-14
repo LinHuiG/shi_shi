@@ -41,7 +41,7 @@ async fn connection_save_requires_models_and_deletion_allows_empty_routes() {
     assert_eq!(delete_connection(&ctx, &json!({})).await.unwrap_err().0, "缺少连接编号");
     let saved = ConfigStore::load(root.join("config.json")).unwrap().get();
     assert!(saved.ai_connections.is_empty());
-    for kind in ["message_filter", "classify", "handling", "archive"] {
+    for kind in ["message_filter", "classify", "archive"] {
         assert!(!super::super::prompt::configured(&saved, kind), "{kind} route was cleared");
     }
 }
@@ -152,12 +152,9 @@ fn validate_connections_checks_connections_then_routes() {
     c.ai_connections[0].base_url = "https://example.com/v1".into();
     let api_route =
         Some(ModelChoice { connection_id: "a".into(), model: "fixture".into(), reasoning_effort: String::new() });
-    c.model_profiles.as_mut().unwrap().handling = api_route.clone();
-    // Without a launcher handling is unavailable and its route is not checked.
     assert!(validate_connections(&c).is_ok());
     c.codex = "codex.exe".into();
-    assert_eq!(validate_connections(&c).unwrap_err().0, "官方 API 仅用于分析，不能用于一键处置");
-    c.model_profiles.as_mut().unwrap().handling = None;
+    assert!(validate_connections(&c).is_ok());
     c.model_profiles.as_mut().unwrap().analysis =
         Some(ModelChoice { connection_id: "missing".into(), ..ModelChoice::default() });
     assert_eq!(validate_connections(&c).unwrap_err().0, "所选 AI 连接不存在，请重新选择接入");

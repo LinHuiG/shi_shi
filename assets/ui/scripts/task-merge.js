@@ -148,6 +148,13 @@ document.addEventListener('click', async (e) => {
       return;
     }
     if (b.dataset.settingsTarget) {
+      if (page !== 'settings') {
+        if (!(await leaveSettings())) return;
+        pendingSettingsSection = b.dataset.settingsTarget;
+        page = 'settings';
+        await render();
+        return;
+      }
       $('#settings-' + b.dataset.settingsTarget)?.scrollIntoView({
         block: 'start',
         behavior: 'smooth',
@@ -156,11 +163,13 @@ document.addEventListener('click', async (e) => {
     }
     if (b.dataset.promptSection) {
       if (!(await leaveSettings())) return;
-      settingsDirty = false;
-      promptEditing = false;
       promptSection = b.dataset.promptSection === 'memory' ? 'memory' : 'history';
-      page = 'prompts';
-      await render();
+      if (page === 'settings') await renderSystemPrompts();
+      else {
+        page = 'settings';
+        pendingSettingsSection = 'system-prompts';
+        await render();
+      }
       return;
     }
     if (b.dataset.adviceReply) {

@@ -11,7 +11,8 @@ async fn patch_merges_fields_and_profiles_and_records_audit() {
     let out = patch(&ctx, &p).await.unwrap();
     assert_eq!(out["config"]["daily_calls"], 20);
     assert_eq!(out["config"]["model_profiles"]["review"]["model"], "m");
-    assert_eq!(out["config"]["model_profiles"]["handling"]["reasoning_effort"], "medium");
+    assert_eq!(out["config"]["model_profiles"]["analysis"]["reasoning_effort"], "low");
+    assert!(out["config"]["model_profiles"].get("handling").is_none());
     assert_eq!(ctx.config.get().daily_calls, 20);
     let kinds: Vec<String> = ctx
         .db
@@ -39,6 +40,7 @@ async fn patch_rejects_unknown_fields_and_bad_values_without_saving() {
     assert_eq!(e(json!([])).await, "设置补丁必须是对象");
     assert_eq!(e(json!({"tools": []})).await, "设置补丁包含不可修改字段");
     assert_eq!(e(json!({"model_profiles": {"chat": {}}})).await, "模型用途无效");
+    assert_eq!(e(json!({"model_profiles": {"handling": {}}})).await, "模型用途无效");
     assert_eq!(e(json!({"model_profiles": 1})).await, "模型用途配置无效");
     assert_eq!(e(json!({"daily_calls": 501})).await, "每日调用上限不能超过500");
     assert_eq!(e(json!({"max_input_chars": 100})).await, "AI 输入上限应为5000–200000字符");

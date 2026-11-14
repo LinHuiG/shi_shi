@@ -34,6 +34,7 @@ function systemPromptTabs() {
   return `<div class="pills" role="tablist" aria-label="系统提示词内容" style="margin-bottom:16px"><button role="tab" data-prompt-section="history" aria-selected="${promptSection === 'history'}" class="${promptSection === 'history' ? 'active' : ''}">提示词与版本</button><button role="tab" data-prompt-section="memory" aria-selected="${promptSection === 'memory'}" class="${promptSection === 'memory' ? 'active' : ''}">AI 记忆</button></div>`;
 }
 async function renderSystemPrompts() {
+  renderedKey = viewKey(state, 'settings');
   if (promptSection !== 'history' && promptHistory) releasePromptHistory();
   if (promptSection === 'memory') {
     ++promptRequest;
@@ -84,23 +85,17 @@ function rememberPromptDraft() {
 async function renderPromptHistory() {
   const request = ++promptRequest,
     epoch = renderEpoch,
-    target = promptTarget;
-  if (
-    $('#view').dataset.contentPage !== 'prompts' ||
-    $('#view').dataset.renderedPromptSection !== 'history' ||
-    $('#view').dataset.renderedPromptTarget !== target
-  ) {
+    target = promptTarget,
+    host = $('#settings-prompt-content');
+  if (!host.querySelector(`[data-prompt-target="${target}"]`)) {
     setHtml(
-      '#view',
-      `<div class="page prompt-workspace">${systemPromptTabs()}<div class="box">读取系统提示词…</div></div>`,
+      host,
+      `<div class="prompt-workspace" data-prompt-target="${esc(target)}">${systemPromptTabs()}<p class="helper">读取系统提示词…</p></div>`,
     );
-    $('#view').dataset.contentPage = 'prompts';
-    $('#view').dataset.renderedPromptSection = 'history';
-    $('#view').dataset.renderedPromptTarget = target;
   }
   const result = await rpc('prompt_history', { target });
   if (
-    page !== 'prompts' ||
+    page !== 'settings' ||
     promptSection !== 'history' ||
     epoch !== renderEpoch ||
     request !== promptRequest ||
@@ -116,14 +111,14 @@ function renderPromptWorkspace() {
     versions = result.versions || [],
     current = result.current;
   setHtml(
-    '#view',
-    `<div class="page prompt-workspace">${systemPromptTabs()}<div class="prompt-toolbar"><label>用途 <select id="prompt-target">${Object.entries(
+    '#settings-prompt-content',
+    `<div class="prompt-workspace" data-prompt-target="${esc(promptTarget)}">${systemPromptTabs()}<div class="prompt-toolbar"><label>用途 <select id="prompt-target">${Object.entries(
       promptLabels,
     )
       .map(([k, label]) => `<option value="${k}" ${k === promptTarget ? 'selected' : ''}>${label}</option>`)
       .join(
         '',
-      )}</select></label>${help('系统提示词仅由你配置；编辑、手动采用和回滚保留版本。没改过的内置提示词随新版本更新，改过的保持原样。固定协议由程序追加，AI 不能修改。')}<span class="tiny">${current ? '更新于 ' + esc(date(current.created)) : ''}</span><button data-prompt-edit>编辑</button>${promptTarget === 'tool_call' ? '<button data-tool-library>工具列表</button>' : ''}</div><section class="prompt-current"><textarea id="prompt-content" readonly spellcheck="false" aria-label="当前提示词" maxlength="20000">${esc(current?.content || '')}</textarea><div class="editor-actions" id="prompt-editor-actions" hidden><button data-prompt-reset>恢复内置</button><button data-prompt-cancel>取消</button><button class="primary" data-prompt-save>保存</button></div><div class="error-box" id="prompt-error"></div></section><details class="prompt-history"><summary>历史版本 · ${versions.length}</summary>${versions.map((v) => `<details class="prompt-version" data-prompt-version="${esc(v.id)}" data-ui-key="prompt-${esc(v.id)}"><summary><span>${esc(date(v.created))}</span><span>${esc({ initial: '初始', upgrade: '内置更新', manual: '编辑', adopt: '采用', auto_adopt: '自动采用', consolidate: '归档', rollback: '回滚', archive_rollback: '归档回滚' }[v.action] || v.action)}</span>${current?.id === v.id ? '<span class="badge">当前</span>' : ''}</summary><p class="helper">${esc(v.reason || '')}</p><div data-prompt-body data-preserve-content></div>${current?.id !== v.id ? `<div class="editor-actions"><button data-prompt-rollback="${esc(v.id)}">回滚到此版本</button></div>` : ''}</details>`).join('')}</details></div>`,
+      )}</select></label>${help('系统提示词仅由你配置；编辑、手动采用和回滚保留版本。没改过的内置提示词随新版本更新，改过的保持原样。固定协议由程序追加，AI 不能修改。')}<span class="tiny">${current ? '更新于 ' + esc(date(current.created)) : ''}</span><button data-prompt-edit>编辑</button></div><section class="prompt-current"><textarea id="prompt-content" readonly spellcheck="false" aria-label="当前提示词" maxlength="20000">${esc(current?.content || '')}</textarea><div class="editor-actions" id="prompt-editor-actions" hidden><button data-prompt-reset>恢复内置</button><button data-prompt-cancel>取消</button><button class="primary" data-prompt-save>保存</button></div><div class="error-box" id="prompt-error"></div></section><details class="prompt-history"><summary>历史版本 · ${versions.length}</summary>${versions.map((v) => `<details class="prompt-version" data-prompt-version="${esc(v.id)}" data-ui-key="prompt-${esc(v.id)}"><summary><span>${esc(date(v.created))}</span><span>${esc({ initial: '初始', upgrade: '内置更新', manual: '编辑', adopt: '采用', auto_adopt: '自动采用', consolidate: '归档', rollback: '回滚', archive_rollback: '归档回滚' }[v.action] || v.action)}</span>${current?.id === v.id ? '<span class="badge">当前</span>' : ''}</summary><p class="helper">${esc(v.reason || '')}</p><div data-prompt-body data-preserve-content></div>${current?.id !== v.id ? `<div class="editor-actions"><button data-prompt-rollback="${esc(v.id)}">回滚到此版本</button></div>` : ''}</details>`).join('')}</details></div>`,
   );
   for (const comparison of document.querySelectorAll('[data-prompt-current]'))
     comparison.value = current?.content || '';
@@ -131,7 +126,6 @@ function renderPromptWorkspace() {
   const draft = promptDrafts.get(promptTarget);
   if (draft) {
     promptEditing = true;
-    settingsDirty = true;
     $('#prompt-content').value = draft.text;
     $('#prompt-content').readOnly = false;
     $('#prompt-editor-actions').hidden = false;
@@ -177,7 +171,6 @@ document.addEventListener('change', async (e) => {
     if (promptEditing) promptDrafts.delete(promptTarget);
     promptTarget = e.target.value;
     promptEditing = false;
-    settingsDirty = false;
     releasePromptHistory();
     try {
       await renderPromptHistory();
@@ -192,7 +185,6 @@ document.addEventListener('click', async (e) => {
   try {
     if (b.hasAttribute('data-prompt-edit')) {
       promptEditing = true;
-      settingsDirty = true;
       $('#prompt-content').readOnly = false;
       $('#prompt-editor-actions').hidden = false;
       b.hidden = true;
@@ -201,7 +193,6 @@ document.addEventListener('click', async (e) => {
     if (b.hasAttribute('data-prompt-cancel')) {
       promptDrafts.delete(promptTarget);
       promptEditing = false;
-      settingsDirty = false;
       renderPromptWorkspace();
     }
     if (b.hasAttribute('data-prompt-reset')) {
@@ -219,7 +210,6 @@ document.addEventListener('click', async (e) => {
         });
         promptEditing = false;
         promptDrafts.delete(promptTarget);
-        settingsDirty = false;
         await refreshState(true);
         toast('提示词已保存');
       } finally {

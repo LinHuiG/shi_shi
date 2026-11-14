@@ -18,12 +18,6 @@ use crate::config::{Connection as AiConnection, PURPOSES, UNCONFIGURED_CONNECTIO
 use crate::exec::blocking;
 use crate::{bail, Config, Ctx, Error, Result};
 
-/// Whether one-click handling has a launcher it could use.
-fn handling_available(config: &Config) -> bool {
-    let launcher = |c: &AiConnection| matches!(c.driver.as_str(), "codex" | "dsh") && !c.executable.trim().is_empty();
-    !config.codex.trim().is_empty() || config.ai_connections.iter().any(launcher)
-}
-
 /// Every connection and every configured purpose route, as the settings
 /// save checks them (the total time limit first).
 pub fn validate_connections(config: &Config) -> Result<()> {
@@ -51,7 +45,7 @@ pub fn validate_connections(config: &Config) -> Result<()> {
     }
     for kind in PURPOSES {
         let choice = config.model_choice(kind);
-        if choice.connection_id == UNCONFIGURED_CONNECTION || kind == "handling" && !handling_available(config) {
+        if choice.connection_id == UNCONFIGURED_CONNECTION {
             continue;
         }
         let c = connection_by_id(config, &choice.connection_id)?;
@@ -62,9 +56,6 @@ pub fn validate_connections(config: &Config) -> Result<()> {
             _ => Err(unsupported(&c)),
         }
         .map_err(Error)?;
-        if kind == "handling" && c.driver == "api" {
-            bail!("官方 API 仅用于分析，不能用于一键处置");
-        }
     }
     Ok(())
 }
@@ -96,17 +87,14 @@ fn referenced(c: &Config, id: &str) -> bool {
 /// Clear every purpose route that uses `id`; the purpose becomes
 /// unconfigured instead of silently falling back to another connection.
 fn clear_routes(config: &mut Config, id: &str) {
-    let matching =
-        ["message_filter", "classify", "handling", "archive"].map(|kind| config.model_choice(kind).connection_id == id);
+    let matching = ["message_filter", "classify", "archive"].map(|kind| config.model_choice(kind).connection_id == id);
     let base = config.model_choice("classify");
     let p = config.model_profiles.get_or_insert_with(|| crate::config::ModelProfiles {
         filter: Some(base.clone()),
         analysis: Some(base.clone()),
-        handling: Some(base.clone()),
         review: Some(base),
     });
-    for (choice, matching) in [&mut p.filter, &mut p.analysis, &mut p.handling, &mut p.review].into_iter().zip(matching)
-    {
+    for (choice, matching) in [&mut p.filter, &mut p.analysis, &mut p.review].into_iter().zip(matching) {
         if matching {
             *choice = None;
         }

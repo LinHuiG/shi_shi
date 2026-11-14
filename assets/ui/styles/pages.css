@@ -22,9 +22,9 @@
   color: var(--blue-fg);
   cursor: pointer;
 }
-.inbox-tools {
+.inbox-tools,
+.tool-toolbar {
   display: flex;
-  flex-direction: column;
   gap: 6px;
   border-bottom: 1px solid var(--hairline);
   background: var(--surface-layer);
@@ -34,7 +34,11 @@
   /* Full-width sticky bar whose content lines up with the page column. */
   padding: var(--sp-3) max(var(--sp-6), calc((100% - var(--page-w)) / 2 + var(--sp-6)));
 }
-.inbox-tools > input {
+.inbox-tools {
+  flex-direction: column;
+}
+.inbox-tools > input,
+.tool-toolbar > input {
   max-width: 560px;
 }
 .inbox-tools label {

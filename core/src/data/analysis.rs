@@ -15,7 +15,7 @@ use crate::ai::usage::State;
 use crate::analysis::apply::Applied;
 use crate::analysis::batch::{self, Material};
 use crate::analysis::progress::{
-    self, automatic_retry, hash, route_value, Backlog, Failure, Row, BODY_CHARS, MAX_INPUT_ERRORS, ROW_OVERHEAD,
+    self, hash, route_value, Backlog, Failure, Row, BODY_CHARS, MAX_INPUT_ERRORS, ROW_OVERHEAD,
 };
 use crate::analysis::round::{Accept, Accepted, Prepared, Start, PARTIAL_COMMANDS};
 use crate::analysis::{
@@ -41,23 +41,12 @@ const RELATED: &str = "(json_extract(m.payload, '$.mine') = 1 OR json_extract(m.
                 WHERE t.archived = 0 AND t.merged_into = '' \
                 AND em.source_id = m.source_id AND em.chat = m.chat))";
 
-/// The pending condition over `messages m`: current version not analysed,
-/// in the lookback window (`?1`), not at the input-error limit, and for
-/// automatic work not waiting for a manual retry ([`automatic_retry`]).
-fn pending_where(config: &Config, manual: bool) -> String {
+/// Unanalysed versions within the lookback window and below the input-error limit.
+fn pending_where(config: &Config) -> String {
     let related = if config.analysis_related_only { format!(" AND {RELATED}") } else { String::new() };
-    let automatic = if manual { String::new() } else { format!(" AND NOT {}", manual_retry()) };
     format!(
         "m.withdrawn = 0 AND m.analyzed_hash IS NOT m.content_hash AND (m.time >= ?1 OR m.time = 0) \
-         AND NOT (m.error_hash IS m.content_hash AND m.error_count >= {MAX_INPUT_ERRORS}){automatic}{related}"
-    )
-}
-
-/// The current version waits for a manual retry ([`automatic_retry`] is false).
-fn manual_retry() -> String {
-    format!(
-        "(m.error_hash IS m.content_hash AND substr(coalesce(m.retry_reason, ''), -{}) = '{COMMAND_RETRY_REASON}')",
-        COMMAND_RETRY_REASON.chars().count()
+         AND NOT (m.error_hash IS m.content_hash AND m.error_count >= {MAX_INPUT_ERRORS}){related}"
     )
 }
 
@@ -65,17 +54,15 @@ fn cutoff(config: &Config) -> i64 {
     time::now() - config.analysis_lookback_hours as i64 * time::HOUR
 }
 
-/// Pending versions in the lookback window, sorted by
-/// `(errors, updated_at, time, id)`. `manual` also returns messages only a
-/// manual retry may take.
-pub fn pending_rows(conn: &Connection, config: &Config, manual: bool) -> Result<Vec<Row>> {
+/// Pending versions sorted by `(errors, updated_at, time, id)`.
+pub fn pending_rows(conn: &Connection, config: &Config) -> Result<Vec<Row>> {
     let sql = format!(
         "SELECT m.id, m.content_hash, m.time, m.updated_at, \
          CASE WHEN m.error_hash = m.content_hash THEN m.error_count ELSE 0 END AS errors, \
          CASE WHEN m.error_hash = m.content_hash THEN coalesce(m.retry_reason, '') ELSE '' END, \
          min(length(m.text), {BODY_CHARS}) \
          FROM messages m WHERE {} ORDER BY errors, m.updated_at, m.time, m.id",
-        pending_where(config, manual)
+        pending_where(config)
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([cutoff(config)], |r| {
@@ -86,7 +73,6 @@ pub fn pending_rows(conn: &Connection, config: &Config, manual: bool) -> Result<
             time: r.get(2)?,
             updated_at: r.get(3)?,
             errors: r.get(4)?,
-            automatic: automatic_retry(&reason),
             reason,
             chars: r.get::<_, i64>(6)? as usize,
         })
@@ -94,10 +80,9 @@ pub fn pending_rows(conn: &Connection, config: &Config, manual: bool) -> Result<
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Waiting messages, by the same condition as [`pending_rows`]: `manual`
-/// counts the manual-only ones too.
-pub fn pending_count(conn: &Connection, config: &Config, manual: bool) -> Result<usize> {
-    let sql = format!("SELECT count(*) FROM messages m WHERE {}", pending_where(config, manual));
+/// Waiting messages, by the same condition as [`pending_rows`].
+pub fn pending_count(conn: &Connection, config: &Config) -> Result<usize> {
+    let sql = format!("SELECT count(*) FROM messages m WHERE {}", pending_where(config));
     let n: i64 = conn.prepare_cached(&sql)?.query_row([cutoff(config)], |r| r.get(0))?;
     Ok(n as usize)
 }
@@ -106,38 +91,31 @@ pub fn pending_count(conn: &Connection, config: &Config, manual: bool) -> Result
 struct Pending {
     /// Not among the versions being analysed now.
     waiting: usize,
-    /// Waiting for a manual retry ([`automatic_retry`] is false).
-    manual_retry: usize,
     backlog: Backlog,
 }
 
-/// [`Pending`] over `manual` pending versions; `ids` limits it to those
-/// messages.
+/// Pending versions limited to `ids` when supplied.
 fn pending_stats(
     conn: &Connection,
     config: &Config,
-    manual: bool,
     analyzing: &BTreeMap<String, String>,
     ids: Option<&BTreeSet<&str>>,
 ) -> Result<Pending> {
     let sql = format!(
         "SELECT count(*), \
          coalesce(sum(NOT EXISTS (SELECT 1 FROM json_each(?2) a WHERE a.key = m.id AND a.value = m.content_hash)), 0), \
-         coalesce(sum({}), 0), \
          coalesce(sum(min(length(m.text), {BODY_CHARS}) + {ROW_OVERHEAD}), 0) \
          FROM messages m WHERE {} AND (?3 IS NULL OR m.id IN (SELECT value FROM json_each(?3)))",
-        manual_retry(),
-        pending_where(config, manual)
+        pending_where(config)
     );
     let ids = ids.map(|ids| json!(ids).to_string());
     let row = conn.prepare_cached(&sql)?.query_row(
         params![cutoff(config), json!(analyzing).to_string(), ids],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)),
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)),
     )?;
-    let (count, waiting, manual_retry, volume) = row;
+    let (count, waiting, volume) = row;
     Ok(Pending {
         waiting: waiting as usize,
-        manual_retry: manual_retry as usize,
         backlog: Backlog { count: count as usize, volume: volume as usize },
     })
 }
@@ -271,10 +249,9 @@ pub(crate) fn part(
     analyzing: &BTreeMap<String, String>,
     out: &mut Map<String, Value>,
 ) -> Result<()> {
-    let p = pending_stats(conn, config, true, analyzing, None)?;
+    let p = pending_stats(conn, config, analyzing, None)?;
     out.insert("pending".into(), p.waiting.into());
     out.insert("analyzing".into(), analyzing.len().into());
-    out.insert("manual_retry_count".into(), p.manual_retry.into());
     out.insert("analysis_retries".into(), Value::Object(retries(conn)?));
     out.insert("filter_usage".into(), filter_usage(conn)?);
     Ok(())
@@ -304,15 +281,14 @@ impl Db {
                     return Ok(Start::Skip(DEFERRED));
                 }
             }
-            let automatic_rows = pending_rows(tx, &config, false)?;
+            let rows = pending_rows(tx, &config)?;
             let early = early_at(tx)?;
             if after_scan
                 && mode == Mode::Automatic
-                && !progress::automatic_due(&s, early.is_some(), &config, Backlog::of(&automatic_rows), budget, now)
+                && !progress::automatic_due(&s, early.is_some(), &config, Backlog::of(&rows), budget, now)
             {
                 return Ok(Start::Skip(NOT_DUE));
             }
-            let rows = if mode == Mode::Manual { pending_rows(tx, &config, true)? } else { automatic_rows };
             let empty = rows.is_empty();
             // The round really starts here: the one trigger time of manual
             // and automatic analysis, never moved back.
@@ -432,16 +408,16 @@ impl Db {
         .await
     }
 
-    /// Messages still waiting, manual-only ones included.
+    /// Messages still waiting for analysis.
     pub async fn analysis_remaining(&self, config: Arc<Config>) -> Result<usize> {
-        self.read(move |c| pending_count(c, &config, true)).await
+        self.read(move |c| pending_count(c, &config)).await
     }
 
     /// What automatic due-ness reads: the state, the automatic backlog and
     /// the filter's early decision.
     pub async fn analysis_probe(&self, config: Arc<Config>) -> Result<(State, Backlog, Option<i64>)> {
         self.read(move |c| {
-            let backlog = pending_stats(c, &config, false, &BTreeMap::new(), None)?.backlog;
+            let backlog = pending_stats(c, &config, &BTreeMap::new(), None)?.backlog;
             Ok((state(c)?, backlog, early_at(c)?))
         })
         .await
@@ -468,7 +444,7 @@ fn trigger(
         return Ok(f.trigger);
     }
     let ids: BTreeSet<&str> = boundary.iter().map(|(id, _)| id.as_str()).collect();
-    let backlog = pending_stats(conn, config, false, &BTreeMap::new(), Some(&ids))?.backlog;
+    let backlog = pending_stats(conn, config, &BTreeMap::new(), Some(&ids))?.backlog;
     let s = state(conn)?;
     Ok(progress::due_reason(&s, config, backlog, budget, time::now()).unwrap_or("analysis_interval").into())
 }
@@ -515,14 +491,14 @@ fn accept_batch(tx: &Connection, mut a: Accept) -> Result<Accepted> {
         record_failure(tx, &retry, Failure::CommandUnconfirmed, PARTIAL_COMMANDS)?;
     }
     let now = time::now();
-    let pending = pending_count(tx, &a.config, false)? > 0;
+    let pending = pending_count(tx, &a.config)? > 0;
     update_state(tx, |s| {
         s.last_success_at = now;
         s.pending = pending;
         s.pending_since = if pending { now } else { 0 };
     })?;
     a.check()?;
-    let remaining = pending_count(tx, &a.config, true)?;
+    let remaining = pending_count(tx, &a.config)?;
     super::activity::log(
         tx,
         "analysis_result",
@@ -622,8 +598,8 @@ impl Db {
                 .filter(|(id, hash)| expected.get(id).and_then(Value::as_str) == Some(hash.as_str()))
                 .collect();
             let skipped = mark_analyzed(tx, &chosen)?;
-            let remaining = pending_stats(tx, &config, true, &analyzing, None)?.waiting;
-            let pending = pending_count(tx, &config, false)? > 0 || !analyzing.is_empty();
+            let remaining = pending_stats(tx, &config, &analyzing, None)?.waiting;
+            let pending = pending_count(tx, &config)? > 0 || !analyzing.is_empty();
             let now = time::now();
             update_state(tx, |s| progress::mark_pending(s, pending, now))?;
             super::activity::log(
@@ -648,7 +624,7 @@ impl Db {
 }
 
 fn waiting(conn: &Connection, config: &Config, analyzing: &BTreeMap<String, String>) -> Result<Vec<Row>> {
-    Ok(pending_rows(conn, config, true)?.into_iter().filter(|r| analyzing.get(&r.id) != Some(&r.hash)).collect())
+    Ok(pending_rows(conn, config)?.into_iter().filter(|r| analyzing.get(&r.id) != Some(&r.hash)).collect())
 }
 
 // ---- the AI call layer ----

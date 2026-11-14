@@ -368,15 +368,11 @@ async fn only_input_errors_count_and_a_version_at_the_limit_is_not_selected() {
         assert_eq!(stub.calls() as i64, n);
     }
     let config = ctx.config.get();
-    let (rows, manual_n, auto_n) = read(&ctx, move |c| {
-        Ok((
-            store::analysis::pending_rows(c, &config, true)?,
-            store::analysis::pending_count(c, &config, true)?,
-            store::analysis::pending_count(c, &config, false)?,
-        ))
+    let (rows, count) = read(&ctx, move |c| {
+        Ok((store::analysis::pending_rows(c, &config)?, store::analysis::pending_count(c, &config)?))
     })
     .await;
-    assert!(rows.is_empty() && manual_n == 0 && auto_n == 0, "{rows:?}");
+    assert!(rows.is_empty() && count == 0, "{rows:?}");
     assert_eq!(manual(&ctx, &m).await.unwrap()["skipped"], NOTHING);
     assert_eq!(round::automatic(&ctx, &m).await.unwrap()["skipped"].is_string(), true);
     assert_eq!(stub.calls(), 3);
@@ -386,7 +382,7 @@ async fn only_input_errors_count_and_a_version_at_the_limit_is_not_selected() {
     assert_eq!(manual(&ctx, &m).await.unwrap()["skipped"], NOTHING);
     put(&ctx, message("m1", "合成消息（已更正）", time::now())).await;
     let config = ctx.config.get();
-    let rows = read(&ctx, move |c| store::analysis::pending_rows(c, &config, true)).await;
+    let rows = read(&ctx, move |c| store::analysis::pending_rows(c, &config)).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].errors, 0);
 }
@@ -404,29 +400,36 @@ async fn a_refused_batch_is_not_charged_to_its_messages() {
 }
 
 #[tokio::test]
-async fn command_unconfirmed_stays_manual_only_without_reaching_the_limit() {
-    let ctx = ctx();
-    put(&ctx, message("m1", "合成消息", time::now())).await;
-    let m = Stub::new(&ctx)
-        .answer(|_| Reply {
-            result: Err(crate::Error::new("合成命令失败")),
-            commands_ran: true,
-            invalid_response: false,
-            refused: false,
-        })
-        .arc();
-    manual(&ctx, &m).await.unwrap_err();
-    assert_eq!(errors(&ctx, "m1").await, 0);
-    let config = ctx.config.get();
-    let (manual_n, auto_n, auto_rows) = read(&ctx, move |c| {
-        Ok((
-            store::analysis::pending_count(c, &config, true)?,
-            store::analysis::pending_count(c, &config, false)?,
-            store::analysis::pending_rows(c, &config, false)?,
-        ))
-    })
-    .await;
-    assert_eq!((manual_n, auto_n, auto_rows.len()), (1, 0, 0));
+async fn failed_messages_return_on_the_next_automatic_interval() {
+    for (commands_ran, invalid_response) in [(true, false), (false, true), (false, false)] {
+        let ctx = ctx();
+        put(&ctx, message("m1", "合成消息", time::now())).await;
+        let stub = Arc::new(
+            Stub::new(&ctx)
+                .answer(move |_| Reply {
+                    result: Err(crate::Error::new("合成失败")),
+                    commands_ran,
+                    invalid_response,
+                    refused: false,
+                })
+                .ok(create("m1", "失败后再次分析的事项")),
+        );
+        let m: Arc<dyn Model> = stub.clone();
+        assert_eq!(round::automatic(&ctx, &m).await.unwrap()["skipped"], NOT_DUE);
+        rewind(&ctx).await;
+        assert_eq!(round::automatic(&ctx, &m).await.unwrap_err().0, "合成失败");
+        assert!(pending(&ctx, "m1").await);
+        assert_eq!(errors(&ctx, "m1").await, 0);
+        assert_eq!(stub.calls(), 1);
+        assert_eq!(round::automatic(&ctx, &m).await.unwrap()["skipped"], NOT_DUE);
+        assert_eq!(stub.calls(), 1, "a failed round is not immediately retried");
+        rewind(&ctx).await;
+        assert_eq!(round::automatic(&ctx, &m).await.unwrap()["processed"], 1);
+        assert_eq!(stub.calls(), 2);
+        assert!(!pending(&ctx, "m1").await);
+        assert_eq!(task_count(&ctx).await, 1);
+        assert_eq!(column(&ctx, "m1", "retry_reason").await, None);
+    }
 }
 
 #[tokio::test]
@@ -713,25 +716,24 @@ async fn backlog_groups_retry_reasons() {
     .await;
     let preview = backlog::handle(&ctx, json!({})).await.unwrap();
     assert_eq!(preview["hours"], 24);
-    assert_eq!(preview["manual_retry_count"], 1);
-    assert_eq!(preview["retry_reasons"][0]["automatic_retry"], false);
+    assert_eq!(preview["retry_reasons"][0]["count"], 1);
+    assert!(preview["retry_reasons"][0]["reason"].as_str().unwrap().contains("等待后续自动分析"));
     assert_eq!(preview["retry_reasons_more"], 0);
     // The SQL counts agree with the listed rows.
     put(&ctx, message("m2", "另一条合成消息", time::now())).await;
     let config = ctx.config.get();
-    let (rows, auto, part) = read(&ctx, move |c| {
-        let rows = store::analysis::pending_rows(c, &config, true)?;
+    let (rows, part) = read(&ctx, move |c| {
+        let rows = store::analysis::pending_rows(c, &config)?;
         let analyzing = BTreeMap::from([("m2".to_string(), rows.iter().find(|r| r.id == "m2").unwrap().hash.clone())]);
         let mut part = serde_json::Map::new();
         store::analysis::part(c, &config, &analyzing, &mut part)?;
-        Ok((rows, store::analysis::pending_rows(c, &config, false)?, part))
+        Ok((rows, part))
     })
     .await;
-    assert_eq!((part["pending"].as_u64(), part["manual_retry_count"].as_u64()), (Some(1), Some(1)));
-    assert_eq!(rows.iter().filter(|r| !r.automatic).count(), 1);
+    assert_eq!(part["pending"], 1);
     let (_, backlog, _) = ctx.db.analysis_probe(ctx.config.get()).await.unwrap();
-    assert_eq!(backlog, progress::Backlog::of(&auto));
-    assert_eq!(backlog.count, 1);
+    assert_eq!(backlog, progress::Backlog::of(&rows));
+    assert_eq!(backlog.count, 2);
 }
 
 // ---- read_context ---------------------------------------------------------------

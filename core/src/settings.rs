@@ -34,7 +34,7 @@ const PATCHABLE: [&str; 19] = [
     "message_filter_enabled",
     "leaders",
 ];
-const PROFILES: [&str; 4] = ["analysis", "handling", "review", "filter"];
+const PROFILES: [&str; 3] = ["analysis", "review", "filter"];
 
 pub async fn handle(ctx: &Arc<Ctx>, method: &str, p: Value) -> Result<Value> {
     match method {

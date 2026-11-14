@@ -1,5 +1,5 @@
 let pendingSettingsSection = '';
-function renderSettings() {
+async function renderSettings() {
   closeConnectionEditor();
   const c = state.config;
   const sections = [
@@ -9,6 +9,7 @@ function renderSettings() {
     ['tags', '标签显示优先级'],
     ['prompts', '判断规则'],
     ['sources', '消息来源'],
+    ['system-prompts', '系统提示词'],
     ['storage', '数据设置'],
     ['about', '关于我们'],
   ];
@@ -35,8 +36,9 @@ function renderSettings() {
  <div class="automation-extras">${toggle('cfg-traces', '保留完整 AI 跟踪', c.retain_ai_traces, '保存 AI 输入、输出、事件和错误正文，可能包含私人内容。消息会发送到所选 AI 服务；消息清理不会清除服务端会话。')}</div></section>
  <section class="settings-card" id="settings-models">${head('用途与模型', '模型目录在 AI 接入中维护。API 不支持一键处置；已开始的会话继续使用原连接。')}${modelProfileFields()}</section>
  <div class="settings-pair"><section class="settings-card" id="settings-tags">${head('标签显示优先级')}${tagPriorityFields()}</section>
- <section class="settings-card" id="settings-prompts">${head('判断规则')}<div class="form-group"><label for="cfg-leaders">重点关注人员${help('每行一个姓名，提高关注度，不直接判为紧急。')}</label><textarea id="cfg-leaders" rows="2" placeholder="可留空">${esc(c.leaders.join('\n'))}</textarea></div><button data-page="prompts">管理系统提示词 →</button></section></div>
+ <section class="settings-card" id="settings-prompts">${head('判断规则')}<div class="form-group"><label for="cfg-leaders">重点关注人员${help('每行一个姓名，提高关注度，不直接判为紧急。')}</label><textarea id="cfg-leaders" rows="2" placeholder="可留空">${esc(c.leaders.join('\n'))}</textarea></div></section></div>
  <section class="settings-card settings-sources" id="settings-sources">${head('消息来源')}<div id="settings-source-content" data-preserve-content><p class="helper">正在读取消息来源…</p></div></section>
+ <section class="settings-card" id="settings-system-prompts">${head('系统提示词')}<div id="settings-prompt-content" data-preserve-content></div></section>
  <section class="settings-card" id="settings-storage">${head('数据设置', '配置、事项、消息、插件和日志保存在数据目录；更改目录后自动重启。')}<div class="data-settings-row"><div class="data-directory"><span class="setting-label">数据目录</span><div class="settings-path" tabindex="0" title="${esc(state.data_directory)}">${esc(state.data_directory)}</div><button data-action="open-data">打开目录</button><button data-storage-change>更改目录</button></div>${number('cfg-retention', '保留期限', c.message_retention_days, 1, 3650, '天', '过期消息和旧操作记录清理后不可补查；未分析消息也会过期。未归档事项及仍被引用的材料保留，报表和提示词历史单独保留。')}</div>${retentionSummary()}</section>
  ${aboutSection()}</main></div>`,
   );
@@ -46,6 +48,10 @@ function renderSettings() {
   settingsBaseline = readSettingsValues();
   syncUpdateControls();
   void renderSources();
+  await renderSystemPrompts().catch((e) => {
+    renderedKey = '';
+    toast(e.message);
+  });
 }
 
 let settingsQueue = null,

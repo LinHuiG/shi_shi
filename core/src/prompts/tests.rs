@@ -275,7 +275,7 @@ async fn retry_validates_answers_and_adopt_needs_the_same_base() {
     let err = review::retry(&ctx, "r1", |_| async { Ok(Value::Null) }).await.unwrap_err();
     assert_eq!(err.0, "建议已处理，请刷新后选择可重新评估的记录");
 
-    let state = dispatch(&ctx, "state", json!({"page": "prompts"})).await.unwrap();
+    let state = dispatch(&ctx, "state", json!({"page": "learning"})).await.unwrap();
     assert_eq!(state["prompt_pending"], 1);
     let shown = &state["evolution"]["prompts"];
     assert_eq!(shown.as_array().unwrap().len(), 1);

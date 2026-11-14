@@ -5,7 +5,6 @@
 use serde_json::{json, Value};
 use sha2::Digest;
 
-use super::COMMAND_RETRY_REASON;
 use crate::{time, Config};
 
 /// Minimum gap between an automatic round and the last trigger time.
@@ -39,18 +38,11 @@ pub struct Row {
     pub reason: String,
     /// Body characters, capped at [`BODY_CHARS`].
     pub chars: usize,
-    pub automatic: bool,
 }
 
 /// Recorded input-data errors after which a content version is no longer
 /// selected, manually or automatically; a content change starts again.
 pub const MAX_INPUT_ERRORS: i64 = 3;
-
-/// Whether automatic work may take a failed message: any failure unless
-/// commands may have run.
-pub fn automatic_retry(reason: &str) -> bool {
-    !reason.ends_with(COMMAND_RETRY_REASON)
-}
 
 /// Kinds of failure recorded against the messages of a batch. Only
 /// [`Failure::InputData`] counts towards [`MAX_INPUT_ERRORS`]; the others
@@ -62,7 +54,7 @@ pub enum Failure {
     InputData,
     /// A response arrived but failed validation, or the batch was rejected.
     InvalidResult,
-    /// Commands may have run: only a manual retry may take the batch.
+    /// Commands may have run before the batch failed.
     CommandUnconfirmed,
     /// Part of an accepted batch whose action was not adopted.
     NotAdopted,

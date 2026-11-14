@@ -9,9 +9,7 @@ function reviewTabs() {
   return `<div class="pills" role="tablist" aria-label="回顾内容" style="margin-bottom:16px">${tabs.map(([p, label]) => `<button role="tab" data-page="${p}" aria-selected="${page === p}" class="${page === p ? 'active' : ''}">${label}</button>`).join('')}</div>`;
 }
 function pendingMessageLabel() {
-  const total = state.pending,
-    manual = Math.min(total, state.manual_retry_count);
-  return manual ? `${total - manual} 条等待 · ${manual} 条需手动重试` : total ? `${total} 条等待分析` : '无等待消息';
+  return state.pending ? `${state.pending} 条等待分析` : '无等待消息';
 }
 
 // The bottom-bar phase. Its AI-allowed rule is the top bar's: work_state
@@ -126,7 +124,7 @@ function render(nextKey) {
   renderEpoch++;
   renderedPage = page;
   renderedKey = nextKey ?? viewKey(state, page);
-  if (!['sources', 'prompts'].includes(page)) $('#view').dataset.contentPage = page;
+  if (page !== 'sources') $('#view').dataset.contentPage = page;
   for (const el of document.querySelectorAll('[data-page]'))
     el.classList.toggle(
       'active',
@@ -137,7 +135,7 @@ function render(nextKey) {
     tasks: `${state.open_task_count} 项未完成`,
     schedules: '每日或每周，到点自动生成待处理事项',
     inbox: '查询完整消息缓存 · 支持时间排序与搜索',
-    prompts: '管理提示词与 AI 记忆',
+    tools: '管理AI可调用的本地工具',
     logs: '判断依据、人工修改、用量和错误记录',
     reports: `工作 ${state.config.work_start}–${state.config.work_end} · 下班后一次汇总与归档`,
     learning: '从你的修正和处置记录中生成，由你确认后采用',
@@ -154,7 +152,7 @@ function render(nextKey) {
     learning: '<button data-action="learn">生成判断规则建议</button>',
     sources: '',
     guide: '',
-    prompts: '',
+    tools: '<button data-tool-history>调用记录</button><button class="primary" data-tool-new>＋ 新增工具</button>',
     settings:
       '<span id="settings-save-status" role="status"><span data-settings-save-message>更改后自动保存</span><button type="button" data-settings-retry hidden>重试</button></span>',
   };
@@ -163,15 +161,11 @@ function render(nextKey) {
     tasks: renderTasks,
     schedules: renderSchedules,
     sources: renderSources,
-    prompts: () =>
-      renderSystemPrompts().catch((e) => {
-        renderedKey = '';
-        toast(e.message);
-      }),
+    tools: showToolLibrary,
     guide: renderGuide,
-    settings: () => {
-      renderSettings();
-      if (pendingSettingsSection) {
+    settings: async () => {
+      await renderSettings();
+      if (page === 'settings' && pendingSettingsSection) {
         document.getElementById('settings-' + pendingSettingsSection)?.scrollIntoView({ block: 'start' });
         pendingSettingsSection = '';
       }
@@ -636,7 +630,7 @@ async function previewBacklog() {
   retries.hidden = !reasons.length;
   retries.textContent =
     reasons
-      .map((row) => `${row.count} 条${row.automatic_retry ? '等待重试' : '需手动重试'}：${row.reason}`)
+      .map((row) => `${row.count} 条等待重试：${row.reason}`)
       .join('；') + (result.retry_reasons_more ? `；另有 ${result.retry_reasons_more} 类原因，可在日志中核对。` : '');
   $('#backlog-count').textContent = result.count
     ? `共 ${result.eligible} 条，可跳过 ${result.count} 条`

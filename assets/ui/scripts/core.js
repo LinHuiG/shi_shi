@@ -206,12 +206,12 @@ const names = {
   review: '回顾',
   schedules: '回顾',
   inbox: '消息',
+  tools: '工具',
   reports: '回顾',
   learning: '回顾',
   logs: '系统日志',
   settings: '设置',
   sources: '消息来源',
-  prompts: '系统提示词',
   guide: '使用说明',
 };
 function toast(s) {
@@ -483,7 +483,9 @@ function viewKey(s, p) {
       return JSON.stringify(s.activity_day_revision);
     case 'sources':
       return JSON.stringify([s.chat_sources, pluginCatalogRevision]);
-    case 'prompts':
+    case 'tools':
+      return JSON.stringify(s.config.tools);
+    case 'settings':
       return JSON.stringify([promptSection, promptSection === 'memory' ? s.memory_state : s.prompt_state]);
     default:
       return '';
@@ -556,7 +558,7 @@ window.refreshState = function (force = false) {
             scroll = $('#view').scrollTop;
           await render(nextKey);
           if (page === target) $('#view').scrollTop = scroll;
-        }
+        } else if (page === 'settings' && renderedPage === page && changed) await renderSystemPrompts();
         if (!uiReady) {
           uiReady = true;
           await rpc('ui_ready');

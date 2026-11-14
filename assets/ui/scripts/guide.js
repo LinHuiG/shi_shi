@@ -9,8 +9,11 @@ document.addEventListener('click', async (e) => {
   if (!b) return;
   if (b.hasAttribute('data-guide-memory') || b.hasAttribute('data-guide-advice')) {
     if (!(await leaveSettings())) return;
-    if (b.hasAttribute('data-guide-memory')) promptSection = 'memory';
-    page = b.hasAttribute('data-guide-memory') ? 'prompts' : 'learning';
+    if (b.hasAttribute('data-guide-memory')) {
+      promptSection = 'memory';
+      pendingSettingsSection = 'system-prompts';
+    }
+    page = b.hasAttribute('data-guide-memory') ? 'settings' : 'learning';
     await render();
   }
   if (b.hasAttribute('data-guide-copy')) {

@@ -128,7 +128,6 @@ pub struct ModelChoice {
 pub struct ModelProfiles {
     pub filter: Option<ModelChoice>,
     pub analysis: Option<ModelChoice>,
-    pub handling: Option<ModelChoice>,
     pub review: Option<ModelChoice>,
 }
 
@@ -137,12 +136,12 @@ impl Default for ModelProfiles {
         let choice = |effort: &str| {
             Some(ModelChoice { model: "gpt-6-astra".into(), reasoning_effort: effort.into(), ..Default::default() })
         };
-        Self { filter: choice("low"), analysis: choice("low"), handling: choice("medium"), review: choice("high") }
+        Self { filter: choice("low"), analysis: choice("low"), review: choice("high") }
     }
 }
 
 /// Every purpose that can reach a provider.
-pub const PURPOSES: [&str; 11] = [
+pub const PURPOSES: [&str; 10] = [
     "classify",
     "format",
     "edit",
@@ -150,7 +149,6 @@ pub const PURPOSES: [&str; 11] = [
     "report",
     "learning",
     "prompt_review",
-    "handling",
     "advice_revision",
     "archive",
     "message_filter",
@@ -179,7 +177,6 @@ impl Config {
         let Some(p) = &self.model_profiles else { return base };
         let route = match purpose {
             "message_filter" => &p.filter,
-            "handling" => &p.handling,
             "archive" | "learning" | "prompt_review" | "report" | "advice_revision" => &p.review,
             _ => &p.analysis,
         };

@@ -9,7 +9,8 @@ const handlingLabels = {
 };
 const handlingClient = (r) => ((r?.driver || r?.connection?.driver) === 'dsh' ? 'DSH' : 'Codex');
 const taskRun = (id) => (state?.handling || []).find((r) => r.task_id === id);
-let handlingChoices = null;
+let handlingChoices = null,
+  lastHandlingDriver = '';
 const handlingStarting = new Set();
 
 // The detail action: start a session, or go back to the one handed over.
@@ -36,9 +37,6 @@ function handlingNote(t) {
 
 // ---------------------------------------------------------------- pickers
 
-// The start dialog picks connection, model and effort in one menu; the
-// settings' handling model is the default and a choice lasts only for this
-// session.
 const handlingConnection = (id) => handlingChoices?.connections.find((c) => c.id === id);
 const handlingModelName = (m) => [m.providerName, m.displayName || m.model].filter(Boolean).join(' / ');
 function handlingEfforts(pick) {
@@ -54,7 +52,7 @@ function handlingChip(pick) {
   const model = m ? m.displayName || m.model : pick.model || '默认模型';
   const effort = pick.effort ? effortNames[pick.effort] || pick.effort : '默认强度';
   const title = [c?.name || handlingClient(c), m ? handlingModelName(m) : model, effort].join(' · ');
-  return `<button type="button" class="handling-chip" data-handling-menu="model" aria-haspopup="listbox" aria-expanded="false" title="${esc(title)}，仅本次会话生效"><span>${esc(model)}</span><small>${esc(effort)}</small>${icon('chevron')}</button>`;
+  return `<button type="button" class="handling-chip" data-handling-menu="model" aria-haspopup="listbox" aria-expanded="false" title="${esc(title)}，仅本次会话生效"><span>${esc(c.name)} · ${esc(model)}</span><small>${esc(effort)}</small>${icon('chevron')}</button>`;
 }
 
 let handlingMenu = null;
@@ -198,6 +196,7 @@ document.addEventListener('click', (e) => {
   }
   const switched = pick.connection !== handlingChoices.pick.connection;
   handlingChoices.pick = pick;
+  lastHandlingDriver = handlingConnection(pick.connection).driver;
   host.innerHTML = handlingChip(pick);
   handlingMenu.anchor = host.firstElementChild;
   if (b.dataset.effort !== undefined) closeHandlingMenu(true);
@@ -255,19 +254,19 @@ function syncHandlingStart() {
   note.classList.toggle('error-text', !!c.error);
   $('#handling-start-note').textContent = client === 'Codex'
     ? '拾事会在 Codex 桌面端新建对话并填好第一句，按回车即开始，过程中可随时中断、追加。'
-    : '拾事用所选模型在 Codex 或 DSH 中跑完首轮调查，再把会话交给客户端继续；进展和结论由客户端通过拾事 CLI 写回事项。';
+    : '拾事用所选模型在DSH中跑完首轮调查，再把会话交给客户端继续；进展和结论由客户端通过拾事CLI写回事项。';
   $('#dialog [data-handle="submit"]').disabled = !project;
 }
 async function beginHandling(id) {
   const p = await rpc('handling_prepare', { task_id: id });
-  if (!p.default) throw Error('请先在设置中添加 Codex 或 DeepSeek Harness 接入');
-  const d = p.default;
-  handlingChoices = { ...p, task: id, pick: { connection: d.connection_id, model: d.model, effort: d.effort } };
+  const c = p.connections.find((c) => c.driver === lastHandlingDriver) ?? p.connections[0];
+  if (!c) throw Error('请先在设置中添加 Codex 或 DeepSeek Harness 接入');
+  handlingChoices = { ...p, task: id, pick: { connection: c.id, model: '', effort: '' } };
   setModal(
     `<h2>AI一键处置</h2><p class="subtitle" id="handling-start-note"></p><div class="form-group"><label id="handling-project-label">项目</label><button type="button" class="handling-select" id="handling-project" data-handling-menu="project" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="handling-project-label"></button><p class="helper" id="handling-project-note" hidden></p></div><div class="form-group"><label for="handling-instructions">本次补充说明（可选）</label><textarea id="handling-instructions" maxlength="2000" placeholder="例如：先核对复现步骤和相关日志。"></textarea></div><details class="handling-prompt"><summary>查看当前通用调查提示词</summary><pre>${esc(p.prompt)}</pre></details><div id="modal-error" class="error-box"></div><div class="dialog-foot handling-start-foot"><span class="handling-chip-host" data-handling-picker>${handlingChip(handlingChoices.pick)}</span><button data-action="close">取消</button><button class="primary" data-handle="submit" data-task-id="${esc(id)}" disabled>开始调查</button></div>`,
   );
   syncHandlingStart();
-  await chooseHandlingConnection(d.connection_id);
+  await chooseHandlingConnection(c.id);
 }
 
 // ---------------------------------------------------------------- actions
@@ -295,6 +294,7 @@ const handlingActions = {
     const c = handlingChoices,
       project = c.list?.find((p) => p.id === c.project);
     if (!project) throw Error('请选择项目');
+    lastHandlingDriver = handlingConnection(c.pick.connection).driver;
     const params = {
       task_id: id,
       connection_id: c.pick.connection,

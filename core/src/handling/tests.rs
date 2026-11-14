@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use super::agent::fake::{Backend, Fake};
 use super::*;
-use crate::config::ModelChoice;
 use crate::testing::temp_dir;
 
 const TASK: &str = "task-h";
@@ -14,8 +13,6 @@ const TASK: &str = "task-h";
 async fn setup() -> (Arc<Ctx>, Arc<Fake>) {
     let mut config = Config { codex: "/synthetic/codex".into(), codex_name: "Codex".into(), ..Default::default() };
     config.codex_models = vec![json!({"model": "m1"}), json!({"model": "m2"})];
-    config.model_profiles.get_or_insert_with(Default::default).handling =
-        Some(ModelChoice { model: "m1".into(), reasoning_effort: "medium".into(), ..Default::default() });
     let ctx = Ctx::memory_in(config, temp_dir("handling")).unwrap();
     for dir in ["w", "work"] {
         std::fs::create_dir_all(ctx.root.join(dir)).unwrap();
@@ -73,20 +70,55 @@ async fn failed_project_reads_do_not_keep_background_loops_awake() {
 }
 
 #[tokio::test]
-async fn prepare_offers_conversation_connections_with_the_settings_model() {
+async fn prepare_offers_only_configured_conversation_connections() {
     let (ctx, _) = setup().await;
     let p = call(&ctx, "handling_prepare", json!({"task_id": TASK})).await.unwrap();
     assert_eq!(p["connections"][0]["id"], DEFAULT_CODEX);
     assert_eq!(p["connections"][0]["models"].as_array().unwrap().len(), 2);
-    assert_eq!(p["default"], json!({"connection_id": DEFAULT_CODEX, "model": "m1", "effort": "medium"}));
     assert!(p.get("projects").is_none(), "projects are read per connection");
+    ctx.config
+        .update(&ctx.db, |c| {
+            c.ai_connections = vec![
+                Connection {
+                    id: "c-dsh".into(),
+                    driver: "dsh".into(),
+                    executable: "synthetic-dsh.cmd".into(),
+                    ..Default::default()
+                },
+                Connection { id: "api".into(), driver: "api".into(), ..Default::default() },
+                Connection { id: "unset".into(), driver: "codex".into(), ..Default::default() },
+            ];
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let p = call(&ctx, "handling_prepare", json!({"task_id": TASK})).await.unwrap();
+    let drivers: Vec<_> = p["connections"].as_array().unwrap().iter().map(|c| c["driver"].clone()).collect();
+    assert_eq!(drivers, [json!("codex"), json!("dsh")]);
+    ctx.config
+        .update(&ctx.db, |c| {
+            c.codex.clear();
+            c.ai_connections.retain(|c| c.driver == "api");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(call(&ctx, "handling_prepare", json!({"task_id": TASK})).await.unwrap()["connections"], json!([]));
+    assert!(call(&ctx, "handling_start", json!({"task_id": TASK, "connection_id": "api", "cwd": ctx.root.join("w")}))
+        .await
+        .is_err());
     let _ = std::fs::remove_dir_all(&ctx.root);
 }
 
 #[tokio::test]
 async fn projects_come_only_from_the_chosen_connections_client() {
     let (ctx, _) = setup().await;
-    let dsh = Connection { id: "c-dsh".into(), driver: "dsh".into(), ..Default::default() };
+    let dsh = Connection {
+        id: "c-dsh".into(),
+        driver: "dsh".into(),
+        executable: "synthetic-dsh.cmd".into(),
+        ..Default::default()
+    };
     ctx.config.update(&ctx.db, |c| Ok(c.ai_connections.push(dsh))).await.unwrap();
     let ids = |v: Value| v.as_array().unwrap().iter().map(|p| p["id"].clone()).collect::<Vec<_>>();
     let codex = call(&ctx, "handling_projects", json!({"connection_id": DEFAULT_CODEX})).await.unwrap();
@@ -96,10 +128,9 @@ async fn projects_come_only_from_the_chosen_connections_client() {
     assert!(call(&ctx, "handling_projects", json!({"connection_id": "missing"})).await.is_err());
     let prepared = call(&ctx, "handling_prepare", json!({"task_id": TASK})).await.unwrap();
     let drivers = prepared["connections"].as_array().unwrap().iter().map(|c| c["driver"].clone()).collect::<Vec<_>>();
-    assert_eq!(prepared["default"]["connection_id"], "c-dsh");
-    assert_eq!(drivers, [json!("dsh")], "only the settings' client is offered");
-    let default = prepared["default"].clone();
-    let shown = call(&ctx, "handling_projects", default).await.unwrap();
+    assert_eq!(drivers, [json!("codex"), json!("dsh")]);
+    let shown =
+        call(&ctx, "handling_projects", json!({"connection_id": prepared["connections"][0]["id"]})).await.unwrap();
     assert_eq!(offered(&ctx).await, shown, "analysis suggests from the dialog's default client");
     let _ = std::fs::remove_dir_all(&ctx.root);
 }
@@ -125,7 +156,6 @@ async fn codex_composes_then_binds_the_desktop_thread_through_its_brief() {
     assert!(fake.turns.lock().unwrap().is_empty());
     assert!(ctx.handling.live(&id).is_none());
     assert!(fake.opened.lock().unwrap().is_empty());
-    assert_eq!(ctx.config.get().model_choice("handling").model, "m1");
     let composed = fake.composed.lock().unwrap().clone();
     assert_eq!(composed.len(), 1);
     assert_eq!(composed[0].0, cwd);
@@ -182,7 +212,12 @@ async fn codex_composes_then_binds_the_desktop_thread_through_its_brief() {
 #[tokio::test]
 async fn a_running_first_turn_blocks_a_second_start_and_dsh_is_raised_with_its_project() {
     let (ctx, fake) = setup().await;
-    let dsh = Connection { id: "c-dsh".into(), driver: "dsh".into(), ..Default::default() };
+    let dsh = Connection {
+        id: "c-dsh".into(),
+        driver: "dsh".into(),
+        executable: "synthetic-dsh.cmd".into(),
+        ..Default::default()
+    };
     ctx.config.update(&ctx.db, |c| Ok(c.ai_connections.push(dsh))).await.unwrap();
     fake.script.lock().unwrap().push(("sess", Ok("completed")));
     let (release, hold) = mpsc::channel();
@@ -213,7 +248,12 @@ async fn a_running_first_turn_blocks_a_second_start_and_dsh_is_raised_with_its_p
 #[tokio::test]
 async fn a_failed_turn_keeps_its_error_and_a_restart_interrupts_running_rows() {
     let (ctx, fake) = setup().await;
-    let dsh = Connection { id: "c-dsh".into(), driver: "dsh".into(), ..Default::default() };
+    let dsh = Connection {
+        id: "c-dsh".into(),
+        driver: "dsh".into(),
+        executable: "synthetic-dsh.cmd".into(),
+        ..Default::default()
+    };
     ctx.config.update(&ctx.db, |c| Ok(c.ai_connections.push(dsh))).await.unwrap();
     fake.script.lock().unwrap().push(("", Err("模型不可用".into())));
     let id =

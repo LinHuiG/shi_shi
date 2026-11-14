@@ -36,27 +36,22 @@ pub async fn handle(ctx: &Arc<Ctx>, params: Value) -> Result<Value> {
 /// The preview of the waiting `rows` and the versions older than `hours`.
 pub fn preview(rows: &[Row], hours: u64, analyzing: usize) -> (Value, BTreeMap<String, String>) {
     let cutoff = time::now() - hours as i64 * time::HOUR;
-    let mut reasons = BTreeMap::<(bool, String), usize>::new();
-    let mut manual_retry_count = 0usize;
+    let mut reasons = BTreeMap::<String, usize>::new();
     let mut records = BTreeMap::new();
     for r in rows {
         if !r.reason.is_empty() {
-            manual_retry_count += usize::from(!r.automatic);
-            *reasons.entry((r.automatic, r.reason.clone())).or_default() += 1;
+            *reasons.entry(r.reason.clone()).or_default() += 1;
         }
         if r.time > 0 && r.time < cutoff {
             records.insert(r.id.clone(), r.hash.clone());
         }
     }
     let more = reasons.len().saturating_sub(3);
-    let retry_reasons: Vec<Value> = reasons
-        .into_iter()
-        .take(3)
-        .map(|((automatic_retry, reason), count)| json!({"automatic_retry": automatic_retry, "reason": reason, "count": count}))
-        .collect();
+    let retry_reasons: Vec<Value> =
+        reasons.into_iter().take(3).map(|(reason, count)| json!({"reason": reason, "count": count})).collect();
     let value = json!({
         "hours": hours, "count": records.len(), "records": &records, "eligible": rows.len(),
-        "analyzing": analyzing, "manual_retry_count": manual_retry_count,
+        "analyzing": analyzing,
         "retry_reasons": retry_reasons, "retry_reasons_more": more,
     });
     (value, records)

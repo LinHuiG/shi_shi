@@ -543,7 +543,7 @@
 .tool-row-actions {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--sp-2);
 }
 .tool-toolbar input {
   flex: 1;
@@ -551,14 +551,11 @@
 }
 .tool-library-row {
   display: grid;
-  grid-template-columns: minmax(100px, 1fr) minmax(120px, 2fr) auto auto;
-  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto auto;
+  gap: var(--sp-3);
   align-items: center;
-  padding: 12px 0;
+  padding: var(--sp-3) 0;
   border-bottom: 1px solid var(--line);
-}
-.tool-description,
-.tool-library-row b {
   overflow-wrap: anywhere;
 }
 .tool-parameter {
@@ -609,6 +606,13 @@
 @media (max-width: 700px) {
   .tool-library-row {
     grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .tool-library-row > :first-child {
+    grid-column: 1 / -1;
+  }
+  .tool-description {
+    grid-column: 1 / -1;
+    grid-row: 2;
   }
   .tool-row-actions,
   .tool-toolbar,
@@ -1531,9 +1535,6 @@ input[type='checkbox'].setting-switch:checked:before {
 .connection-form .field-row input {
   flex: 1;
   min-width: 80px;
-}
-.model-profile[data-unavailable='true'] > b {
-  color: var(--text-tertiary);
 }
 .source-card h3 {
   font-size: var(--fs-body);

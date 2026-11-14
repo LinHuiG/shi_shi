@@ -36,13 +36,6 @@ const modelFields = [
     '根据消息及相关上下文生成新事项，或更新已有事项的进展、状态和下一步行动。',
   ],
   [
-    'handling',
-    'cfg-handling-model',
-    'cfg-handling-effort',
-    'AI一键处置',
-    '拾事直接发起 Codex 或 DeepSeek Harness 会话，结合事项信息和相关上下文开展处置，可在对应客户端查看。这里是默认模型，发起处置时可改，只对该次会话生效。',
-  ],
-  [
     'review',
     'cfg-review-model',
     'cfg-review-effort',
@@ -80,31 +73,16 @@ function defaultConnection() {
 function draftConnections() {
   return [...(state.config.codex ? [defaultConnection()] : []), ...state.config.ai_connections];
 }
-function handlingConfigured() {
-  return draftConnections().some((c) => ['codex', 'dsh'].includes(c.driver) && c.executable?.trim());
-}
-function refreshHandlingAvailability() {
-  const unavailable = !handlingConfigured(),
-    row = document.querySelector('[data-model-profile="handling"]');
-  if (row) {
-    row.dataset.unavailable = String(unavailable);
-    row.setAttribute('aria-disabled', 'false');
-    row.querySelectorAll('select').forEach((el) => (el.disabled = false));
-  }
-  const note = $('#handling-availability-note');
-  if (note) note.hidden = !unavailable;
-}
 function connectionCard(c) {
   return `<article class="ai-connection" data-ai-connection="${esc(c.id)}"><div class="connection-summary"><b>${esc(c.name)}</b><span class="badge connection-driver" title="${esc(driverLabels[c.driver] || c.driver)}">${esc(driverLabels[c.driver] || c.driver)}</span><div class="connection-actions"><button data-ai-edit="${esc(c.id)}">编辑</button><button class="quiet" data-ai-remove="${esc(c.id)}">删除</button></div></div><div data-connection-editor="${esc(c.id)}"></div></article>`;
 }
 function extraConnectionFields() {
   return `<div id="ai-connections">${draftConnections().map(connectionCard).join('')}</div><button class="add-connection" data-ai-add>＋ 添加连接</button><div id="new-connection-editor"></div>`;
 }
-function connectionOptions(selected, connections = draftConnections(), kind = '') {
+function connectionOptions(selected, connections = draftConnections()) {
   return (
     `<option value="__unselected__" ${selected === '__unselected__' || !connections.some((c) => c.id === selected) ? 'selected' : ''}>未配置</option>` +
     connections
-      .filter((c) => kind !== 'handling' || c.driver !== 'api')
       .map((c) => `<option value="${esc(c.id)}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}</option>`)
       .join('') +
     (selected && selected !== '__unselected__' && !connections.some((c) => c.id === selected)
@@ -117,7 +95,7 @@ function refreshConnectionOptions() {
     const el = $('#cfg-' + kind + '-connection');
     if (el) {
       const selected = el.value;
-      el.innerHTML = connectionOptions(selected, draftConnections(), kind);
+      el.innerHTML = connectionOptions(selected);
       el.value = selected;
     }
   }
@@ -128,9 +106,8 @@ function selectedConnection(kind) {
 function modelProfileFields() {
   return `<div class="model-table-head"><span>用途</span><span>AI 接入</span><span>模型</span><span>强度</span></div>${modelFields
     .map(([kind, m, e, label, tip]) => {
-      const c = modelChoice(kind),
-        unavailable = kind === 'handling' && !handlingConfigured();
-      return `<div class="model-profile" data-model-profile="${kind}" data-unavailable="${unavailable}" aria-disabled="false"><b>${label}${help(tip)}</b><select aria-label="${label}接入" id="cfg-${kind}-connection" data-ai-route="${kind}" >${connectionOptions(c.unconfigured ? '__unselected__' : c.connection_id || '', draftConnections(), kind)}</select><select aria-label="${label}模型" id="${m}" ><option value="${esc(c.model || '')}">${esc(c.model || '选择模型')}</option></select><select aria-label="${label}强度" id="${e}" ><option value="${esc(c.reasoning_effort || '')}">${esc(effortNames[c.reasoning_effort] || '默认')}</option></select><span class="route-error" id="model-status-${kind}"></span></div>${kind === 'handling' ? `<p class="helper handling-availability-note" id="handling-availability-note" ${unavailable ? '' : 'hidden'}>需要先配置 Codex 或 DSH 接入，才能使用 AI 一键处置。</p>` : ''}`;
+      const c = modelChoice(kind);
+      return `<div class="model-profile" data-model-profile="${kind}"><b>${label}${help(tip)}</b><select aria-label="${label}接入" id="cfg-${kind}-connection" data-ai-route="${kind}" >${connectionOptions(c.unconfigured ? '__unselected__' : c.connection_id || '')}</select><select aria-label="${label}模型" id="${m}" ><option value="${esc(c.model || '')}">${esc(c.model || '选择模型')}</option></select><select aria-label="${label}强度" id="${e}" ><option value="${esc(c.reasoning_effort || '')}">${esc(effortNames[c.reasoning_effort] || '默认')}</option></select><span class="route-error" id="model-status-${kind}"></span></div>`;
     })
     .join('')}`;
 }
@@ -193,5 +170,4 @@ function loadModels() {
   }
   for (const el of document.querySelectorAll('.model-profile select:not([id$="effort"])'))
     el.title = el.selectedOptions[0]?.textContent || '';
-  refreshHandlingAvailability();
 }

@@ -5,9 +5,9 @@ async function renderMemory() {
   const request = ++memoryRequest,
     epoch = renderEpoch;
   if (!memoryData)
-    setHtml('#view', `<div class="page memory-page">${systemPromptTabs()}<div class="box">读取 AI 记忆…</div></div>`);
+    setHtml('#settings-prompt-content', `<div class="memory-page">${systemPromptTabs()}<p class="helper">读取AI记忆…</p></div>`);
   const result = await rpc('memory_read');
-  if (page !== 'prompts' || promptSection !== 'memory' || request !== memoryRequest || epoch !== renderEpoch) return;
+  if (page !== 'settings' || promptSection !== 'memory' || request !== memoryRequest || epoch !== renderEpoch) return;
   memoryData = result;
   drawMemory();
 }
@@ -28,11 +28,9 @@ function drawMemory() {
     return `<section class="box memory-card"><div class="row memory-card-head"><div class="memory-heading"><h2>${k === 'temporary' ? '临时记忆' : '归档记忆'}</h2><span class="memory-caption" title="${caption}">${caption}</span></div>${!editing ? `<button data-memory-edit="${k}">编辑记忆</button>` : ''}</div>${editing ? `<div class="memory-editor"><label for="memory-${k}">记忆正文</label><textarea id="memory-${k}" rows="9" data-memory-text>${esc(text)}</textarea><div class="memory-editor-foot"><span id="memory-count" class="helper${overLimit ? ' memory-over-limit' : ''}">${countLabel}</span><div class="row"><button data-memory-cancel>取消</button><button class="primary" data-memory-save>保存记忆</button></div></div><p id="memory-limit" class="helper memory-over-limit"${overLimit ? '' : ' hidden'}>原内容已完整保留，请精简到 ${data.max_chars} 字符以内再保存。</p><div id="memory-error" class="error-box" role="status"></div></div>` : `<p class="memory-prose">${esc(text || (k === 'temporary' ? '还没有临时记忆，AI 会在分析时按需记录。' : '还没有归档记忆。'))}</p><p class="helper${overLimit ? ' memory-over-limit' : ''}">${countLabel}${overLimit ? ' · 原内容已完整保留，后续保存需精简。' : ''}</p>`}</section>`;
   };
   setHtml(
-    '#view',
-    `<div class="page memory-page">${systemPromptTabs()}<div class="memory-intro"><h2>AI 记忆</h2><p>看看 AI 记住了什么，随时修正，让后续处理更贴近你的需要。</p><p class="helper">记忆只保存在本地；保存后供后续 AI 请求使用。记忆不提供版本比较或回滚。</p><button class="quiet" data-memory-reload>重新读取</button></div>${card('temporary')}${card('archived')}</div>`,
+    '#settings-prompt-content',
+    `<div class="memory-page">${systemPromptTabs()}<div class="memory-intro"><h2>AI 记忆</h2><p>看看 AI 记住了什么，随时修正，让后续处理更贴近你的需要。</p><p class="helper">记忆只保存在本地；保存后供后续 AI 请求使用。记忆不提供版本比较或回滚。</p><button class="quiet" data-memory-reload>重新读取</button></div>${card('temporary')}${card('archived')}</div>`,
   );
-  $('#view').dataset.contentPage = 'prompts';
-  $('#view').dataset.renderedPromptSection = 'memory';
 }
 function readMemoryDraft() {
   if (!memoryEditor) return;

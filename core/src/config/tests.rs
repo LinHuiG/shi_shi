@@ -50,7 +50,7 @@ fn model_routes_follow_purpose_and_unconfigured_profile() {
     let mut c = Config::default();
     c.ai_connections.push(Connection { id: "api".into(), ..Default::default() });
     assert_eq!(c.model_choice("archive").reasoning_effort, "high");
-    assert_eq!(c.model_choice("handling").reasoning_effort, "medium");
+    assert!(serde_json::to_value(&c.model_profiles).unwrap().get("handling").is_none());
     assert_eq!(c.model_choice("classify").connection_id, "api");
     c.model_profiles.as_mut().unwrap().review = None;
     assert_eq!(c.model_choice("report").connection_id, UNCONFIGURED_CONNECTION);

@@ -142,26 +142,14 @@ async fn open(ctx: &Ctx, run: &Run) -> Result<Value> {
 fn connections(config: &Config) -> Vec<Connection> {
     let builtin = Connection { id: DEFAULT_CODEX.into(), ..crate::ai::prompt::default_codex(config) };
     std::iter::once(builtin)
-        .filter(|c| !c.executable.trim().is_empty())
         .chain(config.ai_connections.iter().filter(|c| ["codex", "dsh"].contains(&c.driver.as_str())).cloned())
+        .filter(|c| !c.executable.trim().is_empty())
         .collect()
 }
 
 fn connection(config: &Config, id: &str) -> Result<Connection> {
     let id = if id.is_empty() { DEFAULT_CODEX } else { id };
     connections(config).into_iter().find(|c| c.id == id).ok_or_else(|| Error::new("请选择可用的 Codex / DSH 接入"))
-}
-
-/// The settings' handling model when it is on a conversation connection,
-/// else the first such connection with its own default model.
-fn default_choice(config: &Config, choices: &[Connection]) -> Value {
-    let choice = config.model_choice("handling");
-    let id = if choice.connection_id.is_empty() { DEFAULT_CODEX } else { &choice.connection_id };
-    match choices.iter().find(|c| c.id == id).or(choices.first()) {
-        Some(c) if c.id == id => json!({"connection_id": id, "model": choice.model, "effort": choice.reasoning_effort}),
-        Some(c) => json!({"connection_id": c.id, "model": "", "effort": ""}),
-        None => Value::Null,
-    }
 }
 
 /// The projects of the connection's own client: Codex projects for Codex,
@@ -172,14 +160,13 @@ pub(crate) async fn projects(ctx: &Arc<Ctx>, connection_id: &str) -> Result<Vec<
     exec::blocking(move || backends.projects(&driver)).await
 }
 
-/// The projects analysis may suggest for a task: those of the default
-/// handling connection, which the dialog opens with.
+/// Analysis suggests projects from the first configured conversation client.
 pub(crate) async fn offered(ctx: &Arc<Ctx>) -> Value {
     let config = ctx.config.get();
-    let Some(id) = default_choice(&config, &connections(&config))["connection_id"].as_str().map(str::to_owned) else {
+    let Some(connection) = connections(&config).into_iter().next() else {
         return json!([]);
     };
-    let list = projects(ctx, &id).await.unwrap_or_default();
+    let list = projects(ctx, &connection.id).await.unwrap_or_default();
     list.iter().take(60).map(|p| json!({"id": p["id"], "name": p["name"], "cwd": p["cwd"]})).collect()
 }
 
@@ -187,15 +174,11 @@ async fn prepare(ctx: &Arc<Ctx>, task: &str) -> Result<Value> {
     let config = ctx.config.get();
     let (task, prompt) = ctx.db.handling_prepare(task.to_string()).await?;
     let choices = connections(&config);
-    let default = default_choice(&config, &choices);
-    // Only the settings' client: a Codex default offers Codex models only.
-    let driver = choices.iter().find(|c| c.id == default["connection_id"]).map(|c| c.driver.clone());
     let choices = choices
         .iter()
-        .filter(|c| Some(&c.driver) == driver.as_ref())
         .map(|c| json!({"id": c.id, "name": c.name, "driver": c.driver, "models": c.models}))
         .collect::<Vec<_>>();
-    Ok(json!({"suggested": task.suggested_project_id, "prompt": prompt, "connections": choices, "default": default}))
+    Ok(json!({"suggested": task.suggested_project_id, "prompt": prompt, "connections": choices}))
 }
 
 // ---------------------------------------------------------------- start
